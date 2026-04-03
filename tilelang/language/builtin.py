@@ -89,6 +89,44 @@ def __ldg(load_or_buf: BufferLoad | tir.Buffer, index: PrimExpr | int | None = N
     raise TypeError("T.__ldg expects a BufferLoad or a Buffer.")
 
 
+
+def ds_read_vector(dst: tir.Var, shared_ptr: tir.Var, m: int, n: int, offset: int) -> Call:
+    """
+    Load from shared memory using ds_read_b64 instruction.
+
+    This is a vectorized load instruction on AMD DCU that loads 64 bits (8 bytes)
+    from shared memory at the specified byte offset.
+    It writes 8 bytes to dst from shared memory at byte_offset.
+        
+    This is a vectorized load instruction on AMD DCU that loads a 32x16 matrix
+    of half (16-bit) values with hardware-managed bank conflict avoidance.
+
+    Load from shared memory using ds_read_m32x16_b16 instruction.
+    
+    The ds_read_vector intrinsic has signature:
+        ds_read_vector<M,N,offset>(float4 & dst, int lds_base_ptr)
+    
+    Args:
+        dst: Destination pointer (register/local buffer).
+        lds_base_ptr: Source pointer (shared memory buffer data).
+        M: Number of columns in the matrix to load (for ds_read_m32x16_b16 / ds_read_b64).
+        N: Number of rows in the matrix to load (for ds_read_m32x16_b16 / ds_read_b64).
+        offset: address offset into shared memory.
+
+    Returns:
+        Call: A TIR call intrinsic for the ds_read_b64 instruction.
+    """
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ds_read_vector"),
+        dst,
+        shared_ptr,
+        m,
+        n,
+        offset
+    )
+
+
 def get_mbarrier(*args):
     """Retrieve a memory barrier operation.
 

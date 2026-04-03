@@ -769,18 +769,14 @@ class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (
-                            rk * (chunk // micro_size_k) + ki,
-                            warp_m * warp_rows + i,
-                        )
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row, col]
+                        l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + i * micro_size_x)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
             else:
-                print(self.a_preshuffle)
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (warp_m * warp_rows + i, rk * (chunk // micro_size_k) + ki)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_shared_buf[l, r, row, col]
+                        l, r = (warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
         return (
             _warp_ldmatrix_a_global(A_local_buf, A_buf, ki, thread_binding, rk)
@@ -845,19 +841,19 @@ class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (
-                            warp_n * warp_cols + j,
-                            rk * (chunk // micro_size_k) + ki,
+                            warp_n * warp_col_tiles + j * micro_size_y,
+                            rk * chunk + ki * (k_pack * micro_size_k),
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row, col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (
-                            rk * (chunk // micro_size_k) + ki,
-                            warp_n * warp_cols + j,
+                            rk * chunk + ki * (k_pack * micro_size_k),
+                            warp_n * warp_col_tiles + j * micro_size_y,
                         )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_shared_buf[l, r, row, col]
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 
         return (
             _warp_ldmatrix_b_global(B_local_buf, B_buf, ki, thread_binding, rk)

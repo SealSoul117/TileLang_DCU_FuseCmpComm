@@ -338,7 +338,26 @@ def InjectPTXAsyncCopy():
     fpass : tvm.transform.Pass
         The result pass
     """
+    print("Injecting PTX async copy for global to shared memory copy on DCU.")
     return _ffi_api.InjectPTXAsyncCopy()  # type: ignore
+
+
+def InjectDSRead():
+    """Rewrite shared memory to register load using ds_read hardware instructions on DCU.
+
+    This pass replaces BufferLoad from shared memory with ds_read_b64 or
+    ds_read_m32x16_b16 hardware instructions for AMD DCU (gfx936, gfx942, etc.).
+
+    - ds_read_b64: loads 8 bytes (4 halfs or 2 floats) at once
+    - ds_read_m32x16_b16: loads 32 bytes (16 halfs) at once
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    print("Injecting ds_read for shared to register memory copy on DCU.")
+    return _ffi_api.InjectDSRead()  # type: ignore
 
 
 def LowerDeviceStorageAccessInfo():

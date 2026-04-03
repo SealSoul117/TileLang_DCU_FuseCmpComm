@@ -262,6 +262,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # Inject PTX async copy must behind the thread sync pass
     # as ptx async copy won't be recognized as a valid buffer load
     mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
+    # Inject ds_read for shared to register memory copy on DCU
+    mod = tilelang.transform.InjectDSRead()(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)

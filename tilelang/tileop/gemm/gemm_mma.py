@@ -29,24 +29,28 @@ class GemmMMA(GemmBase):
             chunk=self.chunk,
         )
         if self.is_gemm_ss():
+            print("gemm_ss")
             return {
                 self.A: make_swizzled_layout(self.A),
                 self.B: make_swizzled_layout(self.B),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_sr():
+            print("gemm_ss")
             return {
                 self.A: make_swizzled_layout(self.A),
                 self.B: mma_emitter.make_mma_load_layout(self.B, matrix="B"),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_rs():
+            print("gemm_ss")
             return {
                 self.A: mma_emitter.make_mma_load_layout(self.A, matrix="A"),
                 self.B: make_swizzled_layout(self.B),
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         elif self.is_gemm_rr():
+            print("gemm_ss")
             return {
                 self.A: mma_emitter.make_mma_load_layout(self.A, matrix="A"),
                 self.B: mma_emitter.make_mma_load_layout(self.B, matrix="B"),

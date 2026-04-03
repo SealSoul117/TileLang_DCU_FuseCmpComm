@@ -226,6 +226,11 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int warp_n, const int element_size,
                                const int k_pack, bool transposed = false);
 
+Fragment makeGemmFragmentADCU(const int block_m, const int block_n,
+                               const int block_k, const int warp_m,
+                               const int warp_n, const int element_size,
+                               const int k_pack, bool transposed = false);
+
 // Default Memory Layout
 Layout makeGemmLayoutLinear(int stride, int continuous);
 Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size);

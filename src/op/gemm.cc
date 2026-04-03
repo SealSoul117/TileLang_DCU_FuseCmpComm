@@ -787,27 +787,51 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       results.Set(c_, fragment->BindThreadRange(thread_range));
     }
     if (a_.scope() == "shared" || a_.scope() == "shared.dyn") {
+      LOG(INFO) << "Using CDNA shared memory layout for A";
       int dim_A = a_->shape.size();
-      auto shared_layout = makeGemmABLayoutCDNA(
-          *as_const_int(a_->shape[dim_A - 2]),
-          *as_const_int(a_->shape[dim_A - 1]), a_->dtype.bits(), kPack_);
-      results.Set(a_, shared_layout);
+      if (TargetIsDCU(T.target)) {
+        auto shared_layout = makeGemmLayoutLinear(
+            *as_const_int(a_->shape[dim_A - 2]),
+            *as_const_int(a_->shape[dim_A - 1]));
+        results.Set(a_, shared_layout);
+      } else {
+        auto shared_layout = makeGemmABLayoutCDNA(
+            *as_const_int(a_->shape[dim_A - 2]),
+            *as_const_int(a_->shape[dim_A - 1]), a_->dtype.bits(), kPack_);
+        results.Set(a_, shared_layout);
+      }
     } else if (a_.scope() == "local.fragment") {
-      auto fragment =
-          makeGemmFragmentACDNA(m_, n_, k_, m_ / warp_m, n_ / warp_n,
-                                a_->dtype.bits(), kPack_, transA_);
-      results.Set(a_, fragment->BindThreadRange(thread_range));
+      LOG(INFO) << "Using CDNA local fragment layout for A";
+      if (TargetIsDCU){
+        auto fragment =
+            makeGemmFragmentADCU(m_, n_, k_, m_ / warp_m, n_ / warp_n,
+                                  a_->dtype.bits(), kPack_, transA_);
+        results.Set(a_, fragment->BindThreadRange(thread_range));
+      }else{
+        auto fragment =
+            makeGemmFragmentACDNA(m_, n_, k_, m_ / warp_m, n_ / warp_n,
+                                  a_->dtype.bits(), kPack_, transA_);
+        results.Set(a_, fragment->BindThreadRange(thread_range));
+      }
     } else {
       ICHECK(0);
     }
     if (b_.scope() == "shared" || b_.scope() == "shared.dyn") {
+      LOG(INFO) << "Using CDNA shared memory layout for B";
       int dim_B = b_->shape.size();
-      auto shared_layout = makeGemmABLayoutCDNA(
-          *as_const_int(b_->shape[dim_B - 2]),
-          *as_const_int(b_->shape[dim_B - 1]), b_->dtype.bits(), kPack_);
-
-      results.Set(b_, shared_layout);
+      if (TargetIsDCU(T.target)) {
+        auto shared_layout = makeGemmLayoutLinear(
+            *as_const_int(b_->shape[dim_B - 2]),
+            *as_const_int(b_->shape[dim_B - 1]));
+        results.Set(b_, shared_layout);
+      } else {
+        auto shared_layout = makeGemmABLayoutCDNA(
+            *as_const_int(b_->shape[dim_B - 2]),
+            *as_const_int(b_->shape[dim_B - 1]), b_->dtype.bits(), kPack_);
+        results.Set(b_, shared_layout);
+      }
     } else if (b_.scope() == "local.fragment") {
+      LOG(INFO) << "Using CDNA local fragment layout for B";
       auto fragment =
           makeGemmFragmentB(m_, n_, k_, m_ / warp_m, n_ / warp_n, transB_);
       results.Set(b_, fragment->BindThreadRange(thread_range));

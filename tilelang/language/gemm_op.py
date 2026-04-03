@@ -139,6 +139,7 @@ def gemm_v1(
     mbar: tir.Buffer | None = None,
 ):
     """GEMM v1: use op tl.gemm."""
+    # print("Using GEMM v1")
     return _gemm_impl(
         "tl.tileop.gemm",
         A,
@@ -168,6 +169,7 @@ def gemm_v2(
     mbar: tir.Buffer | None = None,
 ):
     """GEMM v2: use op tl.gemm_py."""
+    print("Using GEMM v2")
     return _gemm_impl(
         "tl.tileop.gemm_py",
         A,

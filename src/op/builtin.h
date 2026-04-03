@@ -336,6 +336,16 @@ TVM_DLL const Op &tma_store_arrive();
 TVM_DLL const Op &tma_store_wait();
 
 /*!
+ * \brief DS read from shared memory to register
+ *
+ * ds_read_vector(dst, lds_base_ptr, m, n, offset)
+ *
+ * This is a tilelang intrinsic for DCU ds_read hardware instruction.
+ * Generated code will call tl::ds_read_vector.
+ */
+TVM_DLL const Op &ds_read_vector();
+
+/*!
  * \brief Set reg hint for warp-specialized branched
  *
  * SetMaxNRegInc(num_reg, is_inc)

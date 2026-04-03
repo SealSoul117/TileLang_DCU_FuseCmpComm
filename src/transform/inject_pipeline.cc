@@ -1057,6 +1057,9 @@ private:
       int stage = static_cast<int>(pipeline_stages[i]->value);
       bool is_async =
           pipeline_async_stages.find(stage) != pipeline_async_stages.end();
+      printf("Block %s assigned to stage %d with order %d%s\n", original_order[i]->name_hint.c_str(),
+            stage, static_cast<int>(pipeline_orders[i]->value),
+            is_async ? " (async)" : " sync");
       PipelineAnnotation stage_order{
           stage,
           /*order=*/static_cast<int>(pipeline_orders[i]->value), is_async,

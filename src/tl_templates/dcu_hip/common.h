@@ -138,3 +138,24 @@ template <typename T> TL_DEVICE void AtomicAddx4(T *ref, const T val[4]) {
   atomicAdd(&ref[2], val[2]);
   atomicAdd(&ref[3], val[3]);
 }
+
+typedef float float4_ __attribute__((ext_vector_type(4)));
+typedef float float2_ __attribute__((ext_vector_type(2)));
+
+struct half4
+{
+    __half x;
+    __half y;
+    __half z;
+    __half w;
+};
+
+union RegisterUnion
+{
+    float4_ vector4;
+    struct
+    {
+        float2_ vector_front;
+        float2_ vector_rear;
+    };
+};

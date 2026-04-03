@@ -66,7 +66,8 @@ template <> struct MfmaTraits<fp8_e4_t> {
 // ref to bitblas/tl/mfma_macro_generator.py::kPack
 template <int M, int N, int K, int num_warp_n, int num_warp_m, bool TransposeA,
           bool TransposeB, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type, typename AccDataType = float>
+          typename B_type, typename C_type, typename AccDataType = float,
+          bool use_swizzle = true>
 class GemmTensorOp {
 public:
   // static_assert(!clear_accum, "clear_accum=true is not supported yet");
@@ -147,13 +148,23 @@ public:
   template <int continuous = 32, int element_size = 2>
   TL_DEVICE static constexpr auto make_swizzle_layout(const int row,
                                                       const int col) {
-    auto [n_row, n_col] =
-        make_mfma_swizzle_layout<continuous, element_size>(row, col);
-    return n_row * continuous + n_col;
+    // auto [n_row, n_col] =
+    //     make_mfma_swizzle_layout<continuous, element_size>(row, col);
+    // return n_row * continuous + n_col;
+    if constexpr (use_swizzle) {
+        auto [n_row, n_col] =
+            make_mfma_swizzle_layout<continuous, element_size>(row, col);
+        return n_row * continuous + n_col;
+    } else {
+        // 不使用 swizzle，直接 linear layout
+        return make_layout_padded<continuous, element_size>(row, col).second + 
+               make_layout_padded<continuous, element_size>(row, col).first * continuous;
+    }
   }
 
   static TL_DEVICE void body(A_type *A_shared, B_type *B_shared,
                              C_type *C_local) {
+    printf("Executing GemmTensorOp dcu_hip body\n");
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
     auto warp_m = warp_id / block_col_warps;
@@ -177,6 +188,10 @@ public:
 
     B_type B_local[warp_rows * kPack * local_size_b];
     A_type A_local[warp_cols * kPack * local_size_a];
+
+    // Get base pointers as byte pointers for ds_read
+    const char* B_shared_bytes = reinterpret_cast<const char*>(B_shared);
+    const char* A_shared_bytes = reinterpret_cast<const char*>(A_shared);
 
     for (int ki = 0; ki < inner_k; ki++) {
       // Fetch B into register
@@ -257,6 +272,7 @@ public:
 
     B_type B_local[warp_rows * kPack * local_size_b];
 
+
     for (int ki = 0; ki < inner_k; ki++) {
       // Fetch B into register
       for (int i = 0; i < warp_rows; i++) {
@@ -302,21 +318,21 @@ namespace tl {
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          typename B_type, typename C_type, bool use_swizzle = false>
 TL_DEVICE void gemm_ss(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float, use_swizzle>;
   Compute::body(pA, pB, accum);
 }
 
 template <int M, int N, int K, int num_warp_m, int num_warp_n, bool trans_A,
           bool trans_B, bool clear_accum, int kPack, typename A_type,
-          typename B_type, typename C_type>
+          typename B_type, typename C_type, bool use_swizzle = false>
 TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
   using Compute =
       GemmTensorOp<M, N, K, num_warp_m, num_warp_n, trans_A, trans_B,
-                   clear_accum, kPack, A_type, B_type, C_type>;
+                   clear_accum, kPack, A_type, B_type, C_type, float, use_swizzle>;
   Compute::body_rs(pA, pB, accum);
 }
 

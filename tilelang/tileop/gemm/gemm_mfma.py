@@ -31,24 +31,28 @@ class GemmMFMA(GemmBase):
         )
 
         if self.is_gemm_ss():
+            print("gemm_ss")
             return {
                 self.A: make_swizzled_layout(self.A),
                 self.B: make_swizzled_layout(self.B),
                 self.C: mfma_emitter.make_mfma_store_layout(self.C),
             }
         elif self.is_gemm_sr():
+            print("gemm_sr")
             return {
                 self.A: make_swizzled_layout(self.A),
                 self.B: mfma_emitter.make_mfma_load_layout(self.B, matrix="B"),
                 self.C: mfma_emitter.make_mfma_store_layout(self.C),
             }
         elif self.is_gemm_rs():
+            print("gemm_rs")
             return {
                 self.A: mfma_emitter.make_mfma_load_layout(self.A, matrix="A"),
                 self.B: make_swizzled_layout(self.B),
                 self.C: mfma_emitter.make_mfma_store_layout(self.C),
             }
         elif self.is_gemm_rr():
+            print("gemm_rr")
             return {
                 self.A: mfma_emitter.make_mfma_load_layout(self.A, matrix="A"),
                 self.B: mfma_emitter.make_mfma_load_layout(self.B, matrix="B"),
@@ -101,6 +105,7 @@ class GemmMFMA(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         if self.is_gemm_ss():
+            print("lower is_gemm_ss")
 
             @T.prim_func
             def _gemm_ssr() -> None:
@@ -136,6 +141,7 @@ class GemmMFMA(GemmBase):
             return _Simplify(_gemm_ssr, inline_let=True)
         elif self.is_gemm_sr():
             assert is_full_region(B_region), "Fragment input B must be a full region"
+            print("lower is_gemm_sr")
 
             @T.prim_func
             def _gemm_srr() -> None:
@@ -167,6 +173,7 @@ class GemmMFMA(GemmBase):
             return _Simplify(_gemm_srr, inline_let=True)
         elif self.is_gemm_rs():
             assert is_full_region(A_region), "Fragment input A must be a full region"
+            print("lower is_gemm_rs")
 
             @T.prim_func
             def _gemm_rsr() -> None:
@@ -195,6 +202,7 @@ class GemmMFMA(GemmBase):
         elif self.is_gemm_rr():
             assert is_full_region(A_region), "Fragment input A must be a full region"
             assert is_full_region(B_region), "Fragment input B must be a full region"
+            print("lower is_gemm_rr")
 
             @T.prim_func
             def _gemm_rsr() -> None:

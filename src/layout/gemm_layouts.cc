@@ -104,6 +104,20 @@ Fragment makeGemmFragmentC16x16CDNA() {
   return Fragment({i, j}, {index}, forward_thread, rep);
 }
 
+// Tiled layout for DCU: each thread handles consecutive data in shared memory
+// This layout is compatible with ds_read_m32x16_b16 which reads continuous memory
+Fragment makeGemmFragmentC16x16CDNATiled() {
+  IterVar i = make_itervar("i", 16);
+  IterVar j = make_itervar("j", 16);
+  IterVar rep = make_itervar("rep", 1);
+  // Tiled layout: thread ID = i*4+(j/4), each thread handles 4 consecutive columns
+  // forward_thread: threads are assigned by  (4 columns) 
+  // index: each thread handles 4 elements at column 0-3, 4-7, 8-11, 12-15
+  PrimExpr forward_thread = i * 4 + FloorDiv(j->var,4);
+  PrimExpr index = FloorMod(j->var, 4);
+  return Fragment({i, j}, {index}, forward_thread, rep);
+}
+
 Fragment makeGemmFragmentC_F64(const int block_m, const int block_n,
                                const int warp_m, const int warp_n) {
   ICHECK(block_m % warp_m == 0);
@@ -165,11 +179,20 @@ Fragment makeGemmFragmentCDCU(const int block_m, const int block_n,
   ICHECK(block_n % warp_n == 0);
   ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
   ICHECK(warp_n % 16 == 0) << "warp_n=" << warp_n;
-  auto base_layout = makeGemmFragmentC16x16CDNA()->Repeat({1, 1}, false);
+  // Use tiled layout for DCU: compatible with ds_read_m32x16_b16
+  // auto base_layout = makeGemmFragmentC16x16CDNA()->Repeat({1, 1}, false);
+  auto base_layout = makeGemmFragmentC16x16CDNATiled()->Repeat({1, 1}, false);
   auto warp_layout =
       base_layout->Repeat({warp_m / 16, warp_n / 16}, false, false);
   auto block_layout =
       warp_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
+  LOG(INFO) << "FragmentC warp_m: " << warp_m;
+  LOG(INFO) << "FragmentC warp_n: " << warp_n;
+  LOG(INFO) << "FragmentC block_m: " << block_m;
+  LOG(INFO) << "FragmentC block_n: " << block_n;
+  LOG(INFO) << "FragmentC base_layout: " << base_layout->DebugOutput();
+  LOG(INFO) << "FragmentC warp_layout: " << warp_layout->DebugOutput();
+  LOG(INFO) << "FragmentC block_layout: " << block_layout->DebugOutput();
   return block_layout;
 }
 
@@ -265,6 +288,13 @@ Fragment makeGemmFragmentB(const int block_m, const int block_n,
                            ->Repeat({block_n / warp_n, 1}, true, false);
     auto block_layout =
         warp_layout->Repeat({warp_n / 8, block_k / 16}, false, false);
+    LOG(INFO) << "FragmentB warp_m: " << warp_m;
+    LOG(INFO) << "FragmentB warp_n: " << warp_n;
+    LOG(INFO) << "FragmentB block_m: " << block_m;
+    LOG(INFO) << "FragmentB block_n: " << block_n;
+    LOG(INFO) << "FragmentB base_layout: " << base_layout->DebugOutput();
+    LOG(INFO) << "FragmentB warp_layout: " << warp_layout->DebugOutput();
+    LOG(INFO) << "FragmentB block_layout: " << block_layout->DebugOutput();
     return block_layout;
   } else {
     auto base_layout =
@@ -273,8 +303,16 @@ Fragment makeGemmFragmentB(const int block_m, const int block_n,
                            ->Repeat({1, block_n / warp_n}, true);
     auto block_layout =
         warp_layout->Repeat({block_k / 16, warp_n / 8}, false, true);
+    LOG(INFO) << "FragmentB warp_m: " << warp_m;
+    LOG(INFO) << "FragmentB warp_n: " << warp_n;
+    LOG(INFO) << "FragmentB block_m: " << block_m;
+    LOG(INFO) << "FragmentB block_n: " << block_n;
+    LOG(INFO) << "FragmentB base_layout: " << base_layout->DebugOutput();
+    LOG(INFO) << "FragmentB warp_layout: " << warp_layout->DebugOutput();
+    LOG(INFO) << "FragmentB block_layout: " << block_layout->DebugOutput();        
     return block_layout;
   }
+
 }
 
 Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
@@ -313,6 +351,58 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
     return block_layout;
   }
 }
+
+Fragment makeGemmFragmentADCU(const int block_m, const int block_n,
+                               const int block_k, const int warp_m,
+                               const int warp_n, const int element_size,
+                               const int k_pack, bool transposed) {
+  // assume not transposed
+  ICHECK(block_m % warp_m == 0);
+  ICHECK(block_n % warp_n == 0);
+  ICHECK(warp_m % 16 == 0);
+  const int mfma_k = k_pack * (element_size == 16 ? 16 : 32);
+  ICHECK(block_k % mfma_k == 0);
+  ICHECK(element_size == 8 || element_size == 16)
+      << "element bitwidth=" << element_size;
+  if (transposed) {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNATransposed(k_pack)->Repeat(
+                  {1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({block_k / mfma_k, warp_m / 16}, false, true);
+    auto block_layout = warp_layout->Repeat({1, block_m / warp_m}, true, true)
+                            ->Replicate(block_n / warp_n);
+    LOG(INFO) << "FragmentA warp_m: " << warp_m;
+    LOG(INFO) << "FragmentA warp_n: " << warp_n;
+    LOG(INFO) << "FragmentA block_m: " << block_m;
+    LOG(INFO) << "FragmentA block_n: " << block_n;
+    LOG(INFO) << "FragmentA base_layout: " << base_layout->DebugOutput();
+    LOG(INFO) << "FragmentA warp_layout: " << warp_layout->DebugOutput();
+    LOG(INFO) << "FragmentA block_layout: " << block_layout->DebugOutput();                             
+    return block_layout;
+  } else {
+    auto base_layout =
+        element_size == 16
+            ? makeGemmFragmentAB16x16CDNA(k_pack)->Repeat({1, 1}, false, false)
+            : makeGemmFragmentAB16x32CDNA(k_pack)->Repeat({1, 1}, false, false);
+    auto warp_layout =
+        base_layout->Repeat({warp_m / 16, block_k / mfma_k}, false, false);
+    auto block_layout = warp_layout->Repeat({block_m / warp_m, 1}, true, true)
+                            ->Replicate(block_n / warp_n);
+    LOG(INFO) << "FragmentA warp_m: " << warp_m;
+    LOG(INFO) << "FragmentA warp_n: " << warp_n;
+    LOG(INFO) << "FragmentA block_m: " << block_m;
+    LOG(INFO) << "FragmentA block_n: " << block_n;
+    LOG(INFO) << "FragmentA base_layout: " << base_layout->DebugOutput();
+    LOG(INFO) << "FragmentA warp_layout: " << warp_layout->DebugOutput();
+    LOG(INFO) << "FragmentA block_layout: " << block_layout->DebugOutput();                             
+    return block_layout;
+  }
+}
+
 
 Fragment makeGemmFragment32x32(int element_size) {
   IterVar i = make_itervar("i", 32);

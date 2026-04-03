@@ -181,6 +181,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
+    # print("********************")
+    # print(mod)
+    # print("********************")
     pass_ctx = tilelang.transform.get_pass_context()
     # Lower the barrier.arrive into specific initialization slot
     mod = tilelang.transform.LowerSharedBarrier()(mod)
@@ -204,6 +207,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
             mod = tilelang.transform.RewriteWgmmaSync()(mod)
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
+
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
@@ -214,12 +218,14 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
 
+
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     # ConfigIndexBitwidth must be applied after FlattenBuffer
     # as it will flatten index computing
+
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)

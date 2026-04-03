@@ -115,7 +115,8 @@ class MatrixCoreIntrinEmitter:
         if a_dtype.bits == 32:
             self.k_dim = 4
         elif a_dtype.bits in {16, 8}:
-            self.k_dim = 16
+            # self.k_dim = 16
+            self.k_dim = 256
         else:
             raise ValueError(f"Unsupported a_dtype = {a_dtype}")
 

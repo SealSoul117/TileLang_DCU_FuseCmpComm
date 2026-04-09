@@ -360,6 +360,46 @@ def InjectDSRead():
     return _ffi_api.InjectDSRead()  # type: ignore
 
 
+def InjectBLocalLayoutTransform():
+    """Transform B_local layout from shared memory thread-interleaved to local row-major.
+
+    This pass specifically handles the B_local buffer layout transformation in GEMM kernels
+    for AMD DCU (gfx936, gfx942, etc.). It converts complex indexed BufferStore patterns
+    from shared memory into vectorized ds_read_vector hardware instructions.
+
+    B Layout Transformation:
+    - Shared Memory Layout (per thread in warp, 16 elements):
+        Thread 0: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15]
+        Thread 1: [16,17,18,...                        ,31       ]
+        ...
+    - Local Register Layout (16x32, row-major):
+        Row 0: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 0, 1,...]
+        Row 1: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 0, 1,...]
+        ...
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    print("Injecting Transform B_local layout from shared memory thread-interleaved to local row-major for DCU.")
+    return _ffi_api.InjectBLocalLayoutTransform()  # type: ignore
+
+
+def InjectBLocalLayoutTransformWithPrefetch():
+    """Transform B_local layout with prefetch injection.
+
+    This pass is similar to InjectBLocalLayoutTransform but also injects
+    prefetch operations for B_local before the main transformation.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectBLocalLayoutTransformWithPrefetch()  # type: ignore
+
+
 def LowerDeviceStorageAccessInfo():
     """Lower attached storage access information on device.
 

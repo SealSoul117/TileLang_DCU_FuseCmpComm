@@ -33,30 +33,12 @@
 #include "../op/builtin.h"
 #include "tir/ir/buffer_common.h"
 #include "tvm/tir/stmt.h"
+#include "inject_utils.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
-
-/*!
- * \brief Check if the target is AMD DCU (gfx936, gfx942, etc.)
- */
-bool IsDCUTarget(const IRModule& module) {
-  for (auto& p : module->functions) {
-    if (auto* prim_func = p.second.as<PrimFuncNode>()) {
-      if (auto opt_target = prim_func->GetAttr<Target>("target")) {
-        Target target = opt_target.value();
-        if (target->attrs.count("mcpu")) {
-          std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
-          // if mcpu start with "gfx936", it is DCU
-          return mcpu.find("gfx936") == 0;
-        }
-      }
-    }
-  }
-  return false;
-}
 
 class DSReadInjector : public StmtExprMutator {
  public:
@@ -87,7 +69,7 @@ class DSReadInjector : public StmtExprMutator {
   /*!
    * \brief Visit BufferStoreNode to inject ds_read_vector call
    * Pattern: local_buffer[...] = shared_buffer[...] (BufferLoad)
-   * Parameters m, n, offset are passed via a preceding CallNode
+   * Parameters m, n, offset are passed via a CallNode (tl.ds_read_config)
    */
   Stmt VisitStmt_(const BufferStoreNode* op) override {
     std::cout << "[DEBUG VisitStmt_] Visiting BufferStoreNode" << std::endl;
@@ -118,24 +100,18 @@ class DSReadInjector : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    // Found pattern: local = BufferLoad(shared)
-    // The m, n, offset parameters should come from a CallNode in the IR
-    // For now, use default values that will be replaced when CallNode is processed
-    std::cout << "[DEBUG BufferStore] Injecting ds_read_vector call!" << std::endl;
-
-    // Get parameters from the Store's indices or use default values
-    // In a full implementation, these would come from a preceding CallNode
-    PrimExpr m = make_const(DataType::Int(32), 16);
+    // For A_shared, use the actual shared memory base pointer
+    PrimExpr m = make_const(DataType::Int(32), 32);
     PrimExpr n = make_const(DataType::Int(32), 16);
     PrimExpr offset = make_const(DataType::Int(32), 0);
 
-    // Visit all arguments to transform any nested expressions
+    // Use buffer data vars directly
     Array<PrimExpr> new_args = {
-        VisitExpr(load->buffer.access_ptr(0, DataType::Handle(), 1, 0)),  // src
-        VisitExpr(op->buffer->data),                                        // dst
-        VisitExpr(m),
-        VisitExpr(n),
-        VisitExpr(offset)
+        load->buffer->data,   // src
+        op->buffer->data,      // dst
+        m,
+        n,
+        offset
     };
 
     // Create the ds_read call

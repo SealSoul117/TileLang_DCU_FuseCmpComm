@@ -103,7 +103,14 @@ class DSReadInjector : public StmtExprMutator {
     // For A_shared, use the actual shared memory base pointer
     PrimExpr m = make_const(DataType::Int(32), 32);
     PrimExpr n = make_const(DataType::Int(32), 16);
-    PrimExpr offset = make_const(DataType::Int(32), 0);
+
+    PrimExpr offset;
+    // Extract the shared memory offset from the load indices
+    if (!load->indices.empty()) {
+      offset = load->indices[0];
+    } else {
+      offset = make_const(DataType::Int(32), 0);
+    }
 
     // Use buffer data vars directly
     Array<PrimExpr> new_args = {

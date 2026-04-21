@@ -26,7 +26,7 @@ def shared_16x16_to_local_64x4_layout_A(i, j):
     # thread_id: which thread handles this position
     # local_id: which element within the thread's 4-element vector
     #
-    # Layout (根据你的图示):
+    # Layout :
     #   j=0-3      j=4-7      j=8-11     j=12-15
     #   T0-T3      T16-T19    T32-T35    T48-T51   (i=0)
     #   T4-T7      T20-T23    T36-T39    T52-T55   (i=1)

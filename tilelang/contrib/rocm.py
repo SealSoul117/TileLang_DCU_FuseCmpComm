@@ -26,6 +26,7 @@ import tvm_ffi
 from tvm.base import py_str
 import tvm.runtime
 import tvm.target
+from tvm.target import Target
 
 from tvm.contrib import utils
 
@@ -286,3 +287,12 @@ def find_rocm_path():
     if os.path.exists(os.path.join(rocm_path, "bin/hipcc")):
         return rocm_path
     raise RuntimeError("Cannot find ROCm path")
+
+def is_dcu(target: Target) -> bool:
+    if target.kind.name != "hip" and target.kind.name != "rocm":
+        return False
+    if "mcpu" in target.attrs:
+        mcpu = str(target.attrs["mcpu"])
+        return mcpu.startswith("gfx936")
+        
+    return False

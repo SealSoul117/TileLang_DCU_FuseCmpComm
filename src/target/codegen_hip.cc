@@ -381,7 +381,9 @@ void CodeGenTileLangHIP::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     case 32: {
       if (t.is_scalar()) {
         os << "int";
-      } else if (t.lanes() <= 4) {
+      } else if (t.lanes() == 4) {
+        os << "int32x4_t";
+      } else if (t.lanes() < 4) {
         os << "int" << t.lanes();
       } else if (t.lanes() <= 8) {
         // Emit CUDA code to access int32 vector elements for 4 < lanes <= 8.
@@ -1088,7 +1090,58 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     // HIP doesn't need explicit register management like CUDA
     // This is a no-op for HIP
     return;
-  } else {
+  } else if (op->op.same_as(Op::Get("tl.make_dcu_resource"))) {
+    CHECK_EQ(op->args.size(), 2) << "make_dcu_resource expects 2 arguments";
+    std::string base_ptr = this->PrintExpr(op->args[0]);
+    std::string offset;
+    if (const RampNode* ramp = op->args[1].as<RampNode>()) {
+        offset = this->PrintExpr(ramp->base);
+    } else {
+        offset = this->PrintExpr(op->args[1]);
+    }
+    os << "make_wave_buffer_resource(" << base_ptr << " + (" << offset << "))";
+    
+  }
+  else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
+// 1. 提取模板参数 (IntImm 直接取值)
+    auto get_int_const = [](const PrimExpr& e) -> int {
+        if (const auto* val = e.as<IntImmNode>()) return static_cast<int>(val->value);
+        return 0; 
+    };
+
+    int N             = 16;
+    int smem_offset   = 0; 
+    int load_count    = get_int_const(op->args[4]);
+    int i_sstride     = get_int_const(op->args[5]);
+    int i_gstride     = get_int_const(op->args[6]);
+    int k_gstride     = get_int_const(op->args[7]);
+
+    // 2. 将运行时参数打印到字符串中 (防止直接操作 stream 导致冲突)
+    std::string dst_ptr = this->PrintExpr(op->args[0]);
+    std::string dst_off = this->PrintExpr(op->args[1]);
+    std::string src_res = this->PrintExpr(op->args[2]);
+    std::string src_off = this->PrintExpr(op->args[3]);
+
+    // 3. 仿照范例进行流输出
+    this->PrintIndent();
+    this->stream << "cp_async_gs<" 
+                 << N << ", " 
+                 << smem_offset << ", " 
+                 << load_count << ", " 
+                 << i_sstride << ", " 
+                 << i_gstride << ", " 
+                 << k_gstride << ">(";
+    
+    // 拼接第一个参数：(char*)dst + dst_off
+    this->stream << "((char*)" << dst_ptr << " + " << dst_off << "), ";
+    
+    // 拼接第二个参数：src_res
+    this->stream << src_res << ", ";
+    
+    // 拼接第三个参数：src_off
+    this->stream << src_off << ");\n";
+}
+  else {
     printf("[DEBUG VisitExpr_] Branch: CodeGenC::VisitExpr_ (fallback)\n");
     CodeGenC::VisitExpr_(op, os);
   }

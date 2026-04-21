@@ -4,6 +4,7 @@ from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper
+from tilelang.contrib.rocm import is_dcu
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -68,6 +69,10 @@ def should_enable_layout_visual(pass_ctx: PassContext | None = None) -> bool:
         pass_ctx = tilelang.transform.get_pass_context()
     enabled = pass_ctx.config.get(tilelang.PassConfigKey.TL_LAYOUT_VISUALIZATION_ENABLE, False)
     return enabled
+
+def dcu_async_copy_supported(target: Target | None = None) -> bool:
+    return is_dcu(target)
+    
 
 
 def get_layout_visual_formats(pass_ctx: PassContext | None = None) -> list[str]:
@@ -271,6 +276,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
     # Inject ds_read for shared to register memory copy on DCU
     mod = tilelang.transform.InjectDSRead()(mod)
+    print("222222222")
     print(mod)
  
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
@@ -281,5 +287,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-
+    print("OptimizeForTarget")
+    print(mod)
+    if dcu_async_copy_supported(target):
+        mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
+        print("OptimizeForTarget2")
+        print(mod)
+        mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
+    print("OptimizeForTarget3")
+    print(mod)
     return mod

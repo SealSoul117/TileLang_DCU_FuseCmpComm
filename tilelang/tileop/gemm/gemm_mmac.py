@@ -1,5 +1,5 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_swizzled_layout
+from tilelang.layout import make_swizzled_layout, make_linear_layout
 from tilelang.intrinsics.mmac_macro_generator import (
     MatrixCoreIntrinEmitter,
 )

@@ -552,3 +552,11 @@ def LayoutReducer():
         The transform pass object produced by the FFI backend.
     """
     return _ffi_api.LayoutReducer()  # type: ignore
+
+def LowerSharedGlobalCopy():
+    """DCUResourceRewriter"""
+    return _ffi_api.LowerSharedGlobalCopy()  # type: ignore
+
+def SimplifyDCUAsyncCopy():
+    """SimplifyDCUAsyncCopy"""
+    return _ffi_api.SimplifyDCUAsyncCopy()  # type: ignore

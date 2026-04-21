@@ -888,7 +888,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
  */
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
-
+  printf("Lowering CopyNode with target: %s\n", target->str().c_str());
   using namespace tvm::transform;
   PassContext pass_ctx = PassContext::Current();
   bool disable_tma_lower =
@@ -940,6 +940,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  */
 Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                                arith::Analyzer *analyzer) const {
+  printf("Lowering normal copy for target: %s\n", T.target->str().c_str());
   bool is_cpu_target = T.target->GetTargetDeviceType() == kDLCPU;
   auto simt_loop = MakeSIMTLoop(analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));

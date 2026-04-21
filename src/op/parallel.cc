@@ -242,7 +242,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
                                       InferLevel level) const {
   if (loop_layout_.defined())
     return {};
-
+  LOG(INFO) << "Inferring layout for T.Parallel loop with inference level "
+            << static_cast<int>(level) << "...\n";
   // Expand let bindings to find fragment buffer accesses
   if (!T.let_var_to_expr.empty()) {
     const_cast<ParallelOpNode *>(this)->ExpandLetBindings(T.let_var_to_expr);
@@ -424,7 +425,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
         LOG(FATAL) << msg.str();
       }
     }
-    DLOG(INFO) << "[compute_loop_layout_from_buffer] ... and get "
+    LOG(INFO) << "[compute_loop_layout_from_buffer] ... and get "
                << result->DebugOutput() << '\n';
     return result;
   };

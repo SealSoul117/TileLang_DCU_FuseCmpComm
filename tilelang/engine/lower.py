@@ -252,6 +252,7 @@ def lower(
         func = func_or_mod
         params = extrac_params(func) if not runtime_only else None
         mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    print(mod)
 
     if isinstance(target, str):
         target = determine_target(target)
@@ -266,10 +267,11 @@ def lower(
 
     # Before lowering, do semantic check
     PreLowerSemanticCheck(mod)
-
+    print("1111111")
+    print(mod)
     # Phase 1: Lower and legalize the IR
     mod = LowerAndLegalize(mod, target)
-
+    # print(mod)
     # Phase 2: Optimize the IR for the target
     mod = OptimizeForTarget(mod, target)
 

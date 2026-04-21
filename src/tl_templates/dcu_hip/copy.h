@@ -38,6 +38,20 @@ __device__ void inc_m0(uint32_t m0_inc) {
   asm volatile("s_add_u32 m0, %0, m0" : : "n"(m0_inc) : "memory");
 }
 
+#define UPDATE_WAVE_BUFFER_RESOURCE(res, stride)                       \
+    do {                                                               \
+        /* 1. 提取 64 位基地址，确保低位不进行符号位扩展 */               \
+        uint64_t __current_addr = (static_cast<uint64_t>((res).y) << 32) | \
+                                  (static_cast<uint32_t>((res).x));    \
+                                                                       \
+        /* 2. 增加步长 (自动处理类型提升) */                             \
+        __current_addr += (stride);                                    \
+                                                                       \
+        /* 3. 写回分量到 SGPRs */                                       \
+        (res).x = static_cast<int32_t>(__current_addr);                \
+        (res).y = static_cast<int32_t>(__current_addr >> 32);          \
+    } while (0)
+
 namespace tl {
 
 // AMDGPU automatically commit memory fence
@@ -72,19 +86,95 @@ CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
                : "memory");
 }
 
-template <int N>
-TL_DEVICE void cp_async_gs(void *lds_base_ptr, void *global_base_ptr) {
+template <int N, int smem_offset, int load_count, int i_sstride, int i_gstride, int k_gstride>
+TL_DEVICE void cp_async_gs(void *lds_base_ptr, int32x4_t res, int offset) {
   if constexpr (N == 16) {
-    *(uint4 *)lds_base_ptr = *(uint4 *)global_base_ptr;
-  } else if constexpr (N == 8) {
-    *(uint2 *)lds_base_ptr = *(uint2 *)global_base_ptr;
-  } else if constexpr (N == 4) {
-    async_buffer_load_dword_v(
-        lds_base_ptr,
-        make_wave_buffer_resource(((int32_t *)global_base_ptr) - threadIdx.x),
-        threadIdx.x * N /*assume 4 bytes*/);
+    if constexpr (load_count == 1){
+        async_buffer_load_dwordx4_v<smem_offset>(
+            lds_base_ptr,
+            res,
+            offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride);
+      }
+      else if constexpr (load_count == 2){
+        async_buffer_load_dwordx4_v<smem_offset>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
+        async_buffer_load_dwordx4_v<smem_offset + i_sstride>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - i_gstride);
+      }
+      else if constexpr (load_count == 4){
+        async_buffer_load_dwordx4_v<smem_offset>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
+        async_buffer_load_dwordx4_v<smem_offset + i_sstride>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
+        async_buffer_load_dwordx4_v<smem_offset + 2 * i_sstride>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
+        async_buffer_load_dwordx4_v<smem_offset + 3 * i_sstride>(
+            lds_base_ptr,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - 3 * i_gstride);
+      }
+      else {
+        #pragma unroll
+        for (int i = 0; i < load_count - 1; ++i) {
+          async_buffer_load_dwordx4_v<smem_offset>(
+              lds_base_ptr + i * i_sstride,
+              res,
+              current_offset
+            );
+          UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
+        }
+        async_buffer_load_dwordx4_v<smem_offset>(
+            lds_base_ptr + (load_count - 1) * i_sstride,
+            res,
+            current_offset
+          );
+        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - (load_count - 1) * i_gstride);
+
+      }
+  }
+  else {
+    not implemented;
   }
 }
+
+
+template <int N>
+// TL_DEVICE void cp_async_gs(void *lds_base_ptr, void *global_base_ptr) {
+//   if constexpr (N == 16) {
+//     *(uint4 *)lds_base_ptr = *(uint4 *)global_base_ptr;
+//   } else if constexpr (N == 8) {
+//     *(uint2 *)lds_base_ptr = *(uint2 *)global_base_ptr;
+//   } else if constexpr (N == 4) {
+//     async_buffer_load_dword_v(
+//         lds_base_ptr,
+//         make_wave_buffer_resource(((int32_t *)global_base_ptr) - threadIdx.x),
+//         threadIdx.x * N /*assume 4 bytes*/);
+//   }
+// }
 
 template <int M, int N, int offset>
 TL_DEVICE void ds_read_vector(float4_& dst, uint32_t  lds_base_ptr)

@@ -1900,6 +1900,7 @@ tvm_mmac = _dtype_forward(_tir_op.tvm_mmac)
 tvm_mfma_store = _dtype_forward(_tir_op.tvm_mfma_store)
 tvm_rdna_wmma = _dtype_forward(_tir_op.tvm_rdna_wmma)
 tvm_rdna_wmma_store = _dtype_forward(_tir_op.tvm_rdna_wmma_store)
+make_dcu_resource = _dtype_forward(_tir_op.make_dcu_resource)
 
 broadcast = Broadcast
 ramp = Ramp
@@ -2222,4 +2223,5 @@ __all__ = [
     "CommReducer",
     "Range",
     "vscale",
+    "make_dcu_resource",
 ]

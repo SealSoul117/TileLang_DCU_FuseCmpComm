@@ -257,6 +257,7 @@ class MatrixCoreIntrinEmitter:
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         warp_row_interval = warp_num * 1 * 4 if warp_rows == 1 else warp_num * 2 * 4
+        warp_row_init = warp_num * 1 * 4
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
@@ -286,11 +287,17 @@ class MatrixCoreIntrinEmitter:
             # {8..11,24..27,40..43,56..59} -> 2
             # {12..15,28..31,44..47,60..63} -> 3
             warp_interval_idx = (tx & 15)>>2
+            warp_group_idx = (tx // 32)
             # warp_rows 轮次 warp需要拆分成多轮来访问完整的行块
             if is_transposed:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        # 每轮初始位置行偏移
+                        row += i * warp_row_init
+                        # warp 组行间隔
+                        row += warp_group_idx * 4
+                        # warp 内行间隔
                         row += warp_interval_idx * warp_row_interval
                         l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + i * micro_size_x)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]

@@ -21,6 +21,20 @@ import tilelang.language as T
     3  19  35  51
 '''
 
+def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, tx):
+    new_col = col
+    if warp_rows > 1:
+        inter_idx_padding = 2
+    else:
+        inter_idx_padding = 1
+    
+    paddings = inter_idx_padding * block_row_warps * 4
+    print("paddings:", paddings)
+        
+    new_row = row + paddings * ((tx & 15) // 4)
+    new_row += (idx & 1) * (paddings // 2) + (idx // 2) * 16 * 2 * block_row_warps
+    return new_row, new_col
+
 def shared_16x16_to_local_64x4_layout_A(i, j):
     # i: row (0-15), j: column (0-15)
     # thread_id: which thread handles this position

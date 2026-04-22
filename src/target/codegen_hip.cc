@@ -1099,7 +1099,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else {
         offset = this->PrintExpr(op->args[1]);
     }
-    os << "make_wave_buffer_resource(" << base_ptr << " + (" << offset << "))";
+    os << "tl::make_wave_buffer_resource(" << base_ptr << " + (" << offset << "))";
     
   }
   else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
@@ -1124,7 +1124,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
 
     // 3. 仿照范例进行流输出
     this->PrintIndent();
-    this->stream << "cp_async_gs<" 
+    this->stream << "tl::cp_async_gs<" 
                  << N << ", " 
                  << smem_offset << ", " 
                  << load_count << ", " 

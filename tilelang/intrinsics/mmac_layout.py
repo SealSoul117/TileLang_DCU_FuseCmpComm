@@ -35,6 +35,21 @@ def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, 
     new_row += (idx & 1) * (paddings // 2) + (idx // 2) * 16 * 2 * block_row_warps
     return new_row, new_col
 
+def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, tx):
+    # ???
+    # T0  T1  T2   T3   T4   T5   T6  T7  T8   T9   T10  T11  T12  T13  T14  T15  T0  T1 ...
+    # T0                                  T1                                      T2
+    new_col = ((col % 16 * 8 ) // 32 * 8) + (col // 16) * 4 + (row // 4)
+    # swap per 4 row idx1 <-> idx2
+    bit0 = (tx // 4) & 1
+    bit1 = (tx // 2) & 1
+    new_row = (tx // 4) & (~3)  + (bit0 * 2) + bit1
+    
+    paddings = 32
+    new_col += (idx & 1) * paddings
+    return new_row, new_col 
+
+
 def shared_16x16_to_local_64x4_layout_A(i, j):
     # i: row (0-15), j: column (0-15)
     # thread_id: which thread handles this position
@@ -67,5 +82,28 @@ def thread_id_shared_access_64x4_to_16x16_layout_A(tx, local_id):
     j = (tx // 16) * 4 + local_id  # 0-15: column position
     return i, j
 
+def shared_32x16_to_local_64x8_layout_B(i, j):
+    # i: row (0-15)  j : col (0-31)
+    # Layout:
+    #             0   1    2    3    4   5   6   7   8    9   10   11   12   13   14   15
+    #  row=0-3   T0  T1  T2   T3   T4  T5  T6  T7  T8   T9   T10  T11  T12  T13  T14  T15
+    #  row=4-7   T16 T17 T18  T19  T20 T21 T22 T23 T24  T25  T26  T27  T28  T29  T30  T31
+    #  row=8-11  T32 T33 T34  T35  T36 T37 T38 T39 T40  T41  T42  T43  T44  T45  T46  T47
+    #  row=12-15 T48 T49 T50  T51  T52 T53 T54 T55 T56  T57  T58  T59  T60  T61  T62  T63
+    thread_id = 16 * (i // 4)
+    local_id = (j // 16) * 4 + (i % 4)
+    return thread_id, local_id
+    
+
+def thread_id_shared_access_64x8_to_32x16_layout_B(tx, local_id):
+    # tx: thread id within warp (0-63)
+    # local_id: element index within thread's 4-element vector (0-7)
+    # i : row (0-15)  j : col (0-31)
+    i = (tx // 15) * 4 + local_id % 4
+    j = (tx % 15) + (local_id // 4) * 16
+    return i,j
+
 shared_16x16_to_local_64x4_layout_m_n = shared_16x16_to_local_64x4_layout_A
 shared_16x16_to_local_64x4_layout_n_k = shared_16x16_to_local_64x4_layout_A
+shared_32x16_to_local_64x8_layout_n_m = shared_32x16_to_local_64x8_layout_B
+shared_32x16_to_local_64x8_layout_k_n = shared_32x16_to_local_64x8_layout_B

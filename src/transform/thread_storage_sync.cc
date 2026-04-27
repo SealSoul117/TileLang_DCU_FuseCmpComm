@@ -52,6 +52,7 @@ public:
 
   // The syncs inserted before each statement
   std::unordered_set<const Object *> syncs_inserted_;
+  std::unordered_set<const Object *> barrier_inserted_;
 
 protected:
   bool Enabled(const VarNode *buf, const StorageScope &scope) const final {
@@ -815,9 +816,9 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
-    stmt = ThreadSyncAfterWaitQueueInserter(sync_scope)(stmt);
-  }
+  // if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
+  //   stmt = ThreadSyncAfterWaitQueueInserter(sync_scope)(stmt);
+  // }
   TileLangThreadSyncPlanner planner(sync_scope);
   for (const auto &[_, buffer] : func->buffer_map) {
     planner.SetBufferDataToBuffer(buffer->data, buffer);

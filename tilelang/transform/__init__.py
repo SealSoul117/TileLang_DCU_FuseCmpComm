@@ -560,3 +560,7 @@ def LowerSharedGlobalCopy():
 def SimplifyDCUAsyncCopy():
     """SimplifyDCUAsyncCopy"""
     return _ffi_api.SimplifyDCUAsyncCopy()  # type: ignore
+
+def FixDCUWaitCount():
+    """FixDCUWaitCount"""
+    return _ffi_api.FixDCUWaitCount()  # type: ignore

@@ -94,6 +94,7 @@ CollectResult CollectResources(const Stmt& body) {
         CollectResult result;
 
     private:
+        bool in_async{false};
         std::unordered_set<const tvm::tir::VarNode*> loop_vars_;
         std::vector<const tvm::tir::StmtNode*> scope_stack_; // 追踪当前遍历的 AST 路径
         bool IsSharedScope(const Buffer& buf) {
@@ -105,27 +106,36 @@ CollectResult CollectResources(const Stmt& body) {
             return s == "global" || s == "";
         }
 
-        void VisitStmt_(const AttrStmtNode* op) override {
-            scope_stack_.push_back(op);
-            if (op->attr_key == tvm::tir::attr::thread_extent) {
+        void VisitStmt_(const AttrStmtNode* attr) override {
+            scope_stack_.push_back(attr);
+            if (attr->attr_key == tir::attr::thread_extent) {
                 // 1. 获取 IterVar
-                auto iv = op->node.as<tvm::tir::IterVarNode>();
+                auto iv = attr->node.as<tvm::tir::IterVarNode>();
                 const std::string& tag = iv->thread_tag;
 
-                // 2. 只有当 tag 包含 "threadIdx" 时才加入 (过滤掉 blockIdx)
-                // 比如: "threadIdx.x", "threadIdx.y", "threadIdx.z"
                 if (tag.find("threadIdx") != std::string::npos) {
                     tvm::tir::Var thread_var = iv->var;
+                    LOG(INFO) << "Entering thread scope: " << tag << " with var " << thread_var->name_hint;
                     loop_vars_.insert(thread_var.get());
 
-                    StmtExprVisitor::VisitStmt_(op);
+                    StmtExprVisitor::VisitStmt_(attr);
 
                     loop_vars_.erase(thread_var.get());
                 } else {
                     // 如果是 blockIdx 或其他，直接跳过当前层继续往下走
-                    StmtExprVisitor::VisitStmt_(op);
+                    StmtExprVisitor::VisitStmt_(attr);
                 }
 
+            } else if (attr->attr_key == tir::attr::async_scope) {
+                ICHECK(in_async == false) << "Nested async scopes not supported";
+                in_async = true;
+                
+                StmtExprVisitor::VisitStmt_(attr);
+                
+                in_async = false;
+            }
+            else {
+                StmtExprVisitor::VisitStmt_(attr);
             }
             scope_stack_.pop_back();
         }
@@ -145,14 +155,15 @@ CollectResult CollectResources(const Stmt& body) {
         }
 
         void VisitStmt_(const BufferStoreNode* op) final {
+            LOG(INFO) << "Visiting BufferStore: " << op->buffer->name;
 
             Buffer dst = op->buffer;
-            if (IsSharedScope(dst) && op->value.defined()) {
+            if (IsSharedScope(dst) && op->value.defined() && in_async) {
                 if (const auto* load = op->value.as<BufferLoadNode>()) {
                     Buffer src = load->buffer;
                     if (IsGlobalScope(src)) {
+                        const StmtNode* target = op;
                         if (result.inject_target == nullptr) {
-                            // 从下往上回溯栈，寻找最内层的 thread_extent
                             for (int i = scope_stack_.size() - 1; i >= 0; --i) {
                                 if (scope_stack_[i]->IsInstance<AttrStmtNode>()) {
                                     auto attr = static_cast<const AttrStmtNode*>(scope_stack_[i]);
@@ -198,10 +209,10 @@ CollectResult CollectResources(const Stmt& body) {
                             VariableEliminator eliminator(loop_vars_);
                             tvm::arith::Analyzer analyzer;
                             Array<PrimExpr> base_indices;
-                        LOG(INFO) << loop_vars_.size() << " loop vars in context.";
-                        for (const auto* var : loop_vars_) {
-                            LOG(INFO) << "Loop Var: " << var->name_hint;
-                        }
+                            LOG(INFO) << loop_vars_.size() << " loop vars in context.";
+                            for (const auto* var : loop_vars_) {
+                                LOG(INFO) << "Loop Var: " << var->name_hint;
+                            }
                             for (const auto& idx : load->indices) {
                                 // 将所有外层循环变量 (k, i 等) 全部替换为 0
                                 PrimExpr no_loops = eliminator(idx);
@@ -225,15 +236,18 @@ CollectResult CollectResources(const Stmt& body) {
                             // 将这个绑定关系和 destination 的 shared buffer 绑死
                             result.shared_alloc_to_binding[src->name] = {var, val};
                         }
+                        LOG(INFO) << "result.copies.size() = " << result.copies.size();
                     }
                 }
             }
             StmtExprVisitor::VisitStmt_(op);
         }
     };
+    LOG(INFO) << "Starting resource collection...";
 
     Collector col;
     col(body);
+    LOG(INFO) << "Finished resource collection. Found " << col.result.copies.size() << " copy(s).";
     return col.result;
 }
 
@@ -252,6 +266,15 @@ private:
     StoreReplacer(const std::vector<CopyInfo>& copies, 
                   const std::unordered_map<String, Var>& global_to_var)
         : copies_(copies), global_to_var_(global_to_var) {}
+
+    Stmt VisitStmt_(const AttrStmtNode *attr) {
+        if (attr->attr_key == tir::attr::async_scope) {
+            auto body = this->VisitStmt(attr->body);
+            return body;
+        }
+        return StmtMutator::VisitStmt_(attr); // ③ 其他属性：默认保留
+    }
+
 
     Stmt VisitStmt_(const BufferStoreNode* op) final {
         for (const auto& copy : copies_) {
@@ -331,19 +354,23 @@ private:
 PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
     auto* n = f.CopyOnWrite();
     
-    // 1. 收集信息并定位目标注入点
+    // 收集信息
+    LOG(INFO) << "Starting LowerSharedGlobalCopy transformation...";
     auto res = CollectResources(n->body);
-    if (res.copies.empty()) return f;
+    if (res.copies.empty()){
+        LOG(INFO) << "No shared-global copy patterns detected. Skipping transformation.";
+        return f;
+    }
 
-    // 【核心修改】：2. 先注入 LetStmt！
-    // 此时使用的 n->body 是原始 AST，res.inject_target 指针百分之百匹配。
+    LOG(INFO) << "Replaced " << res.copies.size() << " copy(s) with dcu_async_copy.";
+    // 注入res声明
     Stmt injected = ResourceInjector::Run(n->body, res.shared_alloc_to_binding, res.inject_target);
     
-    // 3. 替换拷贝语句 
-    // injected 是套了 LetStmt 的新 AST，但底层的 BufferStore 还是原来的，可以被正常替换。
+    // 替换拷贝语句 
     Stmt replaced = StoreReplacer::Run(injected, res.copies, res.global_to_res_var);
     
-    // 4. 写回 PrimFunc
+    
+    // 写回
     n->body = std::move(replaced);
     
     return GetRef<PrimFunc>(n);

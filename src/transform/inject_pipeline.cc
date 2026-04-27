@@ -148,6 +148,7 @@ private:
         new_args.Set(i + 1, new_index);
       }
     }
+    LOG(INFO) << "Rewriting buffer access " << call << " to " << Call(call->dtype, call->op, new_args, call->span);
     return Call(call->dtype, call->op, new_args, call->span);
   }
 
@@ -166,6 +167,7 @@ private:
     for (const Buffer &alloc_buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.erase(alloc_buffer->data);
     }
+    LOG(INFO) << "Rewriting block " << GetRef<Block>(op) << " to " << GetRef<Block>(n);
     return block;
   }
 
@@ -309,6 +311,7 @@ public:
     }
     Block block = MakeBlock(stmt, buffer_data_to_buffer_);
     block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
+    LOG(INFO) << "Final rewritten pipeline block: " << block;
     return BlockRealize({}, Bool(true), block);
   }
 
@@ -631,6 +634,9 @@ private:
         n->body = AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
                            AttrStmt(zero, tir::attr::async_wait_inflight_count,
                                     pw.wait_count, n->body));
+        LOG(INFO) << "Inserting async_wait with count " << pw.wait_count
+                  << " before block with order " << new_blocks[pw.insert_before].order
+                  << " for async stage " << stage_id;
       }
     }
 
@@ -1102,6 +1108,7 @@ private:
         buffer_data_to_buffer_.erase(buffer->data);
       }
     }
+    LOG(INFO) << "Finished rewriting the pipeline loop with body:\n" << pipeline;
     return pipeline;
   }
 
@@ -1121,6 +1128,7 @@ private:
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.erase(buffer->data);
     }
+    LOG(INFO) << "Rewriting blockddd " << block;
     return block;
   }
 
@@ -1158,6 +1166,8 @@ tir::transform::Pass InjectSoftwarePipeline() {
     auto *fptr = f.CopyOnWrite();
     fptr->body = software_pipeline::PipelineInjector::Inject(f);
     fptr->body = ConvertSSA(std::move(fptr->body));
+    LOG(INFO) << "Finished injecting software pipeline for PrimFunc " << f->GetAttr<String>(tvm::attr::kGlobalSymbol).value_or("<unknown>")
+              << ", the transformed body is:\n" << fptr->body;
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSoftwarePipeline", {});

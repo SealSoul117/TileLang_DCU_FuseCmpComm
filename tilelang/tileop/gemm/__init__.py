@@ -20,6 +20,10 @@ print("tileop gemm init...")
 def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range):
     print("tileop gemm infer_layout")
     thread_nums = thread_bounds.extent
+    print(f"gemm_py_infer_layout Target: {target}, thread_nums: {thread_nums}")
+    print(f"gemm_py_infer_layout gemm_py: {gemm_py}")
+    t = gemm_py.infer_layout(target, thread_nums)
+    print(f"gemm_py_infer_layout gemm_py.A: {gemm_py.A}, gemm_py.B: {gemm_py.B}, gemm_py.C: {gemm_py.C}")
     return gemm_py.infer_layout(target, thread_nums)
 
 

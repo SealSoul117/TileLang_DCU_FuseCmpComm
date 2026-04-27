@@ -793,8 +793,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
                    << ", " << condition << ");\n";
     }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_commit_group\n");
-    print_extern_call_stmt("tl::cp_async_commit");
+    ;
+    // print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
     printf("[DEBUG VisitExpr_] Branch: ptx_wait_group\n");
     int n = Downcast<IntImm>(op->args[0])->value;
@@ -1103,42 +1103,51 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     
   }
   else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
-// 1. 提取模板参数 (IntImm 直接取值)
+    auto get_base_expr = [this](const PrimExpr& e) -> std::string {
+    if (const auto* ramp = e.as<tvm::tir::RampNode>()) {
+        // 如果是 Ramp，只打印它的起始位置 (base)
+        return this->PrintExpr(ramp->base);
+    }
+    // 否则正常打印
+    return this->PrintExpr(e);
+};
+    // 辅助函数：尝试获取整数常量
     auto get_int_const = [](const PrimExpr& e) -> int {
         if (const auto* val = e.as<IntImmNode>()) return static_cast<int>(val->value);
         return 0; 
     };
 
-    int N             = 16;
-    int smem_offset   = 0; 
-    int load_count    = get_int_const(op->args[4]);
-    int i_sstride     = get_int_const(op->args[5]);
-    int i_gstride     = get_int_const(op->args[6]);
-    int k_gstride     = get_int_const(op->args[7]);
+    // 1. 静态模板参数 (按要求仅保留 N 和 smem_offset)
+    int N           = 16;
 
-    // 2. 将运行时参数打印到字符串中 (防止直接操作 stream 导致冲突)
-    std::string dst_ptr = this->PrintExpr(op->args[0]);
-    std::string dst_off = this->PrintExpr(op->args[1]);
-    std::string src_res = this->PrintExpr(op->args[2]);
-    std::string src_off = this->PrintExpr(op->args[3]);
-
-    // 3. 仿照范例进行流输出
-    this->PrintIndent();
-    this->stream << "tl::cp_async_gs<" 
-                 << N << ", " 
-                 << smem_offset << ", " 
-                 << load_count << ", " 
-                 << i_sstride << ", " 
-                 << i_gstride << ", " 
-                 << k_gstride << ">(";
+    // 2. 解析 IR 参数
+    // args[0]: dst_ptr (buf_dyn_shmem)
+    // args[1]: dst_ramp (T.Ramp...)
+    // args[2]: src_res (A_dcu_res)
+    // args[3]: src_ramp (T.Ramp...)
+    // args[4]: load_count (1)
     
-    // 拼接第一个参数：(char*)dst + dst_off
+std::string dst_ptr = this->PrintExpr(op->args[0]);
+// 使用新定义的 get_base_expr 避开 lanes > 4 的检查
+std::string dst_off = get_base_expr(op->args[1]);
+std::string src_res = this->PrintExpr(op->args[2]);
+std::string src_off = get_base_expr(op->args[3]);
+
+    // 3. 生成输出流
+    this->PrintIndent();
+    
+    // 模板参数仅保留 N, smem_offset 和动态提取的 load_count
+    this->stream << "tl::cp_async_gs<" 
+                 << N << ">(";
+    
+    // 打印函数参数
+    // 处理目标地址: ((char*)ptr + offset)
     this->stream << "((char*)" << dst_ptr << " + " << dst_off << "), ";
     
-    // 拼接第二个参数：src_res
+    // 打印源资源指针
     this->stream << src_res << ", ";
     
-    // 拼接第三个参数：src_off
+    // 打印源偏移
     this->stream << src_off << ");\n";
 }
   else {

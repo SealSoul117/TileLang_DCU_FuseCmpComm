@@ -389,7 +389,7 @@ TIR_DEFINE_TL_BUILTIN(__ldg).set_num_inputs(-1).set_attr<TCallEffectKind>(
 
 // 
 TIR_DEFINE_TL_BUILTIN(dcu_async_copy)
-    .set_num_inputs(6)
+    .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

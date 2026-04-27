@@ -213,8 +213,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+        print("OptimizeForTarget")
+        print(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+
         mod = tilelang.transform.MergeIfStmt()(mod)
         if allow_fence_proxy(target=target):
             # in hopper device, wgmma is an async proxy
@@ -270,15 +273,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
-
+    print("OptimizeForTarget2")
+    print(mod)
     # Inject PTX async copy must behind the thread sync pass
     # as ptx async copy won't be recognized as a valid buffer load
-    mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
+    if not dcu_async_copy_supported(target):
+        mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
     # Inject ds_read for shared to register memory copy on DCU
-    mod = tilelang.transform.InjectDSRead()(mod)
-    print("222222222")
-    print(mod)
- 
+    # mod = tilelang.transform.InjectDSRead()(mod)
+
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
     mod = tilelang.transform.MakePackedAPI()(mod)
@@ -287,13 +290,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-    print("OptimizeForTarget")
-    print(mod)
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
-        print("OptimizeForTarget2")
-        print(mod)
-        mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
+        mod = tilelang.transform.FixDCUWaitCount()(mod)
+    #     
+        # mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
     print("OptimizeForTarget3")
     print(mod)
     return mod

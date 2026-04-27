@@ -32,8 +32,6 @@ class GemmMMAC(GemmBase):
 
         if self.is_gemm_ss():
             return {
-                # self.A: make_swizzled_layout(self.A, allow_pad=False),
-                # self.B: make_swizzled_layout(self.B, allow_pad=False),
                 self.A: make_linear_layout(self.A),
                 self.B: make_linear_layout(self.B),
                 self.C: mmac_emitter.make_mmac_store_layout(self.C),

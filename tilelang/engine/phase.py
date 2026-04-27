@@ -236,7 +236,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     # Transform B_local layout from shared memory thread-interleaved to local row-major
-    mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
+    # mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tir.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
@@ -282,9 +282,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # Inject ds_read for shared to register memory copy on DCU
     # mod = tilelang.transform.InjectDSRead()(mod)
 
+    # mod = tilelang.transform.InjectDSRead()(mod)
+    print("222222222")
+    print(mod)
+ 
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
-    mod = tilelang.transform.MakePackedAPI()(mod)
+    mod = tilelang.transform.MakePackedAPI()(mod)   
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
 

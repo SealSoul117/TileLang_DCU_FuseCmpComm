@@ -49,10 +49,7 @@ def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, 
     
     # return new_row, new_col
     
-    if block_col_warps > 1:
-        inter_idx_padding = 2
-    else:
-        inter_idx_padding = 1
+    inter_idx_padding = block_col_warps
     
     paddings = 32
     new_col += idx * inter_idx_padding * paddings

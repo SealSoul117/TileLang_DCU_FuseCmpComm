@@ -386,20 +386,6 @@ def InjectBLocalLayoutTransform():
     return _ffi_api.InjectBLocalLayoutTransform()  # type: ignore
 
 
-def InjectBLocalLayoutTransformWithPrefetch():
-    """Transform B_local layout with prefetch injection.
-
-    This pass is similar to InjectBLocalLayoutTransform but also injects
-    prefetch operations for B_local before the main transformation.
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.InjectBLocalLayoutTransformWithPrefetch()  # type: ignore
-
-
 def LowerDeviceStorageAccessInfo():
     """Lower attached storage access information on device.
 

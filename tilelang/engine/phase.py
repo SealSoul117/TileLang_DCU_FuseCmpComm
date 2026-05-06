@@ -235,8 +235,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
-    # Transform B_local layout from shared memory thread-interleaved to local row-major
-    # mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tir.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
@@ -295,9 +293,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
     if dcu_async_copy_supported(target):
+        print("--------------support dcu async copy------------------")
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
-    #     
+        mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
         # mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
     print("OptimizeForTarget3")
     print(mod)

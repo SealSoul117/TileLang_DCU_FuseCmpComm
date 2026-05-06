@@ -839,18 +839,16 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
   }else if(op->op.same_as(tl::ds_read_vector())){
-    //ds_read_b64 %1, %2 offset:%3
-    // ds_read_m32x16_b16 %0, %1 offset:%2
+    // ds_read_m32x16_b16 %0, %1 offset:0
     printf("[DEBUG VisitExpr_] Branch: ds_read_vector\n");
     std::string dst = this->PrintExpr(op->args[0]);
-    std::string lds_base_ptr = this->PrintExpr(op->args[1]);
-    std::string m = this->PrintExpr(op->args[2]);
-    std::string n = this->PrintExpr(op->args[3]);
-    std::string offset = this->PrintExpr(op->args[4]);
-    this->PrintIndent();
-    this->stream << "tl::ds_read_vector<" << m << ", " << n  <<", " << offset << ">"
-                 << "(*reinterpret_cast<float4_*>(" << dst << "), "
-                 << "reinterpret_cast<uintptr_t>(" << lds_base_ptr << "));\n";
+    std::string local_offset = this->PrintExpr(op->args[1]);
+    std::string lds_offset = this->PrintExpr(op->args[2]);
+    os << "tl::ds_read_vector("
+       << dst << " + " << local_offset
+       << ", "
+       << lds_offset
+       << ")";
   }else if (op->op.same_as(tl::wait_wgmma())) {
     printf("[DEBUG VisitExpr_] Branch: wait_wgmma\n");
     this->PrintIndent();

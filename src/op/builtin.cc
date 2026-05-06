@@ -218,7 +218,7 @@ TIR_DEFINE_TL_BUILTIN(tma_store_wait)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(ds_read_vector)
-    .set_num_inputs(5)
+    .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));                              
 

@@ -90,7 +90,7 @@ def __ldg(load_or_buf: BufferLoad | tir.Buffer, index: PrimExpr | int | None = N
 
 
 
-def ds_read_vector(dst: tir.Var, shared_ptr: tir.Var, m: int, n: int, offset: int) -> Call:
+def ds_read_vector(dst: tir.Var, local_offset: tir.Var, shared_ptr: tir.Var) -> Call:
     """
     Load from shared memory using ds_read_b64 instruction.
 
@@ -104,14 +104,12 @@ def ds_read_vector(dst: tir.Var, shared_ptr: tir.Var, m: int, n: int, offset: in
     Load from shared memory using ds_read_m32x16_b16 instruction.
     
     The ds_read_vector intrinsic has signature:
-        ds_read_vector<M,N,offset>(float4 & dst, int lds_base_ptr)
+        ds_read_vector(dst + local_offset, shared_ptr)
     
     Args:
         dst: Destination pointer (register/local buffer).
+        local_offset: Local offset in bytes for the destination register.
         lds_base_ptr: Source pointer (shared memory buffer data).
-        M: Number of columns in the matrix to load (for ds_read_m32x16_b16 / ds_read_b64).
-        N: Number of rows in the matrix to load (for ds_read_m32x16_b16 / ds_read_b64).
-        offset: address offset into shared memory.
 
     Returns:
         Call: A TIR call intrinsic for the ds_read_b64 instruction.
@@ -120,10 +118,8 @@ def ds_read_vector(dst: tir.Var, shared_ptr: tir.Var, m: int, n: int, offset: in
         "handle",
         tir.op.Op.get("tl.ds_read_vector"),
         dst,
-        shared_ptr,
-        m,
-        n,
-        offset
+        local_offset,
+        shared_ptr
     )
 
 

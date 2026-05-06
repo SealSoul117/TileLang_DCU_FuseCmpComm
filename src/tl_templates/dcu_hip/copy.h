@@ -176,35 +176,43 @@ template <int N>
 //   }
 // }
 
-template <int M, int N, int offset>
-TL_DEVICE void ds_read_vector(float4_& dst, uint32_t  lds_base_ptr)
+TL_DEVICE void ds_read_vector(void* dst, uint32_t  lds_base_ptr)
 {
-  if constexpr (M == 16 && N == 32)
-  {
-    const int offset_in_bytes = offset * sizeof(half_t);
-    asm volatile("ds_read_m32x16_b16 %0, %1 offset:%2\n\t"
+    asm volatile("ds_read_m32x16_b16 %0, %1 offset:0\n\t"
                  : "+v"(dst)
                  : "v"(lds_base_ptr),
-                  "n"(offset_in_bytes)
                  : "memory");
-  }
-  else if constexpr (M == 32 && N == 16)
-  {
-    const int offset_in_bytes0 = offset * sizeof(half_t);
-    const int offset_in_bytes1 = offset_in_bytes0 + 4096;
-    float2_& front = *reinterpret_cast<float2_*>(&dst);
-    float2_& rear  = *(reinterpret_cast<float2_*>(&dst) + 1);
-
-    asm volatile(
-      "ds_read_b64 %1, %2 offset:%3\n\t"
-      "ds_read_b64 %0, %2 offset:%4\n\t"
-
-      : "+v"(rear), "+v"(front)
-      : "v"(lds_base_ptr), "n"(offset_in_bytes0), "n"(offset_in_bytes1)
-      : "memory"
-    );
-  }
 }
+
+// template <int M, int N, int offset>
+// TL_DEVICE void ds_read_vector(float4_& dst, uint32_t  lds_base_ptr)
+// {
+//   if constexpr (M == 16 && N == 32)
+//   {
+//     const int offset_in_bytes = offset * sizeof(half_t);
+//     asm volatile("ds_read_m32x16_b16 %0, %1 offset:%2\n\t"
+//                  : "+v"(dst)
+//                  : "v"(lds_base_ptr),
+//                   "n"(offset_in_bytes)
+//                  : "memory");
+//   }
+//   else if constexpr (M == 32 && N == 16)
+//   {
+//     const int offset_in_bytes0 = offset * sizeof(half_t);
+//     const int offset_in_bytes1 = offset_in_bytes0 + 4096;
+//     float2_& front = *reinterpret_cast<float2_*>(&dst);
+//     float2_& rear  = *(reinterpret_cast<float2_*>(&dst) + 1);
+
+//     asm volatile(
+//       "ds_read_b64 %1, %2 offset:%3\n\t"
+//       "ds_read_b64 %0, %2 offset:%4\n\t"
+
+//       : "+v"(rear), "+v"(front)
+//       : "v"(lds_base_ptr), "n"(offset_in_bytes0), "n"(offset_in_bytes1)
+//       : "memory"
+//     );
+//   }
+// }
 
 template <int N>
 TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,

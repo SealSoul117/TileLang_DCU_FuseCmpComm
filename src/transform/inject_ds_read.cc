@@ -42,88 +42,63 @@ using namespace tir;
 
 class DSReadInjector : public StmtExprMutator {
  public:
-  /*!
-   * \brief Visit EvaluateNode to handle explicit ds_read_vector call
-   * ds_read_vector Call is wrapped in Evaluate to become a statement
-   * Parameters m, n, offset are passed explicitly via CallNode args
-   */
-  Stmt VisitStmt_(const EvaluateNode* op) override {
-    std::cout << "[DEBUG VisitStmt_] Visiting EvaluateNode" << std::endl;
-    const CallNode* call = op->value.as<CallNode>();
-    std::cout << "[DEBUG VisitStmt_] CallNode ptr: " << call << std::endl;
-    if (call != nullptr && call->op.same_as(ds_read_vector())) {
-      ICHECK(call->args.size() == 5)
-          << "ds_read_vector expects 5 arguments: (dst, src, m, n, offset)";
+  bool IsBLocalBuffer(const Buffer& buffer) {
+    std::string name = buffer->name;
+    return name.find("B_local") != std::string::npos;
+  }
 
-      // Print args for debugging - these are the actual CallNode args passed in
-      std::cout << "[DEBUG ds_read_vector] args[0] (dst): " << call->args[0] << std::endl;
-      std::cout << "[DEBUG ds_read_vector] args[1] (src): " << call->args[1] << std::endl;
-      std::cout << "[DEBUG ds_read_vector] args[2] (m): " << call->args[2] << std::endl;
-      std::cout << "[DEBUG ds_read_vector] args[3] (n): " << call->args[3] << std::endl;
-      std::cout << "[DEBUG ds_read_vector] args[4] (offset): " << call->args[4] << std::endl;
-    }
-    // Continue with default traversal (don't replace the existing call)
+ private:
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    Buffer buffer = op->buffer;
+
+  if (!IsBLocalBuffer(buffer)) {
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  /*!
-   * \brief Visit BufferStoreNode to inject ds_read_vector call
-   * Pattern: local_buffer[...] = shared_buffer[...] (BufferLoad)
-   * Parameters m, n, offset are passed via a CallNode (tl.ds_read_config)
-   */
-  Stmt VisitStmt_(const BufferStoreNode* op) override {
-    std::cout << "[DEBUG VisitStmt_] Visiting BufferStoreNode" << std::endl;
+  const BufferLoadNode* load = op->value.as<BufferLoadNode>();
+  if (!load) {
+    return StmtExprMutator::VisitStmt_(op);
+  }
 
-    // Check if the store is to a local register (not shared memory)
-    bool is_local = op->buffer.scope() == "local" ||
-                    op->buffer.scope() == "local.fragment";
-    std::cout << "[DEBUG BufferStore] is_local: " << is_local
-              << ", scope: " << op->buffer.scope() << std::endl;
+  // local offset
+  ICHECK(op->indices.size() == 1);
+  PrimExpr local_index = op->indices[0];
+  PrimExpr local_offset;
 
-    if (!is_local) {
-      return StmtExprMutator::VisitStmt_(op);
-    }
+  if (const RampNode* ramp = local_index.as<RampNode>()) {
+      local_offset = ramp->base;
+  } else {
+      local_offset = local_index;
+  }
 
-    // Check if the value is a BufferLoad from shared memory
-    const BufferLoadNode* load = op->value.as<BufferLoadNode>();
-    if (load == nullptr) {
-      std::cout << "[DEBUG BufferStore] value is not BufferLoad" << std::endl;
-      return StmtExprMutator::VisitStmt_(op);
-    }
+  // lds offset
+  ICHECK(load->indices.size() == 1);
+  PrimExpr lds_index = load->indices[0];
+  PrimExpr lds_offset ;
 
-    bool is_shared_load = load->buffer.scope() == "shared" ||
-                         load->buffer.scope() == "shared.dyn";
-    std::cout << "[DEBUG BufferStore] is_shared_load: " << is_shared_load
-              << ", load scope: " << load->buffer.scope() << std::endl;
+  if (const RampNode* ramp = lds_index.as<RampNode>()) {
+    lds_offset = ramp->base;
+  } else {
+    lds_offset = lds_index;
+  }
 
-    if (!is_shared_load) {
-      return StmtExprMutator::VisitStmt_(op);
-    }
+  // buffer pointer
+  PrimExpr buffer_ptr = buffer->data;
 
-    // For A_shared, use the actual shared memory base pointer
-    PrimExpr m = make_const(DataType::Int(32), 32);
-    PrimExpr n = make_const(DataType::Int(32), 16);
+  Array<PrimExpr> args = {
+      buffer_ptr,
+      local_offset,
+      lds_offset
+  };
 
-    PrimExpr offset;
-    // Extract the shared memory offset from the load indices
-    if (!load->indices.empty()) {
-      offset = load->indices[0];
-    } else {
-      offset = make_const(DataType::Int(32), 0);
-    }
+  Call call = Call(
+      DataType::Handle(),
+      ds_read_vector(),
+      args
+  );
 
-    // Use buffer data vars directly
-    Array<PrimExpr> new_args = {
-        load->buffer->data,   // src
-        op->buffer->data,      // dst
-        m,
-        n,
-        offset
-    };
-
-    // Create the ds_read call
-    Call ds_read_call = Call(DataType::Handle(), ds_read_vector(), new_args);
-    return Evaluate(ds_read_call);
+  return Evaluate(call);
   }
 };
 

@@ -827,14 +827,12 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
   }else if(op->op.same_as(tl::ds_read_vector())){
-    //ds_read_b64 %1, %2 offset:%3
-    // ds_read_m32x16_b16 %0, %1 offset:%2
     std::string dst = this->PrintExpr(op->args[0]);
     std::string local_offset = this->PrintExpr(op->args[1]);
     std::string lds_offset = this->PrintExpr(op->args[2]);
-    os << "tl::ds_read_vector("
+    os << "tl::ds_read_vector(*(float4_ *)("
        << dst << " + " << local_offset
-       << ", "
+       << "), "
        << lds_offset
        << ")";
   }else if (op->op.same_as(tl::wait_wgmma())) {

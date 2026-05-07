@@ -57,13 +57,15 @@ class BLocalLayoutTransformer : public StmtExprMutator {
   int expand_;
 
   Stmt VisitStmt_(const ForNode* op) final {
-    // 只处理 serial 外层循环
+    // 1. 先递归处理子节点（重要：确保处理了嵌套的 For 或 Attr）
+    Stmt new_body = this->VisitStmt(op->body);
+    
+    // 2. 检查当前循环是否是目标循环
+    // 即使 body 变了，我们也尝试看看能不能在这个 loop 层级做变换
+    auto store = new_body.as<BufferStoreNode>();
     if (op->kind != ForKind::kSerial) {
       return StmtExprMutator::VisitStmt_(op);
     }
-
-    // 判断是否是 B_local 写循环
-    auto store = op->body.as<BufferStoreNode>();
     if (!store) {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -79,7 +81,6 @@ class BLocalLayoutTransformer : public StmtExprMutator {
 
     int64_t new_extent = old_extent / expand_;
 
-    // 修改循环范围
     For new_for =
         For(op->loop_var,
             op->min,
@@ -94,100 +95,42 @@ class BLocalLayoutTransformer : public StmtExprMutator {
     std::string name = buffer->name;
     return name.find("B_local") != std::string::npos;
   }
-
-  Stmt MutateStore(const BufferStoreNode* store,
-                   const Var& loop_var) {
-
-    Array<PrimExpr> new_indices = store->indices;
-
-    PrimExpr new_value = store->value;
-
-    // 修改切片跨度:
-    // 原来 j*vec : j*vec+vec
-    // 改为 j*vec : j*vec*expand + vec
-
-    PrimExpr idx = store->indices[0];
-    //T.Ramp(j * 4, 1, 4) -> Ramp(j*8, 1, 4)
-    std::cout << idx << std::endl;
-
-    // 解析 j*vec 结构
-    // 假设结构为 j * vec + const
-
-    // 不改 RHS
-    // PrimExpr value = store->value;
-
-    // 修改写入向量宽度
-    // 原 value 是 Ramp(base=j*4, stride=1, lanes=4)
-    // 匹配 j * stride
-    // Ramp(base=j*8, stride=1, lanes=8)
-    if (const auto* ramp = idx.as<RampNode>()) {
-
-      PrimExpr base = ramp->base;
-      PrimExpr stride = ramp->stride;
-      int old_lanes = ramp->lanes.as<IntImmNode>()->value;
-      int new_lanes = old_lanes * expand_;
-
-      // 匹配 base = j * stride_val
-      if (const auto* mul = base.as<MulNode>()) {
-
-        if (mul->a.same_as(loop_var)) {
-          int64_t old_stride =
-              mul->b.as<IntImmNode>()->value;
-
-          int64_t new_stride =
-              old_stride * expand_;
-
-          PrimExpr new_base =
-              loop_var *
-              make_const(DataType::Int(32), new_stride);
-
-          new_indices.Set(
-              0,
-              Ramp(new_base, stride, new_lanes));
-        }
-        else if (mul->b.same_as(loop_var)) {
-          int64_t old_stride =
-              mul->a.as<IntImmNode>()->value;
-
-          int64_t new_stride =
-              old_stride * expand_;
-
-          PrimExpr new_base =
-              make_const(DataType::Int(32), new_stride) *
-              loop_var;
-
-          new_indices.Set(
-              0,
-              Ramp(new_base, stride, new_lanes));
-        }
+  PrimExpr UpdateIndexBase(PrimExpr base, const Var& loop_var, int expand) {
+      if (const auto* add = base.as<AddNode>()) {
+          return UpdateIndexBase(add->a, loop_var, expand) + 
+                UpdateIndexBase(add->b, loop_var, expand);
+      } else if (const auto* mul = base.as<MulNode>()) {
+          if (mul->a.same_as(loop_var)) {
+              return mul->a * (mul->b * expand);
+          } else if (mul->b.same_as(loop_var)) {
+              return (mul->a * expand) * mul->b;
+          }
       }
-    }
+      return base; 
+  }
+  Stmt MutateStore(const BufferStoreNode* store, const Var& loop_var) {
+      auto n = tvm::ffi::make_object<BufferStoreNode>(*store);
+      Array<PrimExpr> new_indices = store->indices;
 
-    if (auto* load = new_value.as<BufferLoadNode>()) {
-      // BufferLoad with region access: B_shared[start : end]
-      // end - start = lanes，需要同步扩展
-      Array<PrimExpr> value_indices = load->indices;
-      if (auto* old_ramp = load->indices[0].as<RampNode>()) {
-
-          PrimExpr scalar_base = old_ramp->base;     // 必须是 scalar
-          PrimExpr stride      = old_ramp->stride;
-          //RHS 4 lane
-          int old_lanes = old_ramp->lanes.as<IntImmNode>()->value;
-          //RHS 8 lane
-          int new_lanes = old_lanes * expand_;
-
-          value_indices.Set(
-              0,
-              Ramp(scalar_base, stride, new_lanes)
-          );
-
-          new_value = BufferLoad(load->buffer, value_indices);
+      if (const auto* ramp = store->indices[0].as<RampNode>()) {
+          PrimExpr new_base = UpdateIndexBase(ramp->base, loop_var, expand_);
+          
+          int new_lanes = ramp->lanes.as<IntImmNode>()->value * expand_;
+          
+          new_indices.Set(0, Ramp(new_base, ramp->stride, new_lanes));
       }
-    }
 
-    return BufferStore(store->buffer,
-                       new_value,
-                       new_indices);
+      PrimExpr new_value = store->value;
+      if (const auto* load = store->value.as<BufferLoadNode>()) {
+          if (const auto* l_ramp = load->indices[0].as<RampNode>()) {
+              Array<PrimExpr> v_indices = load->indices;
+              int v_new_lanes = l_ramp->lanes.as<IntImmNode>()->value * expand_;
+              v_indices.Set(0, Ramp(l_ramp->base, l_ramp->stride, v_new_lanes));
+              new_value = BufferLoad(load->buffer, v_indices);
+          }
+      }
+
+      return BufferStore(store->buffer, new_value, new_indices);
   }
 };
 

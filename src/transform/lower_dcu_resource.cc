@@ -66,10 +66,8 @@ class VariableKeeper : public tvm::tir::ExprMutator {
   PrimExpr VisitExpr_(const tvm::tir::VarNode* op) override {
     // 关键调试：打印每一个遇到的变量及其地址
     if (keep_vars_.count(op)) {
-      LOG(INFO) << "[KEEP] Found var in list: " << op->name_hint << " (" << op << ")";
       return GetRef<PrimExpr>(op);
     } else {
-      LOG(INFO) << "[ERASE] Var not in list: " << op->name_hint << " (" << op << ")";
       return tvm::tir::make_zero(op->dtype);
     }
   }
@@ -115,7 +113,6 @@ CollectResult CollectResources(const Stmt& body) {
 
                 if (tag.find("threadIdx") != std::string::npos) {
                     tvm::tir::Var thread_var = iv->var;
-                    LOG(INFO) << "Entering thread scope: " << tag << " with var " << thread_var->name_hint;
                     loop_vars_.insert(thread_var.get());
 
                     StmtExprVisitor::VisitStmt_(attr);
@@ -154,12 +151,20 @@ CollectResult CollectResources(const Stmt& body) {
             scope_stack_.pop_back();
         }
 
-        void VisitStmt_(const BufferStoreNode* op) final {
-            LOG(INFO) << "Visiting BufferStore: " << op->buffer->name;
+        static const BufferLoadNode* PeelGlobalLoadValue(const PrimExpr& v) {
+            if (const auto* load = v.as<BufferLoadNode>()) {
+                return load;
+            }
+            if (const auto* cast = v.as<CastNode>()) {
+                return cast->value.as<BufferLoadNode>();
+            }
+            return nullptr;
+        }
 
+        void VisitStmt_(const BufferStoreNode* op) final {
             Buffer dst = op->buffer;
             if (IsSharedScope(dst) && op->value.defined() && in_async) {
-                if (const auto* load = op->value.as<BufferLoadNode>()) {
+                if (const auto* load = PeelGlobalLoadValue(op->value)) {
                     Buffer src = load->buffer;
                     if (IsGlobalScope(src)) {
                         const StmtNode* target = op;
@@ -197,7 +202,6 @@ CollectResult CollectResources(const Stmt& body) {
                         for (const auto& idx : load->indices) {
                             PrimExpr filtered = keeper(idx); 
                             for_var_only_indices.push_back(analyzer.Simplify(filtered));
-                            LOG(INFO) << "ONLY Index: " << idx;
                         }
                         CopyInfo info{dst, src, op->indices, for_var_only_indices, GetRef<Stmt>(op)};
                         result.copies.push_back(info);
@@ -209,10 +213,6 @@ CollectResult CollectResources(const Stmt& body) {
                             VariableEliminator eliminator(loop_vars_);
                             tvm::arith::Analyzer analyzer;
                             Array<PrimExpr> base_indices;
-                            LOG(INFO) << loop_vars_.size() << " loop vars in context.";
-                            for (const auto* var : loop_vars_) {
-                                LOG(INFO) << "Loop Var: " << var->name_hint;
-                            }
                             for (const auto& idx : load->indices) {
                                 // 将所有外层循环变量 (k, i 等) 全部替换为 0
                                 PrimExpr no_loops = eliminator(idx);
@@ -227,7 +227,6 @@ CollectResult CollectResources(const Stmt& body) {
                             // 如果需要把 indices 的每个元素作为独立参数展开：
                             for (const auto& idx : base_indices) {
                                 args.push_back(idx);
-                                LOG(INFO) << "Clean Index: " << idx;
                             }
                             PrimExpr val = Call(DataType::Int(32, 4), 
                                                 Op::Get("tl.make_dcu_resource"), args);
@@ -236,18 +235,15 @@ CollectResult CollectResources(const Stmt& body) {
                             // 将这个绑定关系和 destination 的 shared buffer 绑死
                             result.shared_alloc_to_binding[src->name] = {var, val};
                         }
-                        LOG(INFO) << "result.copies.size() = " << result.copies.size();
                     }
                 }
             }
             StmtExprVisitor::VisitStmt_(op);
         }
     };
-    LOG(INFO) << "Starting resource collection...";
 
     Collector col;
     col(body);
-    LOG(INFO) << "Finished resource collection. Found " << col.result.copies.size() << " copy(s).";
     return col.result;
 }
 
@@ -355,14 +351,11 @@ PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
     auto* n = f.CopyOnWrite();
     
     // 收集信息
-    LOG(INFO) << "Starting LowerSharedGlobalCopy transformation...";
     auto res = CollectResources(n->body);
     if (res.copies.empty()){
-        LOG(INFO) << "No shared-global copy patterns detected. Skipping transformation.";
         return f;
     }
 
-    LOG(INFO) << "Replaced " << res.copies.size() << " copy(s) with dcu_async_copy.";
     // 注入res声明
     Stmt injected = ResourceInjector::Run(n->body, res.shared_alloc_to_binding, res.inject_target);
     

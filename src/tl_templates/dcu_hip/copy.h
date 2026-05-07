@@ -18,6 +18,7 @@ struct __attribute__((packed)) buffer_resource {
   uint32_t range;
   uint32_t config;
 };
+# define CK_TILE_BUFFER_RESOURCE_3RD_DWORD 0x00020000
 
 CK_TILE_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
                                                    uint32_t size = 0xffffffff) {
@@ -86,83 +87,39 @@ CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
                : "memory");
 }
 
-template <int N, int smem_offset, int load_count, int i_sstride, int i_gstride, int k_gstride>
+template <int smem_offset =0, bool pre_nop = false>
+CK_TILE_DEVICE void async_buffer_load_dwordx4_v(void *smem, int32x4_t rsrc,
+                                              index_t voffset) {
+  auto const lds_ptr_sgpr =
+      __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>(smem)));
+  asm volatile("s_add_u32 m0, %0, %3 \n\t"
+               "buffer_load_dwordx4 %1, %2, 0, offen offset:0, lds\n\t" ::"s"(lds_ptr_sgpr),
+               "v"(voffset), "s"(rsrc), "n"(smem_offset)
+               : "memory");
+}
+
+template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, int32x4_t res, int offset) {
   if constexpr (N == 16) {
-    if constexpr (load_count == 1){
-        async_buffer_load_dwordx4_v<smem_offset>(
-            lds_base_ptr,
-            res,
-            offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride);
-      }
-      else if constexpr (load_count == 2){
-        async_buffer_load_dwordx4_v<smem_offset>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
-        async_buffer_load_dwordx4_v<smem_offset + i_sstride>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - i_gstride);
-      }
-      else if constexpr (load_count == 4){
-        async_buffer_load_dwordx4_v<smem_offset>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
-        async_buffer_load_dwordx4_v<smem_offset + i_sstride>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
-        async_buffer_load_dwordx4_v<smem_offset + 2 * i_sstride>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
-        async_buffer_load_dwordx4_v<smem_offset + 3 * i_sstride>(
-            lds_base_ptr,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - 3 * i_gstride);
-      }
-      else {
-        #pragma unroll
-        for (int i = 0; i < load_count - 1; ++i) {
-          async_buffer_load_dwordx4_v<smem_offset>(
-              lds_base_ptr + i * i_sstride,
-              res,
-              current_offset
-            );
-          UPDATE_WAVE_BUFFER_RESOURCE(res, i_gstride);
-        }
-        async_buffer_load_dwordx4_v<smem_offset>(
-            lds_base_ptr + (load_count - 1) * i_sstride,
-            res,
-            current_offset
-          );
-        UPDATE_WAVE_BUFFER_RESOURCE(res, k_gstride - (load_count - 1) * i_gstride);
-
-      }
-  }
-  else {
-    not implemented;
+    async_buffer_load_dwordx4_v(
+        lds_base_ptr,
+        res,
+        offset
+      );
   }
 }
 
+TL_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
+                                                   uint32_t size = 0xffffffff) {
+  buffer_resource res{ptr, size, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
+  int32x4_t r = __builtin_bit_cast(int32x4_t, res);
+  r.x = __builtin_amdgcn_readfirstlane(r.x);
+  r.y = __builtin_amdgcn_readfirstlane(r.y);
+  r.z = __builtin_amdgcn_readfirstlane(r.z);
+  r.w = __builtin_amdgcn_readfirstlane(r.w);
+  return r;
+}
 
-template <int N>
 // TL_DEVICE void cp_async_gs(void *lds_base_ptr, void *global_base_ptr) {
 //   if constexpr (N == 16) {
 //     *(uint4 *)lds_base_ptr = *(uint4 *)global_base_ptr;

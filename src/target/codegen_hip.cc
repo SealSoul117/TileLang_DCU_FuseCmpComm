@@ -574,8 +574,8 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
-    this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    // this->PrintIndent();
+    // this->stream << "tl::wave_barrier();\n";
   }
 }
 
@@ -761,7 +761,6 @@ std::string CodeGenTileLangHIP::GetBufferRef(DataType t,
 
 void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
-    printf("[DEBUG VisitExpr_] Branch: print_extern_call_stmt -> %s\n", name.c_str());
     this->PrintIndent();
     this->stream << name << "(";
     for (size_t i = offset; i < op->args.size(); i++) {
@@ -773,7 +772,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   };
 
   if (op->op.same_as(builtin::ptx_cp_async())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_cp_async\n");
     std::string dst = this->PrintExpr(op->args[0]);
     std::string dst_offset = this->PrintExpr(op->args[1]);
     std::string src = this->PrintExpr(op->args[2]);
@@ -796,42 +794,32 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     ;
     // print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_wait_group\n");
     int n = Downcast<IntImm>(op->args[0])->value;
     std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
     print_extern_call_stmt(func_name, 1);
   } else if (op->op.same_as(builtin::create_barriers())) {
-    printf("[DEBUG VisitExpr_] Branch: create_barriers\n");
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
     std::string barrier_name = "_mbarrier";
     this->stream << "__shared__ uint64_t " << barrier_name << "["
                  << barrier_count << "];\n";
   } else if (op->op.same_as(tl::get_mbarrier())) {
-    printf("[DEBUG VisitExpr_] Branch: get_mbarrier\n");
     std::string barrier_name = "_mbarrier";
     std::string barrier_id = this->PrintExpr(op->args[0]);
     os << barrier_name + "[" + barrier_id + "]";
   } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_arrive_barrier\n");
     print_extern_call_stmt("tl::mbarrier_arrive");
   } else if (op->op.same_as(builtin::ptx_init_barrier_thread_count())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_init_barrier_thread_count\n");
     print_extern_call_stmt("tl::mbarrier_init");
   } else if (op->op.same_as(builtin::ptx_arrive_barrier_expect_tx())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_arrive_barrier_expect_tx\n");
     print_extern_call_stmt("tl::mbarrier_arrive_expect_tx");
   } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_cp_async_barrier\n");
     print_extern_call_stmt("tl::mbarrier_cp_async_arrive");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
-    printf("[DEBUG VisitExpr_] Branch: mbarrier_expect_tx\n");
     print_extern_call_stmt("tl::mbarrier_expect_tx");
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    printf("[DEBUG VisitExpr_] Branch: mbarrier_wait_parity\n");
     print_extern_call_stmt("tl::mbarrier_wait");
   } else if (op->op.same_as(tl::ptx_stmatrix())) {
-    printf("[DEBUG VisitExpr_] Branch: ptx_stmatrix\n");
     int trans = Downcast<IntImm>(op->args[0])->value;
     int num = Downcast<IntImm>(op->args[1])->value;
     std::string func_name = "tl::ptx_stmatrix_x" + std::to_string(num);
@@ -839,8 +827,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
   }else if(op->op.same_as(tl::ds_read_vector())){
-    // ds_read_m32x16_b16 %0, %1 offset:0
-    printf("[DEBUG VisitExpr_] Branch: ds_read_vector\n");
+    //ds_read_b64 %1, %2 offset:%3
+    // ds_read_m32x16_b16 %0, %1 offset:%2
     std::string dst = this->PrintExpr(op->args[0]);
     std::string local_offset = this->PrintExpr(op->args[1]);
     std::string lds_offset = this->PrintExpr(op->args[2]);
@@ -850,16 +838,13 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
        << lds_offset
        << ")";
   }else if (op->op.same_as(tl::wait_wgmma())) {
-    printf("[DEBUG VisitExpr_] Branch: wait_wgmma\n");
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;
     this->stream << "tl::wait_wgmma<" << std::to_string(num_mma) << ">();\n";
   } else if (op->op.same_as(tl::pack_b16())) {
-    printf("[DEBUG VisitExpr_] Branch: pack_b16\n");
     os << "__pack_half2(" << this->PrintExpr(op->args[0]) << ", "
        << this->PrintExpr(op->args[1]) << ")";
   } else if (op->op.same_as(tl::__ldg())) {
-    printf("[DEBUG VisitExpr_] Branch: __ldg\n");
     // HIP fallback: regular load
     const BufferLoadNode *bl = op->args[0].as<BufferLoadNode>();
     ICHECK(bl) << "T.__ldg expects a BufferLoad as the first argument.";
@@ -870,7 +855,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto buffer_ref = this->GetBufferRef(op->dtype, buffer, base);
     os << buffer_ref;
   } else if (op->op.same_as(builtin::tvm_fill_fragment())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_fill_fragment\n");
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 6U);
     os << "nvcuda::wmma::fill_fragment(";
@@ -881,7 +865,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[5], os);
     os << ")";
   } else if (op->op.same_as(builtin::tvm_load_matrix_sync())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_load_matrix_sync\n");
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
     os << "nvcuda::wmma::load_matrix_sync(";
@@ -894,7 +877,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintExpr(op->args[6], os);
     os << ")";
   } else if (op->op.same_as(builtin::tvm_store_matrix_sync())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_store_matrix_sync\n");
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
     os << "nvcuda::wmma::store_matrix_sync(";
@@ -912,7 +894,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     os << ")";
   } else if (op->op.same_as(builtin::tvm_mma_sync())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_mma_sync\n");
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
     os << "nvcuda::wmma::mma_sync(";
@@ -923,7 +904,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << "]" << ((i < 3) ? ", " : ")");
     }
   } else if (op->op.same_as(builtin::tvm_bmma_sync())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_bmma_sync\n");
     need_mma_h_ = true;
     ICHECK_EQ(op->args.size(), 8U);
     os << "nvcuda::wmma::bmma_sync(";
@@ -934,7 +914,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << "]" << ((i < 3) ? ", " : ")");
     }
   } else if (op->op.same_as(tl::tvm_mfma())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_mfma\n");
     // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
@@ -1000,7 +979,6 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mfma_code);
   } else if (op->op.same_as(tl::tvm_mmac())) {
-    printf("[DEBUG VisitExpr_] Branch: tvm_mmac\n");
     // arg 0: prefix: {otype}_{intrM}x{intrN}x{intrK}_{itype}
     // arg 1: A layout: row/col
     // arg 2: B layout: row/col
@@ -1066,10 +1044,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mmac_code);
   } else if (op->op.same_as(builtin::thread_return())) {
-    printf("[DEBUG VisitExpr_] Branch: thread_return\n");
     os << "return";
   } else if (op->op.same_as(tl::tl_gemm())) {
-    printf("[DEBUG VisitExpr_] Branch: tl_gemm\n");
     ICHECK(op->args.size() == 4) << "tl_gemm expects 4 arguments <op_instance, "
                                     "A_ptr, B_ptr, C_ptr>, but got "
                                  << op->args.size();
@@ -1077,14 +1053,11 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
                           op_instance->value, op->args, true, os);
   } else if (op->op.same_as(tl::tl_gemm_sp())) {
-    printf("[DEBUG VisitExpr_] Branch: tl_gemm_sp\n");
     LOG(FATAL) << "tl_gemm_sp is not supported on HIP";
   } else if (op->op.same_as(tl::loop_break())) {
-    printf("[DEBUG VisitExpr_] Branch: loop_break\n");
     this->PrintIndent();
     this->stream << "break;\n";
   } else if (op->op.same_as(tl::no_set_max_nreg())) {
-    printf("[DEBUG VisitExpr_] Branch: no_set_max_nreg\n");
     // HIP doesn't need explicit register management like CUDA
     // This is a no-op for HIP
     return;
@@ -1102,54 +1075,37 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
   else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
     auto get_base_expr = [this](const PrimExpr& e) -> std::string {
-    if (const auto* ramp = e.as<tvm::tir::RampNode>()) {
-        // 如果是 Ramp，只打印它的起始位置 (base)
-        return this->PrintExpr(ramp->base);
-    }
-    // 否则正常打印
-    return this->PrintExpr(e);
-};
-    // 辅助函数：尝试获取整数常量
+        if (const auto* ramp = e.as<tvm::tir::RampNode>()) {
+            return this->PrintExpr(ramp->base);
+        }
+        return this->PrintExpr(e);
+    };
     auto get_int_const = [](const PrimExpr& e) -> int {
         if (const auto* val = e.as<IntImmNode>()) return static_cast<int>(val->value);
         return 0; 
     };
 
-    // 1. 静态模板参数 (按要求仅保留 N 和 smem_offset)
-    int N           = 16;
-
-    // 2. 解析 IR 参数
-    // args[0]: dst_ptr (buf_dyn_shmem)
-    // args[1]: dst_ramp (T.Ramp...)
-    // args[2]: src_res (A_dcu_res)
-    // args[3]: src_ramp (T.Ramp...)
-    // args[4]: load_count (1)
-    
-std::string dst_ptr = this->PrintExpr(op->args[0]);
-// 使用新定义的 get_base_expr 避开 lanes > 4 的检查
-std::string dst_off = get_base_expr(op->args[1]);
-std::string src_res = this->PrintExpr(op->args[2]);
-std::string src_off = get_base_expr(op->args[3]);
-
-    // 3. 生成输出流
+    int N = 16; 
+    std::string dst_ptr = this->PrintExpr(op->args[0]);
+    std::string dst_off = get_base_expr(op->args[1]);
+    std::string src_res = this->PrintExpr(op->args[2]);
+    std::string src_off = get_base_expr(op->args[3]);
     this->PrintIndent();
-    
-    // 模板参数仅保留 N, smem_offset 和动态提取的 load_count
     this->stream << "tl::cp_async_gs<" 
                  << N << ">(";
-    
-    // 打印函数参数
-    // 处理目标地址: ((char*)ptr + offset)
-    this->stream << "((char*)" << dst_ptr << " + " << dst_off << "), ";
-    
-    // 打印源资源指针
+    this->stream << "((half_t*)" << dst_ptr << " + " << dst_off << "), ";
     this->stream << src_res << ", ";
-    
-    // 打印源偏移
-    this->stream << src_off << ");\n";
-}
+    this->stream << src_off << " * sizeof(half_t));\n";
+  }
+    else if (op->op.same_as(Op::Get("tl.async_gld_fence"))) {
+      int fence_num = Downcast<IntImm>(op->args[0])->value;
+      this->PrintIndent();
+      this->stream << "tl::async_gld_fence(" << fence_num << ");\n";
+  } else if (op->op.same_as(Op::Get("tl.wave_barrier"))) {
+    this->PrintIndent();
+    this->stream << "tl::wave_barrier();\n";
+  }
   else {
-    printf("[DEBUG VisitExpr_] Branch: CodeGenC::VisitExpr_ (fallback)\n");
     CodeGenC::VisitExpr_(op, os);
   }
 }

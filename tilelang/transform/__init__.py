@@ -69,6 +69,17 @@ def InjectSoftwarePipeline():
     return _ffi_api.InjectSoftwarePipeline()  # type: ignore
 
 
+def InjectRegisterSoftwarePipeline():
+    """InjectRegisterSoftwarePipeline
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectRegisterSoftwarePipeline()  # type: ignore
+
+
 def FrontendLegalize():
     """FrontendLegalize
 
@@ -550,3 +561,11 @@ def SimplifyDCUAsyncCopy():
 def FixDCUWaitCount():
     """FixDCUWaitCount"""
     return _ffi_api.FixDCUWaitCount()  # type: ignore
+
+def RegisterPipelinePlanning():
+    """RegisterPipelinePlanning"""
+    return _ffi_api.RegisterPipelinePlanning()  # type: ignore
+
+def InsertAsyncMMAFence():
+    """InsertAsyncMMAFence"""
+    return _ffi_api.InsertAsyncMMAFence()  # type: ignore

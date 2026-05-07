@@ -201,6 +201,12 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         # if tma is not enabled, we can also do pipeline planning
         # to get better performance with async copy
         mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+        # Register pipeline must be injected before shared pipeline.
+        # Shared injection rewrites loops into prologue/body/epilogue blocks
+        # and loses the original statement granularity expected by
+        # tl_register_pipeline_stage/order annotations.
+        mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         # warp_specialized pass will pack the if stmt into the block
         # so we need to lower the opaque block first
@@ -213,18 +219,28 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+
+
+        mod = tilelang.transform.PipelinePlanning()(mod)
+
+        mod = tilelang.transform.RegisterPipelinePlanning()(mod)
         print("OptimizeForTarget")
         print(mod)
-        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
+        print("OptimizeForTarget2")
+        
+        print(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-
+        print("OptimizeForTarget2")
+        print(mod)
         mod = tilelang.transform.MergeIfStmt()(mod)
         if allow_fence_proxy(target=target):
             # in hopper device, wgmma is an async proxy
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
 
-
+    print("OptimizeForTarget2.5")
+    print(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
@@ -234,6 +250,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
+
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tir.transform.UnrollLoop()(mod)
@@ -245,6 +262,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     mod = tir.transform.VerifyMemory()(mod)
     mod = tir.transform.AnnotateEntryFunc()(mod)
+
     # TODO(lei): This is a hack to make sure the
     # thread level allreduce pass can be applied
     # in TL. As Tl only use one thread dimension
@@ -271,8 +289,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
-    print("OptimizeForTarget2")
-    print(mod)
+
     # Inject PTX async copy must behind the thread sync pass
     # as ptx async copy won't be recognized as a valid buffer load
     if not dcu_async_copy_supported(target):
@@ -281,8 +298,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # mod = tilelang.transform.InjectDSRead()(mod)
 
     # mod = tilelang.transform.InjectDSRead()(mod)
-    print("222222222")
-    print(mod)
+
  
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
@@ -295,6 +311,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     if dcu_async_copy_supported(target):
         print("--------------support dcu async copy------------------")
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
+        print("222222222")
+        print(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
         print("InjectBLocalLayoutTransform ............")
@@ -302,7 +320,12 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectDSRead()(mod)
         print("InjectDSRead ............")
         print(mod)
+        mod = tilelang.transform.InsertAsyncMMAFence()(mod)
+        print("333333333")
+        print(mod)
+        # Register pipeline planning only writes software_pipeline annotations.
+        # We must inject after planning so prologue/body/epilogue are materialized.
+        # mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+        # mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         # mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
-    print("OptimizeForTarget3")
-    print(mod)
     return mod

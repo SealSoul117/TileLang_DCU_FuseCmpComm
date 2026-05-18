@@ -574,8 +574,8 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
-    // this->PrintIndent();
-    // this->stream << "tl::wave_barrier();\n";
+    this->PrintIndent();
+    this->stream << "__syncthreads();\n";
   }
 }
 
@@ -830,11 +830,11 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string dst = this->PrintExpr(op->args[0]);
     std::string local_offset = this->PrintExpr(op->args[1]);
     std::string lds_offset = this->PrintExpr(op->args[2]);
-    os << "tl::ds_read_vector(*(float4_ *)("
+    os << "tl::ds_read_vector(*(float32x4 *)("
        << dst << " + " << local_offset
        << "), "
        << lds_offset
-       << ")";
+       << " * sizeof(half_t))";
   }else if (op->op.same_as(tl::wait_wgmma())) {
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;

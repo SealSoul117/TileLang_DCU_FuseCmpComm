@@ -26,6 +26,7 @@ enum class CopyInst : uint8_t {
   kBulkStore1D = 6, // utilize tma store 1d
   kTMemLoad = 7,    // tcgen05.ld (tensor memory -> register)
   kTMemStore = 8,   // tcgen05.st (register -> tensor memory)
+  kDCUAsyncCopy = 9,  // Global -> Shared async copy (DCU)
 };
 
 /// Descriptor for Tensor Memory Access (TMA) copy operations
@@ -181,6 +182,8 @@ public:
    */
   bool CheckTMemStore(Target target) const;
 
+
+  bool CheckDCUAsyncCopy(Target target) const;
   /*!
    * \brief Get the copy instruction type.
    */
@@ -218,10 +221,16 @@ protected:
    */
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
+
+  Stmt LowerDCUAsyncCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
   /*!
    * \brief Generate SIMT (thread-level) loop for copying.
    */
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
+
+  For MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const;
+
+  For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const;
 
   /*!
    * \brief Compute linear layout for tma copy.

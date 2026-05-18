@@ -244,8 +244,11 @@ private:
   }
 
   PrimExpr RewriteBufferAccess(const Call &call,
-                               const std::vector<int> &arg_indices) {
+                               const std::vector<int> &arg_indices,
+                               int divisor = 1) {
+                                          LOG(INFO) << "=== [Pipeline Debug] Rewriting buffer access for Call: " << call->op;
     auto product = [](const Array<PrimExpr> &input) {
+
       return foldl(
           [](PrimExpr a, PrimExpr b, Span span) {
             return mul(std::move(a), std::move(b), std::move(span));
@@ -254,6 +257,24 @@ private:
     };
     Array<PrimExpr> new_args = call->args;
     for (int i : arg_indices) {
+            Var buffer_var = Downcast<Var>(call->args[i]);
+      LOG(INFO) << "=== [Pipeline Debug] Rewriting buffer access for Var: " << buffer_var->name_hint
+                << " | Pointer: " << buffer_var.get();
+
+        // 2. 检查是否存在，如果不存在则打印并报错
+        if (buffer_data_to_buffer_.find(buffer_var) == buffer_data_to_buffer_.end()) {
+            LOG(INFO) << "=== [Pipeline Error] Cannot find Var in buffer_data_to_buffer_ ===";
+            LOG(INFO) << "Attempting to find Var: " << buffer_var->name_hint;
+            LOG(INFO) << "Variable pointer: " << buffer_var.get();
+            
+            LOG(INFO) << "Available Vars in map:";
+            for (auto const& [key, val] : buffer_data_to_buffer_) {
+                LOG(INFO) << "  - Name: " << key->name_hint << " | Pointer: " << key.get();
+            }
+            
+            // 抛出一个更有意义的错误，方便定位
+            LOG(FATAL) << "KeyError: Var '" << buffer_var->name_hint << "' is not in buffer_data_to_buffer_";
+        }
       const Buffer &buffer =
           buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
       auto ob = LookupVersionedBuffer(buffer);
@@ -265,6 +286,9 @@ private:
           offset = product(buffer->shape);
         } else {
           offset = new_buffer->strides[0];
+        }
+        if (divisor != 1) {
+          offset = indexdiv(offset, make_const(offset->dtype, divisor));
         }
         PrimExpr new_index =
             old_index +
@@ -336,7 +360,7 @@ private:
         call->op.same_as(tvm_rdna_wmma())) {
       ICHECK_EQ(call->args.size(), 12U)
           << "tl MMA builtins expect 12 arguments for pipeline rewrite";
-      return RewriteBufferAccess(call, {6, 8, 10});
+      return RewriteBufferAccess(call, {6, 8, 10}, 4);
     }
     return call;
   }
@@ -1683,7 +1707,10 @@ private:
     }
 
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
-
+        LOG(INFO) << "Block " << block << " accesses buffers:";
+                    for (auto const& [key, val] : buffer_data_to_buffer_) {
+                LOG(INFO) << "  - Name: " << key->name_hint << " | Pointer: " << key.get();
+            }
     Array<Array<BufferRegion>> access =
         GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
     BlockNode *n = block.CopyOnWrite();
@@ -1693,6 +1720,8 @@ private:
     for (const auto &buffer : op->alloc_buffers) {
       buffer_data_to_buffer_.erase(buffer->data);
     }
+
+
     return block;
   }
 

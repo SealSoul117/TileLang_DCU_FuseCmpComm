@@ -15,7 +15,6 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared)
@@ -45,7 +44,7 @@ def main():
     print(ref_c)
     print("CUDA Source:")
     print(kernel.get_kernel_source())
-    # torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(c, ref_c, rtol=1e-1, atol=1e-1)
     print("All check passed.")
 
     # Get CUDA Source

@@ -166,8 +166,12 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
+    print("After layout inference:")
+    print(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    print("After LowerTileOp:")
+    print(mod)
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
     # Legalize vectorized loops to ensure they are valid
@@ -222,9 +226,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
 
         mod = tilelang.transform.PipelinePlanning()(mod)
-        mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+        print("11111")
+        print(mod)
+        #mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+        print("22222")
+        print(mod)
 
-        mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
+        #mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         mod = tilelang.transform.MergeIfStmt()(mod)
         if allow_fence_proxy(target=target):

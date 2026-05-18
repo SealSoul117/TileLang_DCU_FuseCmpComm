@@ -321,7 +321,7 @@ class MatrixCoreIntrinEmitter:
                         # row += warp_group_idx * 4
                         # # warp 内行间隔
                         # row += warp_interval_idx * warp_row_interval
-                        row, col = shared_to_local_layout_A_padding(row, col, i, warp_rows, self.block_row_warps, tx)
+                        row, col = shared_to_local_layout_A_padding(row, col, i, warp_rows, self.block_row_warps, tx, local_id)
                         print("row, col:", row, col)
                         l, r = (warp_m * warp_inter_stride, rk * chunk + ki * (k_pack * micro_size_k))
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
@@ -346,6 +346,9 @@ class MatrixCoreIntrinEmitter:
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
+        print("B_base0, B_base1:", B_base0, B_base1)
+        print("local_size_b:", local_size_b)
+        print("warp_cols:", warp_cols)
 
         @T.macro
         def _warp_ldmatrix_b(
@@ -371,8 +374,9 @@ class MatrixCoreIntrinEmitter:
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = T.meta_var(reverse_index_map((tx & 15) // 4 + (tx & 3) * 4 + (tx // 16) * 16, local_id))
-                        row, col = shared_to_local_layout_B_padding(row, col, j, warp_cols, self.block_col_warps, tx)
+                        # row, col = T.meta_var(reverse_index_map((tx & 15) // 4 + (tx & 3) * 4 + (tx // 16) * 16, local_id))
+                        row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        row, col = shared_to_local_layout_B_padding(row, col, j, warp_cols, self.block_col_warps, tx, local_id)
                         l, r = (
                             rk * chunk + ki * (k_pack * micro_size_k),
                             # warp_n * warp_col_tiles + j * micro_size_y,
@@ -411,9 +415,9 @@ class MatrixCoreIntrinEmitter:
                     compute_b_dtype,
                     compute_out_dtype,
                     A_local_buf.data,
-                    (a_local_stride + (j * k_pack + kp) * local_size_a) // local_size_a,
+                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
                     B_local_buf.data,
-                    (b_local_stride + (i * k_pack + kp) * local_size_b) // local_size_b,
+                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
                     C_local_buf.data,
                     (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                     dtype=compute_out_dtype,
@@ -496,18 +500,23 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
+        print("local_size_out:", block_row_warps)
 
         def forward_thread(i: int, j: int) -> int:
             """
             Map fragment row `i` and column `j` to a thread index.
             """
-            block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
+            micro_size_dcu_x = 32
+            micro_size_dcu_y = 32
+            warp_cols_dcu = warp_cols // (micro_size_dcu_y // micro_size_y)
+            block_i, block_j = (i // micro_size_dcu_x) % block_row_warps, (j // micro_size_dcu_y) % block_col_warps
+            # (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
             
             lane_id, _ = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
             
             if is_m_first:
-                thread_id = block_i * (block_col_warps * warp_cols) + block_j * warp_size + lane_id
+                thread_id = block_i * (block_col_warps * warp_cols_dcu) + block_j * warp_size + lane_id
             else:
                 thread_id = block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
             return thread_id
@@ -516,13 +525,18 @@ class MatrixCoreIntrinEmitter:
             """
             Map fragment row `i` and column `j` to a local index within a thread's registers.
             """
-            warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
+            micro_size_dcu_x = 32
+            micro_size_dcu_y = 32
+            warp_i, warp_j = (i // micro_size_dcu_x) // block_row_warps, j // micro_size_dcu_y // block_col_warps
+            warp_i_in_32_16 = (i // 16) % 2
+            warp_j_in_32_16 = (j // 16) % 2
+            # (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
             
             # 使用 MMAC 的底层硬件逆映射获取局部偏移
             _, local_id = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
-
-            return warp_j * (warp_rows * local_size_out) + warp_i * local_size_out + local_id
+            return warp_j * ((micro_size_dcu_y // micro_size_y) * local_size_out) + warp_j_in_32_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
+            # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
 
         return T.Fragment(
             shape,

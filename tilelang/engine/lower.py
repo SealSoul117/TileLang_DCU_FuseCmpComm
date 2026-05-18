@@ -142,7 +142,7 @@ def tilelang_callback_hip_compile(code, target):
         target_format="hsaco",
         options=[
             "-std=c++17",
-            "-O1",
+            "-O3",
             "-I" + tl_template_path,
             "-I" + ck_path,
         ],

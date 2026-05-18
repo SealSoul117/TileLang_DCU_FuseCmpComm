@@ -21,7 +21,9 @@ import tilelang.language as T
     3  19  35  51
 '''
 
-def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, tx):
+def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, tx, local_id):
+    col = (tx // 16) * 4 + local_id
+    row = tx % 4
     new_col = col
     if warp_rows > 1:
         inter_idx_padding = 2
@@ -35,11 +37,11 @@ def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, 
     new_row += (idx & 1) * (paddings // 2) + (idx // 2) * 16 * 2 * block_row_warps
     return new_row, new_col
 
-def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, tx):
+def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, tx, local_id):
     # ???
     # T0  T1  T2   T3   T4   T5   T6  T7  T8   T9   T10  T11  T12  T13  T14  T15  T0  T1 ...
     # T0                                  T1                                      T2
-    new_col = ((tx % 4) * 8) + (col // 16) * 4 + (row % 4)
+    new_col = (tx % 4) * 8 + local_id # ((tx % 4) * 8) + (col // 16) * 4 + (row % 4)
     # new_col = ((col % 16 * 8 ) // 32 * 8) + (col // 16) * 4 + (row // 4)
     # swap per 4 row idx1 <-> idx2
     row_tmp = tx // 4
@@ -109,6 +111,18 @@ def thread_id_shared_access_64x8_to_32x16_layout_B(tx, local_id):
     i = (tx // 15) * 4 + local_id % 4
     j = (tx % 15) + (local_id // 4) * 16
     return i,j
+
+
+def thread_id_shared_access_64x4_to_16x16_layout_C_m_n(thread_id, local_id):
+    i = local_id * 4 + (thread_id // 16)
+    j = thread_id % 16
+    return i, j
+
+
+def thread_id_shared_access_64x4_to_16x16_layout_C_n_m(thread_id, local_id):
+    i = thread_id % 16
+    j = local_id * 4 + (thread_id // 16)
+    return i, j
 
 shared_16x16_to_local_64x4_layout_m_n = shared_16x16_to_local_64x4_layout_A
 shared_16x16_to_local_64x4_layout_n_k = shared_16x16_to_local_64x4_layout_A

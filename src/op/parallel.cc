@@ -244,19 +244,24 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     return {};
   LOG(INFO) << "Inferring layout for T.Parallel loop with inference level "
             << static_cast<int>(level) << "...\n";
+  LOG(INFO) << "Initial loop AST:\n" << root_ << '\n';
   // Expand let bindings to find fragment buffer accesses
   if (!T.let_var_to_expr.empty()) {
     const_cast<ParallelOpNode *>(this)->ExpandLetBindings(T.let_var_to_expr);
   }
 
   if (level == InferLevel::kStrict) {
+    LOG(INFO) << "Strict inference level: only using explicitly defined layouts.\n";
     LayoutMap results;
     // Deduce buffers that should be complicated replicated.
     // For example:
     // for i in T.Parallel(m):
     //   fragment[0] = x[i]
     // then fragment[0] must be replicated on all threads.
+    LOG(INFO) << "Checking buffers for strict inference...\n";
     for (const auto &[buffer, indices] : indice_map_) {
+      LOG(INFO) << "Checking buffer " << buffer << " with indices " << indices
+                << '\n';
       if (T.layout_map.count(buffer)) {
         continue;
       }
@@ -301,8 +306,11 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
         results.Set(buffer, frag);
       }
     }
+    LOG(INFO) << "Strict inference completed. Inferred layouts:\n";
+    LOG(INFO) << results << '\n';
     return results;
   }
+  LOG(INFO) << "Non-strict inference level: attempting to infer layouts from buffer accesses and loop structure.\n";
   auto buffer_is_completed_replicated = [&](const Buffer &buffer) {
     if (buffer.scope() != "local.fragment")
       return false;
@@ -319,6 +327,7 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   };
   // Collect fragment buffers with const index and all fragment_buffers
   std::vector<Buffer> const_index_fragment_buffer, fragment_buffers;
+  LOG(INFO) << "Collecting fragment buffers for layout inference...\n";
   for (const auto &[buffer, indices] : indice_map_) {
     if (buffer.scope() != "local.fragment")
       continue;
@@ -352,8 +361,11 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   // Step 1: try to infer loop's partition from a source fragment
   Buffer source_buffer, read_source_buffer;
   Buffer replicated_write_buffer; // Backup: fully replicated write buffer
+  LOG(INFO) << "Identifying source buffers for layout inference...\n";
 
   for (const auto &[buffer, indices] : indice_map_) {
+    LOG(INFO) << "Analyzing buffer " << buffer << " with indices " << indices
+              << '\n';
     if (T.layout_map.count(buffer)) {
       // skip reducers with rep=ALL
       if (auto info = reducer_info_map_.Get(buffer->data);
@@ -385,6 +397,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
       }
     }
   }
+  LOG(INFO) << "Source buffer for layout inference: "
+            << (source_buffer.defined() ? source_buffer->name : "None") << '\n';
   auto compute_loop_layout_from_buffer = [&](const Buffer &buffer) {
     Fragment src_layout = T.layout_map[buffer].as<Fragment>().value();
     DLOG(INFO) << "[compute_loop_layout_from_buffer] infer from buffer `"
@@ -435,7 +449,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   // 2. Non-replicated read buffer
   // 3. Fully replicated write buffer (backup, may cause issues)
   // 4. Free inference mode (no source buffer)
-
+  LOG(INFO) << "Attempting to infer loop layout from source buffers...\n";
+      LOG(INFO) << "Insert root" << root_ << '\n';
   if (source_buffer.defined() && allow_layout_propgate) {
     loop_layout_ = compute_loop_layout_from_buffer(source_buffer);
   } else if (level == InferLevel::kFree) {
@@ -481,13 +496,15 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     if (read_source_buffer.defined() && allow_layout_propgate) {
       loop_layout_ = compute_loop_layout_from_buffer(read_source_buffer);
     }
-
+    LOG(INFO) << "Insert root" << root_ << '\n';
     if (!loop_layout_.defined()) {
       // No source buffer available, use free mode inference
       // Vectorize Size must be aware of the buffer_remap
       // As the pass will do post processing to the layout
       auto maybe_remapped_root_ =
           IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
+      LOG(INFO) << "[PlanLoopPartition] maybe_remapped_root_ = " << maybe_remapped_root_
+                << '\n';
       int vector_size = GetVectorizeSize(maybe_remapped_root_, T.analyzer);
       DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
 
@@ -520,11 +537,11 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
           LOG(FATAL) << "coalesced_width should be an IntImmNode.";
         }
       }
-      DLOG(INFO) << "[PlanLoopPartition] root_ = " << root_
+      LOG(INFO) << "[PlanLoopPartition] root_ = " << root_
                  << " ############# vector_size = " << vector_size
                  << ", thread_bounds = " << T.thread_bounds << '\n';
       loop_layout_ = PlanLoopPartition(root_, vector_size, T.thread_bounds);
-      DLOG(INFO) << "[PlanLoopPartition] loop_layout_ = "
+      LOG(INFO) << "[PlanLoopPartition] loop_layout_ = "
                  << loop_layout_->DebugOutput() << '\n';
     }
 

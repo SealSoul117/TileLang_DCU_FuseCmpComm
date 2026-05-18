@@ -78,6 +78,7 @@ class GemmWarpPolicy(IntEnum):
             ValueError: If the policy is invalid or the partitioning fails.
             AssertionError: If M or N is not divisible by the required factor for FullRow or FullCol policies.
         """
+        print(f"Computing warp partition for M={M}, N={N}, num_warps={num_warps}, policy={self}")
         m_warp = 1  # Initial warp count for rows.
         n_warp = 1  # Initial warp count for columns.
 

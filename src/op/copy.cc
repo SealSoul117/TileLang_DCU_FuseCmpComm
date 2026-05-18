@@ -136,7 +136,16 @@ Copy::Copy(Array<PrimExpr> args) {
     auto region = NormalizeToBufferRegion(args[i]);
     rgs[i] = region->region;
     bf[i] = region->buffer;
+
   }
+  for (int i = 0; i < 2; i++) {
+  LOG(INFO) << (i == 0 ? "src" : "dst") << " region:";
+  for (const auto& r : rgs[i]) {
+    LOG(INFO) << "  min = " << r->min
+              << ", extent = " << r->extent;
+  }
+}
+  
   std::tie(node->src, node->dst) = std::tie(bf[0], bf[1]);
   std::tie(node->src_range, node->dst_range) = std::tie(rgs[0], rgs[1]);
   if (args.size() >= 3) {
@@ -391,6 +400,8 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 
   Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
+  LOG(INFO) << "MakeSIMTLoop for Copy src = " << loop_vars;
+  LOG(INFO) << "src_indices: " << src_indices << ", dst_indices: " << dst_indices;
 
   PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
   PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
@@ -412,6 +423,130 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
     if (coalesced_width.defined()) {
       annotations.Set("coalesced_width", coalesced_width);
     }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kParallel, body, std::nullopt, annotations);
+  }
+  return Downcast<For>(body);
+}
+
+
+For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const {
+  Array<IterVar> loop_vars = MakeIterVars();
+  for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+
+  // 参数定义
+  int pattern_thread_num = 4;
+  
+  // 假设第一个维度 loop_vars[0] 是我们要变换的 i
+  PrimExpr i_raw = loop_vars[0]->var;
+  DataType dtype = i_raw.dtype();
+  // 计算映射后的 i (i_mapped)
+  PrimExpr p_t_num_expr = make_const(i_raw.dtype(), pattern_thread_num);
+
+  // 使用 floordiv 和 floormod 代替运算符
+  // 公式: [(i // (P * L)) % warp_num] * warp_size + [i // (P * L * warp_num)] * pattern_thread_num + [i // L % P]
+  PrimExpr part1 = floormod(floordiv(i_raw, p_t_num_expr), warp_num) * p_t_num_expr * warp_num;
+  PrimExpr part2 = floordiv(i_raw, p_t_num_expr * warp_num) * p_t_num_expr;
+  PrimExpr part3 = floormod(i_raw, pattern_thread_num);
+
+  PrimExpr i_mapped = part1 + part2 + part3;
+  i_mapped = analyzer->Simplify(i_mapped);
+  // 构造特殊的 src_indices
+  Array<PrimExpr> src_indices;
+  // 我们手动替换第一个非 unit 维度的变量
+  size_t idx_in_vars = 0;
+  for (size_t i = 0; i < src_range.size(); ++i) {
+    if (is_one(src_range[i]->extent)) {
+      src_indices.push_back(src_range[i]->min);
+    } else {
+      if (idx_in_vars == 0) {
+        // 对第一个主维度应用变换
+        src_indices.push_back(src_range[i]->min + i_mapped);
+      } else {
+        src_indices.push_back(src_range[i]->min + loop_vars[idx_in_vars]->var);
+      }
+      idx_in_vars++;
+    }
+  }
+
+  // dst_indices 保持正常的一一映射
+  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
+
+  // 生成 Body 逻辑
+  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
+  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
+  if (src_predicate.defined())
+    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
+
+  Stmt body = BufferStore(dst, value, dst_indices);
+  if (dst_predicate.defined()) body = IfThenElse(dst_predicate, body);
+
+  // 构建循环嵌套
+  for (int i = loop_vars.size() - 1; i >= 0; i--) {
+    Map<String, ObjectRef> annotations = {};
+    if (coalesced_width.defined()) annotations.Set("coalesced_width", coalesced_width);
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kParallel, body, std::nullopt, annotations);
+  }
+  return Downcast<For>(body);
+}
+
+For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const {
+  Array<IterVar> loop_vars = MakeIterVars();
+  for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+  
+  // 参数定义
+  int pattern_thread_num = 4;
+
+  PrimExpr i_in_four = floormod(loop_vars[0]->var, pattern_thread_num); 
+  PrimExpr bit0 = floormod(i_in_four, 2);
+  PrimExpr bit1 = floormod(floordiv(i_in_four, 2), 2);
+  PrimExpr part1 = (bit0 * 2) + bit1;
+
+  PrimExpr part2 = floordiv(loop_vars[0]->var, pattern_thread_num) * pattern_thread_num; 
+  
+  PrimExpr i_mapped = part1 + part2;
+  i_mapped = analyzer->Simplify(i_mapped);
+  // 构造特殊的 src_indices
+  Array<PrimExpr> src_indices;
+  // 我们手动替换第一个非 unit 维度的变量
+  size_t idx_in_vars = 0;
+  for (size_t i = 0; i < src_range.size(); ++i) {
+    if (is_one(src_range[i]->extent)) {
+      src_indices.push_back(src_range[i]->min);
+    } else {
+      if (idx_in_vars == 0) {
+        // 对第一个主维度应用变换
+        src_indices.push_back(src_range[i]->min + i_mapped);
+      } else {
+        src_indices.push_back(src_range[i]->min + loop_vars[idx_in_vars]->var);
+      }
+      idx_in_vars++;
+    }
+  }
+
+  // dst_indices 保持正常的一一映射
+  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
+
+  // 生成 Body 逻辑
+  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
+  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
+  if (src_predicate.defined())
+    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
+
+  Stmt body = BufferStore(dst, value, dst_indices);
+  if (dst_predicate.defined()) body = IfThenElse(dst_predicate, body);
+
+  // 构建循环嵌套
+  for (int i = loop_vars.size() - 1; i >= 0; i--) {
+    Map<String, ObjectRef> annotations = {};
+    if (coalesced_width.defined()) annotations.Set("coalesced_width", coalesced_width);
     body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
                ForKind::kParallel, body, std::nullopt, annotations);
   }
@@ -480,7 +615,8 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
       pass_ctx->GetConfig<Bool>(kDisableTMALower, Bool(false)).value();
   auto copy_inst = GetCopyInst(target, disable_tma_lower || disable_tma,
                                T.layout_map, T.analyzer, T.buffer_oob);
-
+  LOG(INFO) << "Enter layout inference for Copy: " << ", src = " << src->name
+            << ", dst = " << dst->name;
   // Handle tensor memory (tmem) layout inference
   if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
     // Tensor memory copy
@@ -587,11 +723,22 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // for LDSM/STSM, the layout was deduced from register layout
   // so we can directly apply the layout of normal copy
   // Use parallel op to infer the layout
+  if (copy_inst == CopyInst::kDCUAsyncCopy){
+    
+  }
+  
   if (!par_op_.defined()) {
+    LOG(INFO) << "Construct parallel op for Copy layout inference for src = "
+              << src->name << ", dst = " << dst->name;
     arith::Analyzer analyzer;
+    LOG(INFO) << "analyzer" << MakeSIMTLoop(&analyzer);
     par_op_ = ParallelOp((MakeSIMTLoop(&analyzer)));
   }
+  LOG(INFO) << "Start parallel op layout inference for Copy src = " << src->name
+            << ", dst = " << dst->name;
   auto layout_map = par_op_->InferLayout(T, level);
+  LOG(INFO) << "Finish parallel op layout inference for Copy src = " << src->name
+            << ", dst = " << dst->name << ", inferred layout map: " << layout_map;
   return layout_map;
 }
 /**
@@ -826,6 +973,23 @@ bool CopyNode::CheckTMemStore(Target target) const {
 }
 
 /**
+ * @brief Determine whether this copy can use DCU async copy
+ *        (Global -> Shared.dyn).
+ *
+ * Returns true when the target is DCU, the source buffer is in
+ * `global` scope, and the destination buffer is in `shared.dyn`
+ * scope.
+ *
+ * @param target The compilation target to query for DCU support.
+ * @return true if the copy may be lowered to a DCU async copy;
+ * false otherwise.
+ */
+bool CopyNode::CheckDCUAsyncCopy(Target target) const {
+  return TargetIsDCU(target) &&
+         dst.scope() == "shared.dyn" &&
+         (src.scope() == "global" || src.scope() == "shared");
+}
+/**
  * @brief Selects the most specific copy instruction supported for the given
  * target and buffers.
  *
@@ -869,6 +1033,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
+  } else if (CheckDCUAsyncCopy(target)) {
+    return CopyInst::kDCUAsyncCopy;
   } else {
     return CopyInst::kNormal;
   }
@@ -913,6 +1079,8 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto ldsm_copy = LowerLDSMCopy(T, analyzer, copy_inst);
     ICHECK(ldsm_copy.defined()) << "Failed to lower ptx matrix copy";
     return ldsm_copy;
+  } else if (copy_inst == CopyInst::kDCUAsyncCopy){
+    return LowerDCUAsyncCopy(T, analyzer);
   } else if (copy_inst == CopyInst::kNormal) {
     return LowerNormalCopy(T, analyzer);
   } else {
@@ -940,7 +1108,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  */
 Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                                arith::Analyzer *analyzer) const {
-  printf("Lowering normal copy for target: %s\n", T.target->str().c_str());
+
   bool is_cpu_target = T.target->GetTargetDeviceType() == kDLCPU;
   auto simt_loop = MakeSIMTLoop(analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
@@ -972,12 +1140,17 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
+    printf("Lowering normal copy for target: %s\n", T.target->str().c_str());
+    LOG(INFO) << "Inferred loop layout for normal copy: " << par_op->GetRoot();
+    LOG(INFO) << loop_layout;
     auto thread_var = T.thread_var;
     auto thread_loop =
         PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer, loop_layout);
     vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+    LOG(INFO) << vectorized_thread_loop;
   }
-
+    printf("fdsg: %s\n", T.target->str().c_str());
+    LOG(INFO) << vectorized_thread_loop;
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
                       vectorized_thread_loop);
@@ -985,6 +1158,66 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
   return vectorized_thread_loop;
 }
 
+Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
+                                 arith::Analyzer *analyzer) const {
+  PrimExpr total_threads = T.thread_bounds->extent;
+  PrimExpr warp_size_expr = make_const(total_threads.dtype(), 64);
+  LOG(INFO) << "dst shape " << dst->shape << ", src shape " << src->shape;
+  // 使用 analyzer->Simplify 确保结果尽可能是一个常数
+  PrimExpr warp_num = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
+  // 安全起见，防止某些极端 case 下 total_threads < 64
+  warp_num = Max(warp_num, make_const(warp_num.dtype(), 1));
+  // 直接生成针对 DCU 优化的 SIMT 循环
+  Stmt simt_loop;
+  if (dst->shape.size() == 2)
+  {
+      if (analyzer->CanProve(dst->shape[0] >= dst->shape[1])) {
+          simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, warp_num);
+      } else {
+          // 既然上面不成立，这里自然就是 dst->shape[0] < dst->shape[1]
+          simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, warp_num);
+      }
+  }
+  else {
+    LOG(FATAL) << "DCU async copy lowering error: Currently only 2D copies are supported. "
+               << "But found dst shape " << dst->shape 
+               << " and src shape " << src->shape << ".";
+  }
+  LOG(INFO) << "Generated SIMT loop for DCU async copy: " << simt_loop;  
+  // 这里的 Fuse 和 Substitute 逻辑保持一致，用于处理多维循环合并
+  auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
+  auto transformed_loop =
+      Downcast<For>(ParallelLoopTransformer::Substitute(fused_loop));
+  LOG(INFO) << "Transformed loop after fusion and substitution: " << transformed_loop;
+  auto par_op = ParallelOp(transformed_loop);
+
+  // DCU 异步拷贝通常需要推导 Layout 以确保线程映射正确
+  std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
+                                    InferLevel::kFree};
+  for (auto level : levels) {
+    par_op->InferLayout({T.target,
+                         T.thread_bounds,
+                         T.layout_map,
+                         analyzer,
+                         false,
+                         T.buffer_remap,
+                         {}},
+                        level);
+  }
+
+  auto loop_layout = par_op->GetLoopLayout();
+  auto thread_loop =
+      PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer, loop_layout);
+  
+  // 最后进行向量化优化（如果满足条件）
+  auto vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+  LOG(INFO) << "Lowered DCU async copy loop: " << vectorized_thread_loop;
+  if (par_op->GetPredicate(T.thread_var).defined()) {
+    return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
+                      vectorized_thread_loop);
+  }
+  return vectorized_thread_loop;
+}
 /**
  * @brief Lower a Copy operator to LDSM/STSM (warp-level 8x8 matrix)
  * instructions.

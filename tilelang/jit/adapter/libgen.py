@@ -108,6 +108,7 @@ class LibraryGenerator:
             command = [
                 "hipcc",
                 "-std=c++17",
+                "-O3",
                 "-fPIC",
                 f"--offload-arch={arch}",
                 "--shared",

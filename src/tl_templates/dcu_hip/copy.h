@@ -133,7 +133,7 @@ TL_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
 //   }
 // }
 
-TL_DEVICE void ds_read_vector(float4_& dst, uint32_t  lds_base_ptr)
+TL_DEVICE void ds_read_vector(float32x4& dst, uint32_t  lds_base_ptr)
 {
     asm volatile("ds_read_m32x16_b16 %0, %1 offset:0\n\t"
                  : "+v"(dst)

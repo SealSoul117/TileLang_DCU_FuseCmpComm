@@ -110,6 +110,9 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
+    LOG(INFO) << "Running InferLayout for infer_list_[" << cur_infer_id
+              << "] at level " << (level == InferLevel::kStrict ? "Strict"
+                                                                : "Common");
     auto updates = next->InferLayout(LayoutInferArgs{target_,
                                                      thread_bounds,
                                                      layout_map,
@@ -118,10 +121,13 @@ public:
                                                      {},
                                                      let_var_to_expr_},
                                      level);
-
+    LOG(INFO) << "InferLayout for infer_list_[" << cur_infer_id
+              << "] returned " << updates.size() << " updates.";
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
       // Basic validity checks
+      LOG(INFO) << "InferLayout returned update for buffer " << buffer
+                << " with layout " << layout;
       ICHECK(buffer.defined()) << "InferLayout returned an undefined buffer.";
       ICHECK(layout.defined()) << "InferLayout returned an undefined layout.";
 
@@ -167,7 +173,7 @@ public:
           }
         }
       };
-
+      LOG(INFO) << "InferLayout update for buffer " << layout_map;
       if (layout_map.count(buffer)) {
         // If new layout contains the old one, update map
         if (buffer.scope() == "local.fragment" &&
@@ -802,13 +808,13 @@ private:
         if (!found) {
           buffers.push_back(op->buffer);
           buffer_data_to_buffers_.Set(op->buffer->data, buffers);
-          DLOG(INFO) << "[LayoutInference] BufferLoad: added buffer "
+          LOG(INFO) << "[LayoutInference] BufferLoad: added buffer "
                      << op->buffer << " buffer.get() = " << op->buffer.get()
                      << " data = " << op->buffer->data.get();
         }
       } else {
         buffer_data_to_buffers_.Set(op->buffer->data, {op->buffer});
-        DLOG(INFO) << "[LayoutInference] BufferLoad: new buffer " << op->buffer
+        LOG(INFO) << "[LayoutInference] BufferLoad: new buffer " << op->buffer
                    << " buffer.get() = " << op->buffer.get()
                    << " data = " << op->buffer->data.get();
       }
@@ -1032,7 +1038,29 @@ private:
     }
   }
 };
+void PrintLayoutInferenceResult(const LayoutInferenceResult& result) {
+  LOG(INFO) << "===== LayoutInferenceResult =====";
 
+  LOG(INFO) << "--- layout_map ---";
+  for (const auto& [buf, layout] : result.layout_map) {
+    LOG(INFO) << "Buffer: " << buf
+              << "\n  layout: " << layout->DebugOutput();
+  }
+
+  LOG(INFO) << "--- for_map ---";
+  for (const auto& [loop, frag] : result.for_map) {
+    LOG(INFO) << "For: " << loop
+              << "\n  fragment: " << frag->DebugOutput();
+  }
+
+  LOG(INFO) << "--- predicate_map ---";
+  for (const auto& [loop, pred] : result.predicate_map) {
+    LOG(INFO) << "For: " << loop
+              << "\n  predicate: " << pred;
+  }
+
+  LOG(INFO) << "===============================";
+}
 class LayoutInferencer : public IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
@@ -1042,6 +1070,7 @@ public:
     BufferUseDefCollector collector(skip_thread_partition);
     collector.Collect(f);
     auto result = collector.Run();
+    PrintLayoutInferenceResult(result);
     LayoutInferencer substituter(result, skip_thread_partition, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
     return f;

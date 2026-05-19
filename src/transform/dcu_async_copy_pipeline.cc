@@ -39,6 +39,7 @@ private:
 
     void VisitExpr_(const CallNode* op) override {
         bool is_async = op->op.same_as(Op::Get("tl.dcu_async_copy")) ||
+                        op->op.same_as(Op::Get("tl.dcu_async_copy_idxen")) ||
                         op->op.same_as(builtin::ptx_cp_async());
         if (is_async) {
             count_++;

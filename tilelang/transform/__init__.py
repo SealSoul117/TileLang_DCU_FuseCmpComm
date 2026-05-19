@@ -370,6 +370,38 @@ def InjectWarpIdx():
     return _ffi_api.InjectWarpIdx()  # type: ignore
 
 
+def InjectDCUAsyncCopyShadowAddr():
+    """Inject warp-dependent shadow shared-memory base addresses for DCU async copy.
+
+    After ``InjectWarpIdx``, declares ``A_shared_addr`` and ``B_shared_addr`` by OR-ing
+    high shadow bits onto ``buf_dyn_shmem``, then replaces the first argument of
+    ``tl.dcu_async_copy`` with the corresponding shadow address.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectDCUAsyncCopyShadowAddr()  # type: ignore
+
+
+def InjectDCUAsyncCopyIdxen():
+    """Convert A-matrix ``tl.dcu_async_copy`` to ``tl.dcu_async_copy_idxen`` for DCU.
+
+    After ``LowerSharedGlobalCopy``, derives the A-matrix K dimension from buffer
+    shapes, sets structured-buffer ``StructBit`` on ``tl.make_dcu_resource`` for A,
+    and splits the global source offset by factoring K-scaled addends into idxen
+  (tile index along K) and ``idxen * (K - tile_width) + remainder`` for
+  ``cp_async_gs_idxen`` codegen.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectDCUAsyncCopyIdxen()  # type: ignore
+
+
 def InjectDSRead():
     """Rewrite shared memory to register load using ds_read hardware instructions on DCU.
 

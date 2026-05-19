@@ -166,12 +166,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
-    print("After layout inference:")
-    print(mod)
+
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
-    print("After LowerTileOp:")
-    print(mod)
+
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
     # Legalize vectorized loops to ensure they are valid
@@ -223,8 +221,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-        print("11111")
-        print(mod)
 
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.RegisterPipelinePlanning()(mod)
@@ -237,8 +233,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
             # in hopper device, wgmma is an async proxy
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
-    print("After PersistThreadblock:")
-    print(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
@@ -309,18 +303,24 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     if dcu_async_copy_supported(target):
         print("--------------support dcu async copy------------------")
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
+        print("--------------after lower shared global copy------------------")
+        print(mod)
+        mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
+        print("--------------after inject dcu async copy------------------")
+        print(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
+        print("--------------after fix dcu wait count------------------")
+        print(mod)
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
-        print("InjectBLocalLayoutTransform ............")
-        print(mod)
+
         mod = tilelang.transform.InjectDSRead()(mod)
-        print("InjectDSRead ............")
-        print(mod)
+
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
         mod = tilelang.transform.InjectWarpIdx()(mod)
+        # mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
+        
+
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
-        print("22222")
-        print(mod)
         # Register pipeline planning only writes software_pipeline annotations.
         # We must inject after planning so prologue/body/epilogue are materialized.
         # mod = tilelang.transform.RegisterPipelinePlanning()(mod)

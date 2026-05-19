@@ -109,16 +109,60 @@ TL_DEVICE void cp_async_gs(void *lds_base_ptr, int32x4_t res, int offset) {
   }
 }
 
-TL_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
-                                                   uint32_t size = 0xffffffff) {
-  buffer_resource res{ptr, size, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
-  int32x4_t r = __builtin_bit_cast(int32x4_t, res);
-  r.x = __builtin_amdgcn_readfirstlane(r.x);
-  r.y = __builtin_amdgcn_readfirstlane(r.y);
-  r.z = __builtin_amdgcn_readfirstlane(r.z);
-  r.w = __builtin_amdgcn_readfirstlane(r.w);
-  return r;
+template <int N, int smem_offset = 0>
+TL_DEVICE void cp_async_gs_idxen(void *lds_base_ptr, int32x4_t res, int offset, int idxen) {
+    typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
+     uint32x2_t v_addr = {idxen, offset};
+    auto const lds_ptr_sgpr =
+      __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>(lds_base_ptr)));
+    
+  asm volatile("s_add_u32 m0, %0, %3 \n\t"
+               "buffer_load_dwordx4 %1, %2, 0, idxen offen offset:0, lds\n\t" ::"s"(lds_ptr_sgpr),
+               "v"(v_addr), "s"(res), "n"(smem_offset)
+               : "memory");
 }
+
+template <uint32_t StructBit = 0>
+TL_DEVICE int32x4_t make_wave_buffer_resource(const void* ptr,
+                          uint32_t size = 0xffffffff)
+{
+    buffer_resource res{
+        ptr,
+        size,
+        CK_TILE_BUFFER_RESOURCE_3RD_DWORD
+    };
+
+    int32x4_t r = __builtin_bit_cast(int32x4_t, res);
+
+    if constexpr (StructBit != 0) {
+        static_assert(StructBit <= 15,
+                      "StructBit must fit in 4 bits for GCN structured buffer");
+
+        constexpr uint32_t IS_STRUCTURED = 0x40000000u;
+        constexpr uint32_t STRUCT_SCALE  = 1u << (17 + StructBit);
+
+        uint32_t addr_hi = static_cast<uint32_t>(r.y) & 0x0000FFFFu;
+        r.y = static_cast<int32_t>(
+            addr_hi | IS_STRUCTURED | STRUCT_SCALE);
+    }
+
+    r.x = __builtin_amdgcn_readfirstlane(r.x);
+    r.y = __builtin_amdgcn_readfirstlane(r.y);
+    r.z = __builtin_amdgcn_readfirstlane(r.z);
+    r.w = __builtin_amdgcn_readfirstlane(r.w);
+
+    return r;
+}
+// TL_DEVICE int32x4_t make_wave_buffer_resource(const void *ptr,
+//                                                    uint32_t size = 0xffffffff) {
+//   buffer_resource res{ptr, size, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
+//   int32x4_t r = __builtin_bit_cast(int32x4_t, res);
+//   r.x = __builtin_amdgcn_readfirstlane(r.x);
+//   r.y = __builtin_amdgcn_readfirstlane(r.y);
+//   r.z = __builtin_amdgcn_readfirstlane(r.z);
+//   r.w = __builtin_amdgcn_readfirstlane(r.w);
+//   return r;
+// }
 
 // TL_DEVICE void cp_async_gs(void *lds_base_ptr, void *global_base_ptr) {
 //   if constexpr (N == 16) {

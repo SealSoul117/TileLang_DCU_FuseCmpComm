@@ -1090,7 +1090,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     // This is a no-op for HIP
     return;
   } else if (op->op.same_as(Op::Get("tl.make_dcu_resource"))) {
-    CHECK_EQ(op->args.size(), 2) << "make_dcu_resource expects 2 arguments";
+    CHECK(op->args.size() >= 2 && op->args.size() <= 3)
+        << "make_dcu_resource expects 2 or 3 arguments";
     std::string base_ptr = this->PrintExpr(op->args[0]);
     std::string offset;
     if (const RampNode* ramp = op->args[1].as<RampNode>()) {
@@ -1098,8 +1099,34 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     } else {
         offset = this->PrintExpr(op->args[1]);
     }
-    os << "tl::make_wave_buffer_resource(" << base_ptr << " + (" << offset << "))";
-    
+    if (op->args.size() == 3) {
+      int struct_bit = Downcast<IntImm>(op->args[2])->value;
+      os << "tl::make_wave_buffer_resource<" << struct_bit << ">(" << base_ptr
+         << " + (" << offset << "))";
+    } else {
+      os << "tl::make_wave_buffer_resource(" << base_ptr << " + (" << offset << "))";
+    }
+  }
+  else if (op->op.same_as(Op::Get("tl.dcu_async_copy_idxen"))) {
+    auto get_base_expr = [this](const PrimExpr& e) -> std::string {
+        if (const auto* ramp = e.as<tvm::tir::RampNode>()) {
+            return this->PrintExpr(ramp->base);
+        }
+        return this->PrintExpr(e);
+    };
+
+    int N = 16;
+    std::string dst_ptr = this->PrintExpr(op->args[0]);
+    std::string dst_off = get_base_expr(op->args[1]);
+    std::string src_res = this->PrintExpr(op->args[2]);
+    std::string src_off = get_base_expr(op->args[3]);
+    std::string idxen = get_base_expr(op->args[4]);
+    this->PrintIndent();
+    this->stream << "tl::cp_async_gs_idxen<" << N << ">(";
+    this->stream << "((half_t*)" << dst_ptr << " + " << dst_off << "), ";
+    this->stream << src_res << ", ";
+    this->stream << src_off << " * sizeof(half_t), ";
+    this->stream << idxen << ");\n";
   }
   else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
     auto get_base_expr = [this](const PrimExpr& e) -> std::string {

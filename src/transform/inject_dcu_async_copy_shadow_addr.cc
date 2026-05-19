@@ -1,0 +1,347 @@
+/*!
+ * \file inject_dcu_async_copy_shadow_addr.cc
+ * \brief Remap shared.dyn base pointers for tl.dcu_async_copy with warp-dependent
+ *        shadow offsets, and replace buf_dyn_shmem with per-buffer shadow addresses.
+ */
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/tir/builtin.h>
+#include <tvm/tir/expr_functor.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
+#include <tvm/tir/transform.h>
+
+#include <string>
+#include <unordered_set>
+
+#include "../op/builtin.h"
+#include "inject_utils.h"
+
+using tvm::ffi::GetRef;
+
+namespace tvm {
+namespace tl {
+
+using namespace tir;
+
+namespace {
+
+const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
+const Op& MakeDCUResourceOp() { return Op::Get("tl.make_dcu_resource"); }
+
+bool IsWarpIdxInit(const PrimExpr& expr) {
+  if (const auto* call = expr.as<CallNode>()) {
+    return call->op.same_as(tl::get_warp_idx_sync());
+  }
+  return false;
+}
+
+bool IsThreadIdxXAttr(const AttrStmtNode* op, const IterVarNode** out_iv = nullptr) {
+  if (op->attr_key != tir::attr::thread_extent) {
+    return false;
+  }
+  const auto* iv = op->node.as<IterVarNode>();
+  if (iv == nullptr || iv->thread_tag != "threadIdx.x") {
+    return false;
+  }
+  if (out_iv != nullptr) {
+    *out_iv = iv;
+  }
+  return true;
+}
+
+std::string GetAllocateStorageScope(const AllocateNode* op) {
+  if (const auto* ptr_type = op->buffer_var->type_annotation.as<PointerTypeNode>()) {
+    if (!ptr_type->storage_scope.empty()) {
+      return ptr_type->storage_scope;
+    }
+  }
+  if (op->annotations.count("storage_scope")) {
+    return Downcast<String>(op->annotations.at("storage_scope"));
+  }
+  return "";
+}
+
+std::string GetGlobalBufferName(const PrimExpr& expr) {
+  if (const auto* var = expr.as<VarNode>()) {
+    return var->name_hint;
+  }
+  if (const auto* load = expr.as<BufferLoadNode>()) {
+    return load->buffer->name;
+  }
+  return "";
+}
+
+bool IsSameVar(const PrimExpr& expr, const Var& var) {
+  if (!var.defined()) {
+    return false;
+  }
+  if (const auto* v = expr.as<VarNode>()) {
+    return v == var.get();
+  }
+  return false;
+}
+
+class InfoCollector : public StmtExprVisitor {
+ public:
+  Var buf_dyn_shmem;
+  PrimExpr thread_extent;
+  std::unordered_set<const VarNode*> a_dcu_res_vars;
+  std::unordered_set<const VarNode*> b_dcu_res_vars;
+
+ private:
+  void VisitStmt_(const AttrStmtNode* op) final {
+    const IterVarNode* iv = nullptr;
+    if (IsThreadIdxXAttr(op, &iv)) {
+      thread_extent = op->value;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode* op) final {
+    if (op->kind == ForKind::kThreadBinding && op->thread_binding.defined() &&
+        op->thread_binding.value()->thread_tag == "threadIdx.x") {
+      thread_extent = op->extent;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocateNode* op) final {
+    const std::string storage_scope = GetAllocateStorageScope(op);
+    if (storage_scope == "shared.dyn") {
+      if (!buf_dyn_shmem.defined() ||
+          op->buffer_var->name_hint == "buf_dyn_shmem") {
+        buf_dyn_shmem = op->buffer_var;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const DeclBufferNode* op) final {
+    if (op->buffer.scope() == "shared.dyn" && !buf_dyn_shmem.defined()) {
+      buf_dyn_shmem = op->buffer->data;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const LetStmtNode* op) final {
+    if (const auto* call = op->value.as<CallNode>()) {
+      if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
+        const std::string global_name = GetGlobalBufferName(call->args[0]);
+        if (global_name == "A" || global_name == "A_1") {
+          a_dcu_res_vars.insert(op->var.get());
+        } else if (global_name == "B" || global_name == "B_1") {
+          b_dcu_res_vars.insert(op->var.get());
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+};
+
+PrimExpr ToUInt64(const PrimExpr& value) {
+  const DataType u64 = DataType::UInt(64);
+  if (value.dtype().is_handle()) {
+    return Call(u64, builtin::reinterpret(), {value});
+  }
+  return Cast(u64, value);
+}
+
+PrimExpr FromUInt64(const DataType& target_dtype, const PrimExpr& value) {
+  if (target_dtype.is_handle()) {
+    return Call(target_dtype, builtin::reinterpret(), {value});
+  }
+  return Cast(target_dtype, value);
+}
+
+PrimExpr MakeShadowAddr(const Var& base, const PrimExpr& shadow_bits) {
+  const DataType ptr_type = base->dtype;
+  PrimExpr addr_uint = ToUInt64(base);
+  PrimExpr shadow = Cast(DataType::UInt(64), shadow_bits);
+  PrimExpr combined = bitwise_or(addr_uint, shadow);
+  return FromUInt64(ptr_type, combined);
+}
+
+class ShadowAddrInjector : public StmtExprMutator {
+ public:
+  ShadowAddrInjector(Var buf_dyn_shmem, PrimExpr thread_extent,
+                     std::unordered_set<const VarNode*> a_dcu_res_vars,
+                     std::unordered_set<const VarNode*> b_dcu_res_vars)
+      : buf_dyn_shmem_(std::move(buf_dyn_shmem)),
+        thread_extent_(std::move(thread_extent)),
+        a_dcu_res_vars_(std::move(a_dcu_res_vars)),
+        b_dcu_res_vars_(std::move(b_dcu_res_vars)) {}
+
+  static PrimFunc Substitute(PrimFunc func, const InfoCollector& info) {
+    ShadowAddrInjector mutator(info.buf_dyn_shmem, info.thread_extent, info.a_dcu_res_vars,
+                               info.b_dcu_res_vars);
+    auto* n = func.CopyOnWrite();
+    n->body = mutator(std::move(n->body));
+    return func;
+  }
+
+ private:
+  bool IsBufDynShmem(const PrimExpr& expr) const {
+    if (!buf_dyn_shmem_.defined()) {
+      return false;
+    }
+    if (IsSameVar(expr, buf_dyn_shmem_)) {
+      return true;
+    }
+    if (const auto* var = expr.as<VarNode>()) {
+      return var->name_hint == buf_dyn_shmem_->name_hint;
+    }
+    return false;
+  }
+
+  bool IsADcuRes(const PrimExpr& expr) const {
+    if (const auto* var = expr.as<VarNode>()) {
+      return a_dcu_res_vars_.count(var) > 0;
+    }
+    return false;
+  }
+
+  bool IsBDcuRes(const PrimExpr& expr) const {
+    if (const auto* var = expr.as<VarNode>()) {
+      return b_dcu_res_vars_.count(var) > 0;
+    }
+    return false;
+  }
+
+  PrimExpr BuildShadowOffsetA() const {
+    PrimExpr warp_num = truncdiv(thread_extent_, make_const(DataType::Int(32), 64));
+    PrimExpr a_mod = truncdiv(warp_num, make_const(DataType::Int(32), 2));
+    PrimExpr warp_mod = floormod(warp_idx_var_, a_mod);
+    return left_shift(warp_mod, make_const(DataType::Int(32), 16));
+  }
+
+  PrimExpr BuildShadowOffsetB() const {
+    PrimExpr warp_mod = floormod(warp_idx_var_, make_const(DataType::Int(32), 2));
+    return left_shift(warp_mod, make_const(DataType::Int(32), 18));
+  }
+
+  Stmt InjectShadowAddrLets(Stmt body) {
+    ICHECK(buf_dyn_shmem_.defined())
+        << "buf_dyn_shmem must be defined before shadow addr injection";
+    ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before shadow addr injection";
+    a_shared_addr_var_ = Var("A_shared_addr", buf_dyn_shmem_->dtype);
+    b_shared_addr_var_ = Var("B_shared_addr", buf_dyn_shmem_->dtype);
+    PrimExpr a_init = MakeShadowAddr(buf_dyn_shmem_, BuildShadowOffsetA());
+    PrimExpr b_init = MakeShadowAddr(buf_dyn_shmem_, BuildShadowOffsetB());
+    body = LetStmt(b_shared_addr_var_, b_init, body);
+    body = LetStmt(a_shared_addr_var_, a_init, body);
+    shadow_injected_ = true;
+    return body;
+  }
+
+  PrimExpr RewriteDCUAsyncCopy(const CallNode* op) {
+    if (!op->op.same_as(DCUAsyncCopyOp()) || !shadow_injected_ || op->args.size() < 3 ||
+        !IsBufDynShmem(op->args[0])) {
+      return GetRef<PrimExpr>(op);
+    }
+    PrimExpr new_base = op->args[0];
+    if (IsADcuRes(op->args[2])) {
+      new_base = a_shared_addr_var_;
+    } else if (IsBDcuRes(op->args[2])) {
+      new_base = b_shared_addr_var_;
+    } else {
+      return GetRef<PrimExpr>(op);
+    }
+    Array<PrimExpr> new_args = op->args;
+    new_args.Set(0, new_base);
+    return Call(op->dtype, op->op, new_args);
+  }
+
+  Stmt VisitStmt_(const LetStmtNode* op) final {
+    if (IsWarpIdxInit(op->value)) {
+      warp_idx_var_ = op->var;
+      Stmt body = InjectShadowAddrLets(op->body);
+      body = VisitStmt(body);
+      return LetStmt(op->var, op->value, body);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode* op) final {
+    if (const auto* call = op->value.as<CallNode>()) {
+      PrimExpr rewritten = RewriteDCUAsyncCopy(call);
+      if (!rewritten.same_as(op->value)) {
+        return Evaluate(rewritten);
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode* op) final {
+    PrimExpr rewritten = RewriteDCUAsyncCopy(op);
+    if (!rewritten.same_as(GetRef<PrimExpr>(op))) {
+      return rewritten;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Var buf_dyn_shmem_;
+  PrimExpr thread_extent_;
+  std::unordered_set<const VarNode*> a_dcu_res_vars_;
+  std::unordered_set<const VarNode*> b_dcu_res_vars_;
+  Var warp_idx_var_;
+  Var a_shared_addr_var_;
+  Var b_shared_addr_var_;
+  bool shadow_injected_{false};
+};
+
+}  // namespace
+
+PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
+  InfoCollector collector;
+  collector(func->body);
+
+  if (!collector.buf_dyn_shmem.defined() || !collector.thread_extent.defined()) {
+    return func;
+  }
+
+  class CopyChecker : public StmtExprVisitor {
+   public:
+    bool has_copy{false};
+
+   private:
+    void VisitExpr_(const CallNode* op) final {
+      if (op->op.same_as(DCUAsyncCopyOp())) {
+        has_copy = true;
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  } copy_checker;
+  copy_checker(func->body);
+  if (!copy_checker.has_copy) {
+    return func;
+  }
+
+  if (collector.a_dcu_res_vars.empty() && collector.b_dcu_res_vars.empty()) {
+    return func;
+  }
+
+  return ShadowAddrInjector::Substitute(func, collector);
+}
+
+namespace transform {
+
+using namespace tir::transform;
+
+tvm::transform::Pass InjectDCUAsyncCopyShadowAddr() {
+  auto pass_func = [=](PrimFunc f, const IRModule& m, const PassContext& ctx) {
+    if (!IsDCUTarget(m)) {
+      return f;
+    }
+    return InjectDCUAsyncCopyShadowAddrToFunc(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.InjectDCUAsyncCopyShadowAddr", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.InjectDCUAsyncCopyShadowAddr", InjectDCUAsyncCopyShadowAddr);
+}
+
+}  // namespace transform
+}  // namespace tl
+}  // namespace tvm

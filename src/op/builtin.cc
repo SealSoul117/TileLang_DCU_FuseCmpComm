@@ -393,6 +393,11 @@ TIR_DEFINE_TL_BUILTIN(dcu_async_copy)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(dcu_async_copy_idxen)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(make_dcu_resource)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",

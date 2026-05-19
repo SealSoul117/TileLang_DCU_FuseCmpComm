@@ -131,7 +131,8 @@ void CodeGenTileLangHIP::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
       // return
       return;
     }
-    stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
+    // stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
+    // stream << " __launch_bounds__(256)";
   }
 }
 
@@ -147,6 +148,7 @@ std::string CodeGenTileLangHIP::Finish() {
     decl_stream << "#include <tl_templates/hip/hip_fp8.h>\n";
   }
 
+  decl_stream << "#include <tl_templates/dcu_hip/intrin.h>\n";
   decl_stream << "#include <tl_templates/dcu_hip/gemm.h>\n";
   decl_stream << "#include <tl_templates/dcu_hip/copy.h>\n";
   decl_stream << "#include <tl_templates/dcu_hip/reduce.h>\n";
@@ -575,7 +577,8 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    // this->stream << "__syncthreads();\n";
+    this->stream << "tl::wave_barrier();\n";
   }
 }
 
@@ -1041,6 +1044,33 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("{c_ref}", c_ref);
     replacer.register_rule("{c_bias}", c_bias);
     os << replacer.rewrite(call_mmac_code);
+  } else if (op->op.same_as(tl::get_lane_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_lane_idx expects at most one argument <warp_size>.";
+    os << "tl::get_lane_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_idx_sync())) {
+    ICHECK_LE(op->args.size(), 2)
+        << "tl.get_warp_idx_sync expects at most two arguments <warp_size, thread_id>.";
+    os << "tl::get_warp_idx_sync(";
+    for (size_t i = 0; i < op->args.size(); ++i) {
+      if (i > 0) {
+        os << ", ";
+      }
+      os << PrintExpr(op->args[i]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_warp_idx expects at most one argument <warp_size>.";
+    os << "tl::get_warp_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
   } else if (op->op.same_as(builtin::thread_return())) {
     os << "return";
   } else if (op->op.same_as(tl::tl_gemm())) {

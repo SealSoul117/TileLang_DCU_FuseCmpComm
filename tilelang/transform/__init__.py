@@ -353,6 +353,23 @@ def InjectPTXAsyncCopy():
     return _ffi_api.InjectPTXAsyncCopy()  # type: ignore
 
 
+def InjectWarpIdx():
+    """Inject warp_idx and rewrite warp-level threadIdx.x indexing for DCU.
+
+    Declares ``warp_idx`` via ``tl.get_warp_idx_sync(64, thread_binding)`` (lowered with
+    ``readfirstlane`` on DCU) and replaces expressions that use the high bits of
+    ``threadIdx.x`` (e.g. ``thread_binding // 64``) with equivalent ``warp_idx``
+    operations, while preserving lane-only indexing and global-to-shared copy
+    destinations.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectWarpIdx()  # type: ignore
+
+
 def InjectDSRead():
     """Rewrite shared memory to register load using ds_read hardware instructions on DCU.
 
@@ -569,3 +586,8 @@ def RegisterPipelinePlanning():
 def InsertAsyncMMAFence():
     """InsertAsyncMMAFence"""
     return _ffi_api.InsertAsyncMMAFence()  # type: ignore
+
+
+def UnrollDCUKLoop():
+    """Unroll the unique DCU GEMM k-loop by a configurable factor (default 4)."""
+    return _ffi_api.UnrollDCUKLoop()  # type: ignore

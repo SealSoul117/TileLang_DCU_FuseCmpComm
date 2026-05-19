@@ -257,10 +257,10 @@ TIR_DEFINE_TL_BUILTIN(get_lane_idx)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
-TIR_DEFINE_TL_BUILTIN(get_warp_idx_sync)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kPure));
+// TIR_DEFINE_TL_BUILTIN(get_warp_idx_sync)
+//     .set_num_inputs(2)
+//     .set_attr<TCallEffectKind>("TCallEffectKind",
+//                                Integer(CallEffectKind::kPure));
 
 TIR_DEFINE_TL_BUILTIN(get_warp_idx)
     .set_num_inputs(-1)
@@ -404,6 +404,11 @@ TIR_DEFINE_TL_BUILTIN(async_gld_fence)
 
 TIR_DEFINE_TL_BUILTIN(wave_barrier)
     .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(get_warp_idx_sync)
+    .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 } // namespace tl

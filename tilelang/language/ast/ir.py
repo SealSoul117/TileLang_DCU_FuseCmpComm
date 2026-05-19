@@ -1903,6 +1903,7 @@ tvm_rdna_wmma_store = _dtype_forward(_tir_op.tvm_rdna_wmma_store)
 make_dcu_resource = _dtype_forward(_tir_op.make_dcu_resource)
 async_gld_fence = _dtype_forward(_tir_op.async_gld_fence)
 wave_barrier = _dtype_forward(_tir_op.wave_barrier)
+get_warp_idx_sync = _dtype_forward(_tir_op.get_warp_idx_sync)
 
 broadcast = Broadcast
 ramp = Ramp
@@ -2227,5 +2228,6 @@ __all__ = [
     "vscale",
     "make_dcu_resource",
     "async_gld_fence",
-    "wave_barrier"
+    "wave_barrier",
+    "get_warp_idx_sync",
 ]

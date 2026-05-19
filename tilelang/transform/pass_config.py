@@ -87,6 +87,10 @@ class PassConfigKey(str, Enum):
 
     """
 
+    TL_DCU_K_LOOP_UNROLL_FACTOR = "tl.dcu_k_loop_unroll_factor"
+    """Unroll factor for the unique DCU GEMM k-loop that contains global->shared
+    async copy and tvm_mmac. Set to 1 to disable. Default: 4"""
+
     TL_STORAGE_REWRITE_DETECT_INPLACE = "tl.storage_rewrite_detect_inplace"
     """Control StorageRewrite inplace detection.
 

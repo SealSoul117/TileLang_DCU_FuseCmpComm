@@ -110,13 +110,16 @@ class LibraryGenerator:
                 "-std=c++17",
                 "-O3",
                 "-fPIC",
+                "--gpu-max-threads-per-block=256",
                 f"--offload-arch={arch}",
                 "--shared",
                 src.name,
             ]
+            print(f"Using ROCm path: {rocm_path} and arch: {arch}")
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
+            print("command: ", " ".join(command))   
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler
 

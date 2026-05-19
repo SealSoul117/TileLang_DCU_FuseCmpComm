@@ -223,23 +223,22 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-
-
-        mod = tilelang.transform.PipelinePlanning()(mod)
         print("11111")
         print(mod)
-        #mod = tilelang.transform.RegisterPipelinePlanning()(mod)
-        print("22222")
-        print(mod)
 
-        #mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
+        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.RegisterPipelinePlanning()(mod)
+
+
+        mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         mod = tilelang.transform.MergeIfStmt()(mod)
         if allow_fence_proxy(target=target):
             # in hopper device, wgmma is an async proxy
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
-
+    print("After PersistThreadblock:")
+    print(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
@@ -318,9 +317,14 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         print("InjectDSRead ............")
         print(mod)
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
+        mod = tilelang.transform.InjectWarpIdx()(mod)
+        mod = tilelang.transform.UnrollDCUKLoop()(mod)
+        print("22222")
+        print(mod)
         # Register pipeline planning only writes software_pipeline annotations.
         # We must inject after planning so prologue/body/epilogue are materialized.
         # mod = tilelang.transform.RegisterPipelinePlanning()(mod)
         # mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         # mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
+
     return mod

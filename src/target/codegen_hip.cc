@@ -794,7 +794,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
                    << ", " << condition << ");\n";
     }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
-    ;
+    // this->PrintIndent();
+    //   this->stream << "tl::wave_barrier();\n";
     // print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
     int n = Downcast<IntImm>(op->args[0])->value;
@@ -1163,8 +1164,23 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(Op::Get("tl.wave_barrier"))) {
     this->PrintIndent();
     this->stream << "tl::wave_barrier();\n";
-  }
-  else {
+  } else if (op->op.same_as(builtin::reinterpret())) {
+    DataType target_dtype = op->dtype;
+    DataType source_dtype = op->args[0]->dtype;
+    bool ptr_to_uint =
+        source_dtype.is_handle() && target_dtype.is_uint() && target_dtype.bits() == 64;
+    bool uint_to_ptr =
+        target_dtype.is_handle() && source_dtype.is_uint() && source_dtype.bits() == 64;
+    if (ptr_to_uint) {
+      os << "reinterpret_cast<uintptr_t>(" << PrintExpr(op->args[0]) << ")";
+    } else if (uint_to_ptr) {
+      os << "reinterpret_cast<";
+      PrintType(target_dtype, os);
+      os << ">(" << PrintExpr(op->args[0]) << ")";
+    } else {
+      CodeGenC::VisitExpr_(op, os);
+    }
+  } else {
     CodeGenC::VisitExpr_(op, os);
   }
 }

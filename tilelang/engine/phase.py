@@ -305,7 +305,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         print("--------------after lower shared global copy------------------")
         print(mod)
-        # mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
         print("--------------after inject dcu async copy------------------")
         print(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
@@ -320,8 +319,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
 
         mod = tilelang.transform.InjectWarpIdx()(mod)
-        # mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
-        
+        mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
+        mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
 

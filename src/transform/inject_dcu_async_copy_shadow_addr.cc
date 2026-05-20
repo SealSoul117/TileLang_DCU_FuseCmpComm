@@ -138,7 +138,7 @@ class InfoCollector : public StmtExprVisitor {
   }
 };
 
-PrimExpr ToUInt64(const PrimExpr& value) {
+PrimExpr ToUIntPtr(const PrimExpr& value) {
   const DataType u64 = DataType::UInt(64);
   if (value.dtype().is_handle()) {
     return Call(u64, builtin::reinterpret(), {value});
@@ -146,19 +146,19 @@ PrimExpr ToUInt64(const PrimExpr& value) {
   return Cast(u64, value);
 }
 
-PrimExpr FromUInt64(const DataType& target_dtype, const PrimExpr& value) {
+PrimExpr FromUIntPtr(const DataType& target_dtype, const PrimExpr& value) {
   if (target_dtype.is_handle()) {
     return Call(target_dtype, builtin::reinterpret(), {value});
   }
   return Cast(target_dtype, value);
 }
 
-PrimExpr MakeShadowAddr(const Var& base, const PrimExpr& shadow_bits) {
-  const DataType ptr_type = base->dtype;
-  PrimExpr addr_uint = ToUInt64(base);
+PrimExpr MakeShadowAddr(const PrimExpr& base, const PrimExpr& shadow_bits) {
+  const DataType ptr_type = base.dtype();
+  PrimExpr addr_uint = ToUIntPtr(base);
   PrimExpr shadow = Cast(DataType::UInt(64), shadow_bits);
   PrimExpr combined = bitwise_or(addr_uint, shadow);
-  return FromUInt64(ptr_type, combined);
+  return FromUIntPtr(ptr_type, combined);
 }
 
 class ShadowAddrInjector : public StmtExprMutator {
@@ -208,27 +208,36 @@ class ShadowAddrInjector : public StmtExprMutator {
   }
 
   PrimExpr BuildShadowOffsetA() const {
-    PrimExpr warp_num = truncdiv(thread_extent_, make_const(DataType::Int(32), 64));
-    PrimExpr a_mod = truncdiv(warp_num, make_const(DataType::Int(32), 2));
-    PrimExpr warp_mod = floormod(warp_idx_var_, a_mod);
-    return left_shift(warp_mod, make_const(DataType::Int(32), 16));
+    const DataType u32 = DataType::UInt(32);
+    PrimExpr warp_num = truncdiv(thread_extent_, make_const(u32, 64));
+    PrimExpr a_mod = truncdiv(warp_num, make_const(u32, 2));
+    PrimExpr warp_mod = floormod(Cast(u32, warp_idx_var_), a_mod);
+    return left_shift(warp_mod, make_const(u32, 16));
   }
 
   PrimExpr BuildShadowOffsetB() const {
-    PrimExpr warp_mod = floormod(warp_idx_var_, make_const(DataType::Int(32), 2));
-    return left_shift(warp_mod, make_const(DataType::Int(32), 18));
+    const DataType u32 = DataType::UInt(32);
+    PrimExpr warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 2));
+    return left_shift(warp_mod, make_const(u32, 18));
   }
 
   Stmt InjectShadowAddrLets(Stmt body) {
     ICHECK(buf_dyn_shmem_.defined())
         << "buf_dyn_shmem must be defined before shadow addr injection";
     ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before shadow addr injection";
-    a_shared_addr_var_ = Var("A_shared_addr", buf_dyn_shmem_->dtype);
-    b_shared_addr_var_ = Var("B_shared_addr", buf_dyn_shmem_->dtype);
-    PrimExpr a_init = MakeShadowAddr(buf_dyn_shmem_, BuildShadowOffsetA());
-    PrimExpr b_init = MakeShadowAddr(buf_dyn_shmem_, BuildShadowOffsetB());
-    body = LetStmt(b_shared_addr_var_, b_init, body);
-    body = LetStmt(a_shared_addr_var_, a_init, body);
+    const DataType ptr_type = buf_dyn_shmem_->dtype;
+    const DataType u32 = DataType::UInt(32);
+    shmem_base_var_ = Var("shmem_base", ptr_type);
+    shadow_offset_a_var_ = Var("shadow_offset_a", u32);
+    shadow_offset_b_var_ = Var("shadow_offset_b", u32);
+    a_shared_addr_var_ = Var("A_shared_addr", ptr_type);
+    b_shared_addr_var_ = Var("B_shared_addr", ptr_type);
+    // Outermost lets run first: bind shmem_base, then offsets, then shadow-tagged addrs.
+    body = LetStmt(a_shared_addr_var_, MakeShadowAddr(shmem_base_var_, shadow_offset_a_var_), body);
+    body = LetStmt(b_shared_addr_var_, MakeShadowAddr(shmem_base_var_, shadow_offset_b_var_), body);
+    body = LetStmt(shadow_offset_a_var_, BuildShadowOffsetA(), body);
+    body = LetStmt(shadow_offset_b_var_, BuildShadowOffsetB(), body);
+    body = LetStmt(shmem_base_var_, buf_dyn_shmem_, body);
     shadow_injected_ = true;
     return body;
   }
@@ -284,6 +293,9 @@ class ShadowAddrInjector : public StmtExprMutator {
   std::unordered_set<const VarNode*> a_dcu_res_vars_;
   std::unordered_set<const VarNode*> b_dcu_res_vars_;
   Var warp_idx_var_;
+  Var shmem_base_var_;
+  Var shadow_offset_a_var_;
+  Var shadow_offset_b_var_;
   Var a_shared_addr_var_;
   Var b_shared_addr_var_;
   bool shadow_injected_{false};

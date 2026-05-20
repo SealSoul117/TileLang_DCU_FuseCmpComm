@@ -31,9 +31,11 @@ from .mmac_layout import (
     shared_16x16_to_local_64x4_layout_A,
     thread_id_shared_access_64x4_to_16x16_layout_A,
     shared_to_local_layout_A_padding,
+    shared_to_local_layout_A_wrap,
     shared_32x16_to_local_64x8_layout_B,
     thread_id_shared_access_64x8_to_32x16_layout_B,
-    shared_to_local_layout_B_padding
+    shared_to_local_layout_B_padding,
+    shared_to_local_layout_B_wrap
 )
 
 lift = convert
@@ -322,8 +324,9 @@ class MatrixCoreIntrinEmitter:
                         # # warp 内行间隔
                         # row += warp_interval_idx * warp_row_interval
                         row, col = shared_to_local_layout_A_padding(row, col, i, warp_rows, self.block_row_warps, tx, local_id)
+                        row, col = shared_to_local_layout_A_wrap(row, col, i, warp_rows, warp_m, self.block_row_warps, tx)
                         print("row, col:", row, col)
-                        l, r = (warp_m * warp_inter_stride, rk * chunk + ki * (k_pack * micro_size_k))
+                        l, r = (0 * warp_m * warp_inter_stride, rk * chunk + ki * (k_pack * micro_size_k))
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
@@ -377,10 +380,11 @@ class MatrixCoreIntrinEmitter:
                         # row, col = T.meta_var(reverse_index_map((tx & 15) // 4 + (tx & 3) * 4 + (tx // 16) * 16, local_id))
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         row, col = shared_to_local_layout_B_padding(row, col, j, warp_cols, self.block_col_warps, tx, local_id)
+                        row, col = shared_to_local_layout_B_wrap(row, col, j, warp_cols, warp_n, self.block_col_warps, tx, local_id)
                         l, r = (
                             rk * chunk + ki * (k_pack * micro_size_k),
                             # warp_n * warp_col_tiles + j * micro_size_y,
-                            warp_n * warp_inter_stride,
+                            0 * warp_n * warp_inter_stride,
                         )
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 

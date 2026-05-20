@@ -2,7 +2,6 @@
 # from tvm.runtime import convert
 import tilelang.language as T
 
-
 '''
 256x16 A share mem layout
   0   16   32   48
@@ -31,10 +30,35 @@ def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, 
         inter_idx_padding = 1
     
     paddings = inter_idx_padding * block_row_warps * 4
-    # print("paddings:", paddings)
         
     new_row = row + paddings * ((tx & 15) // 4)
     new_row += (idx & 1) * (paddings // 2) + (idx // 2) * 16 * 2 * block_row_warps
+    return new_row, new_col
+
+def shared_to_local_layout_A_wrap(row, col, idx,  warp_rows, warp_m, block_row_warps, tx):
+    if warp_rows > 1:
+        inter_idx_padding = 2
+    else:
+        inter_idx_padding = 1
+    paddings = inter_idx_padding * block_row_warps * 4
+    # 跨 warp 的 padding
+    row += warp_m * 4
+    
+    new_row = row + (col + ((tx & 15) // 4) * 8) // 16
+    new_col = (col + ((tx & 15) // 4) * 8) % 16
+    condition_col = (((tx // 16)) + ((tx & 3) * 4) + (((tx & 15) // 4) * 2)) // 16
+    cond = condition_col & (warp_m == block_row_warps-1) & (idx & 1)
+    new_row = new_row - 32 * cond
+    
+    # limit_row = (((tx & 15) // 4) + 1) * paddings
+    # new_row = new_row - paddings * (row >= limit_row)
+    # (warp_rows == 1) || (idx + 1) % 2 == 0) && warp_m == block_row_warps - 1 &&  ((((tx & 15) // 4)+1) * paddings) & (new_row) == 1
+    # max_nooffset_row = (((tx & 15) // 4) + 1) * paddings + (idx // 2) * 16 * 2 * block_row_warps
+    # new_row -= paddings * (
+    #     ((warp_rows == 1) or ((idx + 1) % 2 == 0))
+    #     & (warp_m == block_row_warps - 1)
+    #     & ((max_nooffset_row & new_row) // max_nooffset_row == 1)
+    # )
     return new_row, new_col
 
 def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, tx, local_id):
@@ -57,6 +81,39 @@ def shared_to_local_layout_B_padding(row, col, idx, warp_cols, block_col_warps, 
     new_col += idx * inter_idx_padding * paddings
     return new_row, new_col
 
+def shared_to_local_layout_B_wrap(row, col, idx, warp_cols, warp_n, block_col_warps, tx, local_id):
+    paddings = 32
+    # 跨 idx 的 padding
+    col = col + warp_n * paddings
+    # 回转 每隔2行 列 向右偏移 32
+    col += (((tx & 7) // 4) * 32)
+    # col += ((row & 2) >> 1) * paddings
+    #  new_col 对 256 宽度 取余
+    new_col = col % (warp_cols * block_col_warps * 16)
+    new_row = col // (warp_cols * block_col_warps * 16) + row
+    
+    cond = (warp_n == block_col_warps - 1) & (idx == 3) & (((tx >> 2) & 3) == 3)
+    new_row = new_row - 2 * cond
+    
+    # limit_row = (tx // 16 + 1) * 4
+    # new_row = new_row - 2 * (new_row >= limit_row)
+    
+    # row_tmp = row
+    # new_row = row
+    # # idx == warp_cols - 1 && warp_n == block_col_warps - 1 时，每隔两行，上下两行对调
+    # new_row += (
+    # (idx == warp_cols - 1)
+    # & (warp_n == block_col_warps - 1)
+    # & ((((row_tmp % 4) + 1) % 3) == 0)
+    # )
+    
+    # new_row -= (
+    # (idx == warp_cols - 1)
+    # & (warp_n == block_col_warps - 1)
+    # & ((((row_tmp % 4) + 1) % 4) == 0)
+    # )
+    
+    return new_row, new_col
 
 def shared_16x16_to_local_64x4_layout_A(i, j):
     # i: row (0-15), j: column (0-15)

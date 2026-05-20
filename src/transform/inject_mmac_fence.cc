@@ -62,6 +62,42 @@ private:
 
 namespace {
 
+const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
+const Op& DCUAsyncCopyIdxenOp() { return Op::Get("tl.dcu_async_copy_idxen"); }
+
+bool IsDCUAsyncCopyCall(const CallNode* call) {
+    if (!call) return false;
+    return call->op.same_as(DCUAsyncCopyOp()) || call->op.same_as(DCUAsyncCopyIdxenOp());
+}
+
+bool StmtIsDCUAsyncCopyRoot(const Stmt& stmt) {
+    if (const auto* eval = stmt.as<EvaluateNode>()) {
+        if (const auto* call = eval->value.as<CallNode>()) {
+            return IsDCUAsyncCopyCall(call);
+        }
+    }
+    if (const auto* attr = stmt.as<AttrStmtNode>()) {
+        if (attr->attr_key == tir::attr::async_commit_queue_scope ||
+            attr->attr_key == "async_commit_queue_scope") {
+            return StmtIsDCUAsyncCopyRoot(attr->body);
+        }
+    }
+    return false;
+}
+
+Stmt MakeWaveBarrierStmt() {
+    auto barrier_call = Call(DataType::Void(), Op::Get("tl.wave_barrier"), {});
+    return Evaluate(barrier_call);
+}
+
+size_t CountConsecutiveDCUAsyncCopyRun(const Array<Stmt>& seq, size_t start) {
+    size_t len = 0;
+    while (start + len < seq.size() && StmtIsDCUAsyncCopyRoot(seq[start + len])) {
+        ++len;
+    }
+    return len;
+}
+
 bool StmtContainsMMA(const Stmt& stmt) {
     bool found = false;
     PostOrderVisit(stmt, [&found](const ObjectRef& node) {
@@ -201,6 +237,7 @@ public:
     Stmt VisitStmt_(const SeqStmtNode* op) override {
         Array<Stmt> new_seq;
         int pending_load_count = 0;
+        bool prev_stmt_is_dcu_async_copy = false;
 
         for (size_t i = 0; i < op->seq.size(); ++i) {
             const auto& stmt = op->seq[i];
@@ -217,17 +254,33 @@ public:
                     auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_fence"), args);
                     new_seq.push_back(Evaluate(fence_call));
 
-                    auto barrier_call = Call(DataType::Void(), Op::Get("tl.wave_barrier"), {});
-                    new_seq.push_back(Evaluate(barrier_call));
+                    new_seq.push_back(MakeWaveBarrierStmt());
 
                     pending_load_count = 0; 
                 }
                 new_seq.push_back(this->VisitStmt(stmt));
+                prev_stmt_is_dcu_async_copy = false;
+            } else if (StmtIsDCUAsyncCopyRoot(stmt)) {
+                size_t run_len = CountConsecutiveDCUAsyncCopyRun(op->seq, i);
+                if (!prev_stmt_is_dcu_async_copy) {
+                    new_seq.push_back(MakeWaveBarrierStmt());
+                }
+                for (size_t j = 0; j < run_len; ++j) {
+                    new_seq.push_back(this->VisitStmt(op->seq[i + j]));
+                    // When more than 2 consecutive async copies, insert a wave_barrier
+                    // after every pair.
+                    if (run_len > 2 && (j + 1) % 2 == 0) {
+                        new_seq.push_back(MakeWaveBarrierStmt());
+                    }
+                }
+                i += run_len - 1;
+                prev_stmt_is_dcu_async_copy = true;
             } else {
                 LoadCounter counter;
                 counter(stmt);
                 pending_load_count += counter.total_loads;
                 new_seq.push_back(this->VisitStmt(stmt));
+                prev_stmt_is_dcu_async_copy = false;
             }
         }
         return SeqStmt(new_seq);

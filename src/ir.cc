@@ -107,6 +107,9 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
     Map<String, tvm::ffi::Any> anno;
     if (num_stages > 0)
       anno.Set("num_stages", PrimExpr(num_stages));
+    // Default register ping-pong depth when shared pipeline has multiple stages.
+    if (num_stages >= 2)
+      anno.Set("num_register_stages", PrimExpr(2));
     if (!order.empty())
       anno.Set("tl_pipeline_order", order);
     if (!stages.empty())

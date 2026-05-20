@@ -305,26 +305,24 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         print("--------------after lower shared global copy------------------")
         print(mod)
-        mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
+        # mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
         print("--------------after inject dcu async copy------------------")
         print(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
-        print("--------------after fix dcu wait count------------------")
-        print(mod)
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
 
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
+        print("--------------after fix dcu wait count------------------")
+        print(mod)
+        # it is unnecessary to insert shared fence after async copy, as the synchronization between async copy and mma is already handled by the hardware with async fence. And inserting shared fence may cause deadlock if there are not enough threads to execute the fence.
+        # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
+
         mod = tilelang.transform.InjectWarpIdx()(mod)
         # mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
-        # Register pipeline planning only writes software_pipeline annotations.
-        # We must inject after planning so prologue/body/epilogue are materialized.
-        # mod = tilelang.transform.RegisterPipelinePlanning()(mod)
-        # mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-        # mod = tilelang.transform.SimplifyDCUAsyncCopy()(mod)
 
     return mod

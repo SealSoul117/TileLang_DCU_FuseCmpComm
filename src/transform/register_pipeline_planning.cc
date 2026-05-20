@@ -217,33 +217,31 @@ class RegisterPipelinePlanner : public StmtExprMutator {
         }
       }
     }
+    // Align compute with full shared pipeline depth (num_stages). PipelinePlanning
+    // may leave compute at num_stages-1 when register pipeline is enabled; bump
+    // so register stages become [..., num_stages-1, num_stages] (e.g. 3, 4).
+    if (auto num_stages_anno = op->annotations.Get("num_stages")) {
+      if (const auto* imm = num_stages_anno->as<IntImmNode>()) {
+        compute_stage = std::max<int64_t>(compute_stage, imm->value);
+      }
+    }
     int register_stage = std::max(0, compute_stage - 1);
 
     std::vector<Integer> orders(n, Integer(-1));
     std::vector<Integer> stages(n, Integer(compute_stage));
+    bool user_provided_register_orders = false;
     if (auto order_anno = op->annotations.Get(kRegisterPipelineOrderAttr)) {
       if (auto old_orders = order_anno.value().try_cast<Array<Integer>>()) {
-        if (old_orders.value().size() == components.size()) {
+        if (static_cast<int>(old_orders.value().size()) == n) {
           for (int i = 0; i < n; ++i) {
             orders[i] = old_orders.value()[i];
           }
-        }
-      }
-    } else if (auto order_anno =
-                   op->annotations.Get(tir::attr::software_pipeline_order)) {
-      if (auto old_orders = order_anno.value().try_cast<Array<Integer>>()) {
-        if (old_orders.value().size() == components.size()) {
-          for (int i = 0; i < n; ++i) {
-            orders[i] = old_orders.value()[i];
-          }
+          user_provided_register_orders = true;
         }
       }
     }
 
     for (int i = 0; i < n; ++i) {
-      if (orders[i]->value == -1) {
-        orders[i] = Integer(i);
-      }
       if (i < first_register_producer_idx) {
         stages[i] = Integer(0);
         continue;
@@ -265,6 +263,23 @@ class RegisterPipelinePlanner : public StmtExprMutator {
       }
     }
 
+    // Default execution order within the pipelined loop body:
+    //   shared→register, then global→shared, then MMA.
+    // For components [g2s_A, g2s_B, s2r_A, s2r_B, mma] this yields
+    // tl_register_pipeline_order = [2, 3, 0, 1, 4].
+    if (!user_provided_register_orders) {
+      int order_cursor = 0;
+      for (int i = first_register_producer_idx; i < first_compute_idx; ++i) {
+        orders[i] = Integer(order_cursor++);
+      }
+      for (int i = 0; i < first_register_producer_idx; ++i) {
+        orders[i] = Integer(order_cursor++);
+      }
+      for (int i = first_compute_idx; i < n; ++i) {
+        orders[i] = Integer(order_cursor++);
+      }
+    }
+
     Map<String, Any> annotations;
     for (const auto& kv : for_node->annotations) {
       const String& key = kv.first;
@@ -277,6 +292,27 @@ class RegisterPipelinePlanner : public StmtExprMutator {
     }
     annotations.Set(kRegisterPipelineStageAttr, Array<Integer>(stages));
     annotations.Set(kRegisterPipelineOrderAttr, Array<Integer>(orders));
+    // Lift coarse software_pipeline_stage for the GEMM consumer to compute_stage
+    // so shared-memory injection prefetches num_stages tiles.
+    if (auto sw_stage_anno = op->annotations.Get(tir::attr::software_pipeline_stage)) {
+      if (auto sw_stages = sw_stage_anno.value().try_cast<Array<Integer>>()) {
+        int sw_max = 0;
+        for (const Integer& st : sw_stages.value()) {
+          sw_max = std::max(sw_max, static_cast<int>(st->value));
+        }
+        if (sw_max < compute_stage) {
+          Array<Integer> updated_sw;
+          for (const Integer& st : sw_stages.value()) {
+            if (st->value == sw_max && st->value > 0) {
+              updated_sw.push_back(Integer(compute_stage));
+            } else {
+              updated_sw.push_back(st);
+            }
+          }
+          annotations.Set(tir::attr::software_pipeline_stage, updated_sw);
+        }
+      }
+    }
     if (auto async_stages = op->annotations.Get(kRegisterPipelineAsyncStagesAttr)) {
       annotations.Set(kRegisterPipelineAsyncStagesAttr, async_stages.value());
     } else if (auto sw_async = op->annotations.Get(

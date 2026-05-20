@@ -24,6 +24,28 @@ using namespace tir;
  * \param region2 The second region.
  * \return Whether region1 and region2 have intersections.
  */
+/*! \brief Detect tl.tvm_mmac in a pipeline stage statement. */
+class PipelineMmaDetector : public StmtExprVisitor {
+ public:
+  bool has_mma = false;
+
+ private:
+  void VisitExpr_(const CallNode *op) final {
+    if (const auto *op_node = op->op.as<OpNode>()) {
+      if (op_node->name == "tl.tvm_mmac") {
+        has_mma = true;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+};
+
+bool PipelineStageHasMma(const Stmt &stmt) {
+  PipelineMmaDetector detector;
+  detector(stmt);
+  return detector.has_mma;
+}
+
 bool MayConflict(const Region &region1, const Region &region2) {
   ICHECK(region1.size() == region2.size());
   for (size_t i = 0; i < region1.size(); i++) {
@@ -665,12 +687,33 @@ private:
         return copy_stage_cnt;
       return -1;
     }();
+    // When register pipeline will refine the loop (shared→local + MMA), the
+    // consumer of shared memory is s2r, not MMA. Keep compute at num_stages so
+    // prologue can prefetch num_stages global→shared tiles (see
+    // RegisterPipelinePlanning).
+    bool register_pipeline_enabled = false;
+    if (auto reg_anno = loop->annotations.Get("num_register_stages")) {
+      if (const auto *imm = reg_anno->as<IntImmNode>()) {
+        register_pipeline_enabled = imm->value > 1;
+      }
+    }
+    if (!register_pipeline_enabled && num_stages >= 2) {
+      for (size_t i = 0; i < pipeline_body_seq->size(); ++i) {
+        if (PipelineStageHasMma(pipeline_body_seq->seq[i])) {
+          register_pipeline_enabled = true;
+          break;
+        }
+      }
+    }
+
     if (copy_stage_at_end > 0 && num_stages >= 2) {
       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
         pinfo.order =
             (pinfo.order + copy_stage_at_end) % pipeline_stage_infos.size();
-        if (!pinfo.is_copy_stage() && !pinfo.is_producer_for_copy())
+        if (!pinfo.is_copy_stage() && !pinfo.is_producer_for_copy() &&
+            !register_pipeline_enabled) {
           pinfo.stage--;
+        }
       }
     }
 
@@ -680,6 +723,9 @@ private:
       if (key != "num_stages") {
         annotations.Set(key, value);
       }
+    }
+    if (register_pipeline_enabled && !loop->annotations.count("num_register_stages")) {
+      annotations.Set("num_register_stages", Integer(2));
     }
 
     std::vector<Integer> orders, stages;

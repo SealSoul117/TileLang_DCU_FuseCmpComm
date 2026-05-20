@@ -395,7 +395,8 @@ public:
                    String stage_attr_key, String order_attr_key,
                    String async_attr_key,
                    int register_pipeline_min_versions = 0,
-                   const PipelineInfo *shared_buffer_version_pipeline = nullptr)
+                   const PipelineInfo *shared_buffer_version_pipeline = nullptr,
+                   int pipeline_num_stages = 0)
       : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
         pipeline_allocs_(pipeline_allocs), pipeline_loop_(pipeline_loop),
         pipeline_info_(pipeline_info),
@@ -404,7 +405,8 @@ public:
         order_attr_key_(std::move(order_attr_key)),
         async_attr_key_(std::move(async_attr_key)),
         register_pipeline_min_versions_(register_pipeline_min_versions),
-        shared_buffer_version_pipeline_(shared_buffer_version_pipeline) {}
+        shared_buffer_version_pipeline_(shared_buffer_version_pipeline),
+        pipeline_num_stages_(pipeline_num_stages) {}
 
   Stmt BuildPipeline() {
     // Step 1: Analyze accesses to the buffers in the pipeline and compute the
@@ -461,7 +463,14 @@ public:
              shared_buffer_version_pipeline_ != nullptr)
                 ? *shared_buffer_version_pipeline_
                 : pipeline_info_;
-        num_versions = ComputeBufferVersions(canonical, *acc, version_info);
+        num_versions = ComputeBufferVersions(
+            canonical, *acc, version_info,
+            shared_buffer_version_pipeline_ != nullptr &&
+                IsSharedPipelineBuffer(canonical));
+        if (shared_buffer_version_pipeline_ != nullptr &&
+            IsSharedPipelineBuffer(canonical) && pipeline_num_stages_ > 1) {
+          num_versions = std::max(num_versions, pipeline_num_stages_);
+        }
       } else if (stage_attr_key_ == "tl_register_pipeline_stage" &&
                  IsRegisterPipelineLocalBuffer(buffer) &&
                  register_pipeline_min_versions_ >= 2) {
@@ -671,7 +680,8 @@ private:
    */
   int ComputeBufferVersions(const Buffer &buffer,
                             const BufferAccessInfo &buffer_info,
-                            const PipelineInfo &version_pipeline_info) {
+                            const PipelineInfo &version_pipeline_info,
+                            bool shared_register_versioning = false) {
     if (buffer_info.def == -1) {
       // Keep the original number of versions as buffers defined outside the
       // software pipeline should not be mutated.
@@ -722,9 +732,13 @@ private:
       }
       // Do not collapse register-file double buffering using the shared-memory
       // heuristic; locals need explicit ping-pong when stages differ.
+      // Register-pipeline shared versioning uses reordered tl_register_pipeline_order
+      // (s2r before g2s); the writer.order < reader.order test does not apply, but
+      // num_stages physical banks are still required — never shrink here.
       if (!need_multi_version &&
           !(stage_attr_key_ == "tl_register_pipeline_stage" &&
-            IsRegisterPipelineLocalBuffer(buffer))) {
+            IsRegisterPipelineLocalBuffer(buffer)) &&
+          !shared_register_versioning) {
         num_versions--;
       }
     }
@@ -1143,6 +1157,8 @@ private:
   int register_pipeline_min_versions_{0};
   /*! Non-owning; when set, shared-memory bank counts follow software_pipeline_stage. */
   const PipelineInfo *shared_buffer_version_pipeline_{nullptr};
+  /*! From loop `num_stages`; lower bound for shared buffer banks when register pipeline is on. */
+  int pipeline_num_stages_{0};
 };
 
 /*!
@@ -1301,10 +1317,58 @@ private:
         async_attr_key_(std::move(async_attr_key)),
         pipeline_name_(std::move(pipeline_name)) {}
 
+  static bool BlockBodyHasMmaCompute(const Block &block) {
+    class MmaDetector : public StmtExprVisitor {
+     public:
+      bool has_mma = false;
+      void VisitExpr_(const CallNode *op) final {
+        if (const auto *op_node = op->op.as<OpNode>()) {
+          if (op_node->name == "tl.tvm_mmac") {
+            has_mma = true;
+          }
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+    };
+    MmaDetector detector;
+    detector(block->body);
+    return detector.has_mma;
+  }
+
+  static bool BlockBodyIsSharedToLocalCopy(const Block &block) {
+    class Classifier : public StmtExprVisitor {
+     public:
+      bool has_local_store = false;
+      bool reads_shared = false;
+      bool in_local_store_value = false;
+      void VisitStmt_(const BufferStoreNode *op) final {
+        if (IsRegisterPipelineLocalScope(op->buffer.scope())) {
+          has_local_store = true;
+          bool old = in_local_store_value;
+          in_local_store_value = true;
+          VisitExpr(op->value);
+          in_local_store_value = old;
+          return;
+        }
+        StmtExprVisitor::VisitStmt_(op);
+      }
+      void VisitExpr_(const BufferLoadNode *op) final {
+        if (in_local_store_value && IsSharedPipelineBufferScope(op->buffer.scope())) {
+          reads_shared = true;
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+    };
+    Classifier classifier;
+    classifier(block->body);
+    return classifier.has_local_store && classifier.reads_shared;
+  }
+
   /*!
-   * \brief Build fine-block pipeline info whose stages come from
-   * software_pipeline_stage (coarse per SeqStmt child), mapped through the same
-   * MMA inner-seq split as register pipeline planning.
+   * \brief Build fine-block pipeline info for shared-memory multi-versioning during
+   * register pipeline injection. Uses register stages for producers/consumers of
+   * shared, but maps MMA blocks to the s2r stage (compute_stage - 1) because MMA
+   * only reads registers even if block metadata still lists shared buffers.
    */
   std::optional<PipelineInfo>
   MaybeSharedVersionPipelineInfo(const ForNode *loop,
@@ -1352,7 +1416,16 @@ private:
         return std::nullopt;
       }
       PipelineAnnotation pa = it->second;
-      pa.stage = coarse_stages[static_cast<size_t>(fine_to_coarse[i])]->value;
+      int version_stage = pa.stage;
+      if (BlockBodyHasMmaCompute(blk) && !BlockBodyIsSharedToLocalCopy(blk)) {
+        // Shared was consumed at s2r; do not count MMA stage for shared liveness.
+        version_stage = std::max(0, pa.stage - 1);
+      } else if (BlockBodyIsSharedToLocalCopy(blk)) {
+        version_stage = pa.stage;
+      } else {
+        version_stage = coarse_stages[static_cast<size_t>(fine_to_coarse[i])]->value;
+      }
+      pa.stage = version_stage;
       sw_info.emplace(blk, pa);
     }
     return sw_info;
@@ -1662,13 +1735,20 @@ private:
         shared_version_pipeline.has_value() ? &shared_version_pipeline.value()
                                             : nullptr;
 
+    int pipeline_num_stages = 0;
+    if (auto num_stages_anno = op->annotations.Get("num_stages")) {
+      if (const auto *imm = num_stages_anno->as<IntImmNode>()) {
+        pipeline_num_stages = static_cast<int>(imm->value);
+      }
+    }
+
     // Step 4: Rewrite the pipeline body.
     Stmt pipeline = PipelineRewriter(buffer_data_to_buffer_, pipeline_allocs,
                                      tvm::ffi::GetRef<For>(op), pipeline_info,
                                      loop_var_let_wrappers, stage_attr_key_,
                                      order_attr_key_, async_attr_key_,
                                      register_pipeline_min_versions,
-                                     shared_version_ptr)
+                                     shared_version_ptr, pipeline_num_stages)
                         .BuildPipeline();
     auto apply_wrappers = [&](Stmt stmt) {
       for (auto it = rewrap_fns.rbegin(); it != rewrap_fns.rend(); ++it) {

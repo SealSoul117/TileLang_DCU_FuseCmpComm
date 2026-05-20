@@ -620,6 +620,11 @@ def InsertAsyncMMAFence():
     return _ffi_api.InsertAsyncMMAFence()  # type: ignore
 
 
+def InsertAsyncGlobal2SharedFence():
+    """InsertAsyncGlobal2SharedFence"""
+    return _ffi_api.InsertAsyncGlobal2SharedFence()  # type: ignore
+
+
 def UnrollDCUKLoop():
     """Unroll the unique DCU GEMM k-loop by a configurable factor (default 4)."""
     return _ffi_api.UnrollDCUKLoop()  # type: ignore

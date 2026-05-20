@@ -576,9 +576,9 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
   if (sync == "warp") {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
-    this->PrintIndent();
-    // this->stream << "__syncthreads();\n";
-    this->stream << "tl::wave_barrier();\n";
+    // this->PrintIndent();
+    // // this->stream << "__syncthreads();\n";
+    // this->stream << "tl::wave_barrier();\n";
   }
 }
 
@@ -1155,7 +1155,11 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     else if (op->op.same_as(Op::Get("tl.async_gld_fence"))) {
       int fence_num = Downcast<IntImm>(op->args[0])->value;
       this->PrintIndent();
-      this->stream << "tl::async_gld_fence(" << fence_num << ");\n";
+      this->stream << "tl::async_gld_sld_fence(" << fence_num << ");\n";
+  } else if (op->op.same_as(Op::Get("tl.cp_async_wait"))) {
+    int n = Downcast<IntImm>(op->args[0])->value;
+    std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
+    print_extern_call_stmt(func_name, 1);
   } else if (op->op.same_as(Op::Get("tl.wave_barrier"))) {
     this->PrintIndent();
     this->stream << "tl::wave_barrier();\n";

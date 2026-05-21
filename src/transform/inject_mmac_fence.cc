@@ -70,6 +70,11 @@ bool IsDCUAsyncCopyCall(const CallNode* call) {
     return call->op.same_as(DCUAsyncCopyOp()) || call->op.same_as(DCUAsyncCopyIdxenOp());
 }
 
+bool IsKLoopVar(const Var& loop_var) {
+    const auto* var = loop_var.as<VarNode>();
+    return var && var->name_hint == "k";
+}
+
 bool StmtIsDCUAsyncCopyRoot(const Stmt& stmt) {
     if (const auto* eval = stmt.as<EvaluateNode>()) {
         if (const auto* call = eval->value.as<CallNode>()) {
@@ -234,6 +239,19 @@ public:
         return found;
     }
 
+    Stmt VisitStmt_(const ForNode* op) override {
+        bool is_k_loop = IsKLoopVar(op->loop_var);
+        if (is_k_loop) {
+            ++inside_k_loop_depth_;
+        }
+        Stmt body = VisitStmt(op->body);
+        if (is_k_loop) {
+            --inside_k_loop_depth_;
+        }
+        return For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,
+                   op->annotations);
+    }
+
     Stmt VisitStmt_(const SeqStmtNode* op) override {
         Array<Stmt> new_seq;
         int pending_load_count = 0;
@@ -262,7 +280,9 @@ public:
                 prev_stmt_is_dcu_async_copy = false;
             } else if (StmtIsDCUAsyncCopyRoot(stmt)) {
                 size_t run_len = CountConsecutiveDCUAsyncCopyRun(op->seq, i);
-                if (!prev_stmt_is_dcu_async_copy) {
+                // Skip leading wave_barrier inside the main k-loop; pipeline already
+                // serializes consecutive cp_async there.
+                if (!prev_stmt_is_dcu_async_copy && inside_k_loop_depth_ == 0) {
                     new_seq.push_back(MakeWaveBarrierStmt());
                 }
                 for (size_t j = 0; j < run_len; ++j) {
@@ -288,6 +308,7 @@ public:
 
 private:
     Stmt global_last_fence_mma_;
+    int inside_k_loop_depth_ = 0;
 };
 
 namespace transform {

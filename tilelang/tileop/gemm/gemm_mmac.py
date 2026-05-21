@@ -16,7 +16,6 @@ class GemmMMAC(GemmBase):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, False)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
-        print(f"GemmMMAC infer_layout: m_warp={m_warp}, n_warp={n_warp}, warp_row_tiles={warp_row_tiles}, warp_col_tiles={warp_col_tiles}")
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
             b_dtype=self.in_dtype,

@@ -15,21 +15,15 @@ from .gemm_mmac import GemmMMAC
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
 
-print("tileop gemm init...")
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
 def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range):
-    print("tileop gemm infer_layout")
     thread_nums = thread_bounds.extent
-    print(f"gemm_py_infer_layout Target: {target}, thread_nums: {thread_nums}")
-    print(f"gemm_py_infer_layout gemm_py: {gemm_py}")
     t = gemm_py.infer_layout(target, thread_nums)
-    print(f"gemm_py_infer_layout gemm_py.A: {gemm_py.A}, gemm_py.B: {gemm_py.B}, gemm_py.C: {gemm_py.C}")
     return gemm_py.infer_layout(target, thread_nums)
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.lower")
 def gemm_py_lower(gemm_py: GemmMMA, layout_map, target: Target, thread_bounds: Range, thread_var: tir.Var):
-    print("tileop gemm lower")
     thread_nums = thread_bounds.extent
     stmt = gemm_py.lower(layout_map, target, thread_nums, thread_var)
     return stmt
@@ -146,14 +140,12 @@ class GemmPy(Node, Scriptable):
 
     def infer_layout(self, target: Target, thread_nums: int):
         """Infer the layout for the GEMM operation based on target architecture."""
-        print(f"GemmPy infer_layout Target: {target}, thread_nums: {thread_nums}")
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         return impl_class(self).infer_layout(target, thread_nums)
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
         """Lower the GEMM operation to TIR statements based on target architecture."""
-        print(f"GemmPy lower Target: {target}, thread_nums: {thread_nums}")
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         return impl_class(self).lower(layout_map, target, thread_nums, thread_var)
@@ -189,7 +181,6 @@ class GemmPy(Node, Scriptable):
             NotImplementedError: If the instruction type is not supported
             ValueError: If the instruction type is unknown
         """
-        print(f"_get_implementation_class Target: {target}")
         if gemm_inst.is_mma():
             if target_is_volta(target):
                 return GemmMMASm70

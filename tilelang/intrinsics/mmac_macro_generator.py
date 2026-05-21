@@ -279,7 +279,6 @@ class MatrixCoreIntrinEmitter:
         A_buf = A_region.buffer
         A_base0 = A_region.region[-2].min
         A_base1 = A_region.region[-1].min
-        print("A_base0, A_base1:", A_base0, A_base1)
 
         @T.macro
         def _warp_ldmatrix_a(
@@ -325,7 +324,6 @@ class MatrixCoreIntrinEmitter:
                         # row += warp_interval_idx * warp_row_interval
                         row, col = shared_to_local_layout_A_padding(row, col, i, warp_rows, self.block_row_warps, tx, local_id)
                         row, col = shared_to_local_layout_A_wrap(row, col, i, warp_rows, warp_m, self.block_row_warps, tx)
-                        print("row, col:", row, col)
                         l, r = (0 * warp_m * warp_inter_stride, rk * chunk + ki * (k_pack * micro_size_k))
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
@@ -349,9 +347,6 @@ class MatrixCoreIntrinEmitter:
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
-        print("B_base0, B_base1:", B_base0, B_base1)
-        print("local_size_b:", local_size_b)
-        print("warp_cols:", warp_cols)
 
         @T.macro
         def _warp_ldmatrix_b(
@@ -504,7 +499,6 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
-        print("local_size_out:", block_row_warps)
 
         def forward_thread(i: int, j: int) -> int:
             """

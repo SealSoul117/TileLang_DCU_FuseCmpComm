@@ -51,7 +51,6 @@ def shared_16x16_to_local_64x4_layout_A(i, j):
 
 
 def thread_id_shared_access_64x4_to_16x16_layout_B(thread_id, local_id):
-    print("mfma_layout thread_id_shared_access_64x4_to_16x16_layout_B:", thread_id, local_id)
     i = local_id + (thread_id // 16) * 4
     j = thread_id % 16
     return i, j

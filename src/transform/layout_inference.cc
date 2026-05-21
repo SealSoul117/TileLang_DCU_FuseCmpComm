@@ -110,9 +110,6 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
-    LOG(INFO) << "Running InferLayout for infer_list_[" << cur_infer_id
-              << "] at level " << (level == InferLevel::kStrict ? "Strict"
-                                                                : "Common");
     auto updates = next->InferLayout(LayoutInferArgs{target_,
                                                      thread_bounds,
                                                      layout_map,
@@ -121,13 +118,9 @@ public:
                                                      {},
                                                      let_var_to_expr_},
                                      level);
-    LOG(INFO) << "InferLayout for infer_list_[" << cur_infer_id
-              << "] returned " << updates.size() << " updates.";
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
       // Basic validity checks
-      LOG(INFO) << "InferLayout returned update for buffer " << buffer
-                << " with layout " << layout;
       ICHECK(buffer.defined()) << "InferLayout returned an undefined buffer.";
       ICHECK(layout.defined()) << "InferLayout returned an undefined layout.";
 
@@ -173,7 +166,6 @@ public:
           }
         }
       };
-      LOG(INFO) << "InferLayout update for buffer " << layout_map;
       if (layout_map.count(buffer)) {
         // If new layout contains the old one, update map
         if (buffer.scope() == "local.fragment" &&
@@ -808,13 +800,13 @@ private:
         if (!found) {
           buffers.push_back(op->buffer);
           buffer_data_to_buffers_.Set(op->buffer->data, buffers);
-          LOG(INFO) << "[LayoutInference] BufferLoad: added buffer "
+          DLOG(INFO) << "[LayoutInference] BufferLoad: added buffer "
                      << op->buffer << " buffer.get() = " << op->buffer.get()
                      << " data = " << op->buffer->data.get();
         }
       } else {
         buffer_data_to_buffers_.Set(op->buffer->data, {op->buffer});
-        LOG(INFO) << "[LayoutInference] BufferLoad: new buffer " << op->buffer
+        DLOG(INFO) << "[LayoutInference] BufferLoad: new buffer " << op->buffer
                    << " buffer.get() = " << op->buffer.get()
                    << " data = " << op->buffer->data.get();
       }
@@ -884,13 +876,6 @@ private:
 
   void InferInFreeMode(LayoutMap &layout_map,
                        const LayoutMap &strict_layout_map) {
-
-    DLOG(INFO) << "Enforced layout maps:" << '\n';
-    for (auto &&[k, v] : layout_map) {
-      DLOG(INFO) << "    " << k << ": " << v->DebugOutput() << '\n';
-    }
-    DLOG(INFO) << '\n';
-
     // Group operators into connected components
     UnionFind<int> uf;
     for (int i = 0; i < infer_list_.size(); i++) {
@@ -948,8 +933,6 @@ private:
     std::vector<bool> in_queue(infer_list_.size(), false);
 
     for (auto &&[root, members] : components) {
-      DLOG(INFO) << "======================= processing component " << root
-                 << '\n';
       decltype(infer_list_) best_infer_list;
       LayoutMap best_layout_map;
       int64_t min_reg_num = INT64_MAX;
@@ -957,8 +940,6 @@ private:
 
       // Try each member as the root of inference for this component
       for (int attempt_infer_root : members) {
-        DLOG(INFO) << "----------------------- try root " << attempt_infer_root
-                   << " members " << members.size() << '\n';
         // Backup the current infer_list_ state
         auto back_infer_list = BackupInferList();
         // Copy the current layout_map for temporary use
@@ -1070,7 +1051,7 @@ public:
     BufferUseDefCollector collector(skip_thread_partition);
     collector.Collect(f);
     auto result = collector.Run();
-    PrintLayoutInferenceResult(result);
+    // PrintLayoutInferenceResult(result);
     LayoutInferencer substituter(result, skip_thread_partition, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
     return f;

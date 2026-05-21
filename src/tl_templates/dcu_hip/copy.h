@@ -213,7 +213,21 @@ TL_DEVICE void ds_read_vector(float32x4& dst, uint32_t  lds_base_ptr)
 //     );
 //   }
 // }
+TL_DEVICE void load_shmem_to_reg_b64(
+    half_t* dst_base, 
+    half_t* shared_ptr) 
+{
+    uint2* dst_ptr = (uint2*)(dst_base);
+    
+    uint32_t lds_byte_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(shared_ptr));
 
+    asm volatile(
+        "ds_read_b64 %0, %1 offset:0\n\t"
+        : "=v"(*dst_ptr)       // %0: 写入的本地寄存器 (64位)
+        : "v"(lds_byte_addr)   // %1: 算好的共享内存字节地址 (32位 VGPR)
+        : "memory"
+    );
+}
 template <int N>
 TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
                                        void *global_base_ptr, bool cond) {

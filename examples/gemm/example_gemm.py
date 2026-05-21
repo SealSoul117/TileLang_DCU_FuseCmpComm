@@ -27,11 +27,11 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    kernel = matmul(19200, 5120, 5120, 256, 256, 16)
+    kernel = matmul(5120, 5120, 5120, 256, 256, 16)
 
     import torch
 
-    a = torch.randn(19200, 5120).cuda().half()
+    a = torch.randn(5120, 5120).cuda().half()
     b = torch.randn(5120, 5120).cuda().half()
 
     c = kernel(a, b)
@@ -44,17 +44,18 @@ def main():
     print(ref_c)
     print("CUDA Source:")
     print(kernel.get_kernel_source())
-    # torch.testing.assert_close(c, ref_c, rtol=1e-1, atol=1e-1)
+    profiler = kernel.get_profiler()
+    latency = profiler.do_bench()
+    print(f"tilelang Latency: {latency}ms")
+
+    torch.testing.assert_close(c, ref_c, rtol=1e-1, atol=1e-1)
     print("All check passed.")
 
     # Get CUDA Source
 
 
     # benchmark
-    profiler = kernel.get_profiler()
-    latency = profiler.do_bench(backend="cupti")
-    # latency = profiler.do_bench()
-    print(f"tilelang Latency: {latency}ms")
+
 
 
 if __name__ == "__main__":

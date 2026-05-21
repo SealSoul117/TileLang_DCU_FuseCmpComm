@@ -206,15 +206,11 @@ public:
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
     PrimFuncNode *fptr = f.CopyOnWrite();
-    LOG(INFO) << "Before lowering tile op: " << fptr->body;
     fptr->body = substituter.VisitStmt(f->body);
-    LOG(INFO) << "After lowering tile op: " << fptr->body;
     fptr->body =
         RemapBufferRewriter::Substitute(fptr->body, substituter.buffer_remap_);
-      LOG(INFO) << "After remapping buffer references: " << fptr->body;
     fptr->body =
         LayoutRemapRewriter::Substitute(fptr->body, substituter.layout_remap_);
-      LOG(INFO) << "After remapping layout references: " << fptr->body;
     tvm::transform::PassContext ctxt = tvm::transform::PassContext::Current();
     Optional<Bool> opt_disable_tma_lower =
         ctxt->GetConfig(kDisableTMALower, Optional<Bool>());
@@ -246,8 +242,6 @@ private:
       auto layout_map = op->annotations.at(attr::kLayoutMap)
                             .as<Map<Buffer, Layout>>()
                             .value();
-                                  LOG(INFO) << "Found layout map annotation in block "
-                << ", applying layout remapping" << layout_map;
       for (auto [buffer, layout] : layout_map) {
         buffer_remap_.Set(buffer,
                           makeBufferWithLayout(buffer, layout, var_remap_));
@@ -272,7 +266,6 @@ private:
       }
       workspace_stack_.pop_back();
     }
-    LOG(INFO) << "After visiting block: " << block;
     return block;
   }
 
@@ -612,8 +605,6 @@ private:
     // Do not analysis the call node to the global function.
     if (call && call->op.as<GlobalVarNode>())
       return Downcast<Evaluate>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    LOG(INFO) << "===== Visit Evaluate Node =====";
-  LOG(INFO) << "Evaluate value:\n" << op->value;
     auto tile_op = ParseOperator(tvm::ffi::GetRef<Stmt>(op));
     if (!tile_op.defined())
       return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -651,10 +642,6 @@ private:
     for (const auto &[var, expr] : let_bindings_) {
       let_var_to_expr.Set(var, expr);
     }
-    LOG(INFO) << "TileOP" << tile_op<< " detected, lowering with thread bounds " << thread_bounds;
-    LOG(INFO) << "Current let bindings: " << let_var_to_expr;
-    LOG(INFO) << "Current layout map: " << layout_map_;
-    LOG(INFO) << "Current buffer remap: " << buffer_remap_;
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
                   layout_map_, buffer_remap_, let_var_to_expr},

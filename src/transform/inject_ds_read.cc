@@ -106,14 +106,11 @@ using namespace tir::transform;
 
 tvm::transform::Pass InjectDSRead() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    std::cout << "[DEBUG InjectDSRead] Pass is being executed" << std::endl;
     // Only apply to DCU targets
     if (!IsDCUTarget(m)) {
-      std::cout << "[DEBUG InjectDSRead] Not a DCU target, skipping" << std::endl;
       return f;
     }
 
-    std::cout << "[DEBUG InjectDSRead] Is DCU target, applying injector" << std::endl;
     auto *n = f.CopyOnWrite();
     n->body = DSReadInjector()(n->body);
     return f;

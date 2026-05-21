@@ -416,7 +416,6 @@ def InjectDSRead():
     fpass : tvm.transform.Pass
         The result pass
     """
-    print("Injecting ds_read for shared to register memory copy on DCU.")
     return _ffi_api.InjectDSRead()  # type: ignore
 
 
@@ -442,7 +441,6 @@ def InjectBLocalLayoutTransform():
     fpass : tvm.transform.Pass
         The result pass
     """
-    print("Injecting Transform B_local layout from shared memory thread-interleaved to local row-major for DCU.")
     return _ffi_api.InjectBLocalLayoutTransform()  # type: ignore
 
 

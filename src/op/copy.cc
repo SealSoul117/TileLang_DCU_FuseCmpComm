@@ -138,13 +138,6 @@ Copy::Copy(Array<PrimExpr> args) {
     bf[i] = region->buffer;
 
   }
-  for (int i = 0; i < 2; i++) {
-  LOG(INFO) << (i == 0 ? "src" : "dst") << " region:";
-  for (const auto& r : rgs[i]) {
-    LOG(INFO) << "  min = " << r->min
-              << ", extent = " << r->extent;
-  }
-}
   
   std::tie(node->src, node->dst) = std::tie(bf[0], bf[1]);
   std::tie(node->src_range, node->dst_range) = std::tie(rgs[0], rgs[1]);
@@ -400,8 +393,6 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 
   Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
-  LOG(INFO) << "MakeSIMTLoop for Copy src = " << loop_vars;
-  LOG(INFO) << "src_indices: " << src_indices << ", dst_indices: " << dst_indices;
 
   PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
   PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
@@ -615,8 +606,6 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
       pass_ctx->GetConfig<Bool>(kDisableTMALower, Bool(false)).value();
   auto copy_inst = GetCopyInst(target, disable_tma_lower || disable_tma,
                                T.layout_map, T.analyzer, T.buffer_oob);
-  LOG(INFO) << "Enter layout inference for Copy: " << ", src = " << src->name
-            << ", dst = " << dst->name;
   // Handle tensor memory (tmem) layout inference
   if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
     // Tensor memory copy
@@ -728,17 +717,10 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   }
   
   if (!par_op_.defined()) {
-    LOG(INFO) << "Construct parallel op for Copy layout inference for src = "
-              << src->name << ", dst = " << dst->name;
     arith::Analyzer analyzer;
-    LOG(INFO) << "analyzer" << MakeSIMTLoop(&analyzer);
     par_op_ = ParallelOp((MakeSIMTLoop(&analyzer)));
   }
-  LOG(INFO) << "Start parallel op layout inference for Copy src = " << src->name
-            << ", dst = " << dst->name;
   auto layout_map = par_op_->InferLayout(T, level);
-  LOG(INFO) << "Finish parallel op layout inference for Copy src = " << src->name
-            << ", dst = " << dst->name << ", inferred layout map: " << layout_map;
   return layout_map;
 }
 /**
@@ -1054,7 +1036,6 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
  */
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
-  printf("Lowering CopyNode with target: %s\n", target->str().c_str());
   using namespace tvm::transform;
   PassContext pass_ctx = PassContext::Current();
   bool disable_tma_lower =
@@ -1140,17 +1121,11 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
-    printf("Lowering normal copy for target: %s\n", T.target->str().c_str());
-    LOG(INFO) << "Inferred loop layout for normal copy: " << par_op->GetRoot();
-    LOG(INFO) << loop_layout;
     auto thread_var = T.thread_var;
     auto thread_loop =
         PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer, loop_layout);
     vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
-    LOG(INFO) << vectorized_thread_loop;
   }
-    printf("fdsg: %s\n", T.target->str().c_str());
-    LOG(INFO) << vectorized_thread_loop;
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
                       vectorized_thread_loop);
@@ -1162,7 +1137,6 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
                                  arith::Analyzer *analyzer) const {
   PrimExpr total_threads = T.thread_bounds->extent;
   PrimExpr warp_size_expr = make_const(total_threads.dtype(), 64);
-  LOG(INFO) << "dst shape " << dst->shape << ", src shape " << src->shape;
   // 使用 analyzer->Simplify 确保结果尽可能是一个常数
   PrimExpr warp_num = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
   // 安全起见，防止某些极端 case 下 total_threads < 64
@@ -1183,12 +1157,10 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
                << "But found dst shape " << dst->shape 
                << " and src shape " << src->shape << ".";
   }
-  LOG(INFO) << "Generated SIMT loop for DCU async copy: " << simt_loop;  
   // 这里的 Fuse 和 Substitute 逻辑保持一致，用于处理多维循环合并
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
   auto transformed_loop =
       Downcast<For>(ParallelLoopTransformer::Substitute(fused_loop));
-  LOG(INFO) << "Transformed loop after fusion and substitution: " << transformed_loop;
   auto par_op = ParallelOp(transformed_loop);
 
   // DCU 异步拷贝通常需要推导 Layout 以确保线程映射正确
@@ -1211,7 +1183,6 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   
   // 最后进行向量化优化（如果满足条件）
   auto vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
-  LOG(INFO) << "Lowered DCU async copy loop: " << vectorized_thread_loop;
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
                       vectorized_thread_loop);

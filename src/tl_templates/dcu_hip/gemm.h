@@ -164,7 +164,6 @@ public:
 
   static TL_DEVICE void body(A_type *A_shared, B_type *B_shared,
                              C_type *C_local) {
-    printf("Executing GemmTensorOp dcu_hip body\n");
     auto tid = threadIdx.x;
     auto warp_id = tid / warp_size;
     auto warp_m = warp_id / block_col_warps;

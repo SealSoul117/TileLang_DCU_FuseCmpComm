@@ -246,7 +246,6 @@ private:
   PrimExpr RewriteBufferAccess(const Call &call,
                                const std::vector<int> &arg_indices,
                                int divisor = 1) {
-                                          LOG(INFO) << "=== [Pipeline Debug] Rewriting buffer access for Call: " << call->op;
     auto product = [](const Array<PrimExpr> &input) {
 
       return foldl(
@@ -258,20 +257,9 @@ private:
     Array<PrimExpr> new_args = call->args;
     for (int i : arg_indices) {
             Var buffer_var = Downcast<Var>(call->args[i]);
-      LOG(INFO) << "=== [Pipeline Debug] Rewriting buffer access for Var: " << buffer_var->name_hint
-                << " | Pointer: " << buffer_var.get();
 
         // 2. 检查是否存在，如果不存在则打印并报错
         if (buffer_data_to_buffer_.find(buffer_var) == buffer_data_to_buffer_.end()) {
-            LOG(INFO) << "=== [Pipeline Error] Cannot find Var in buffer_data_to_buffer_ ===";
-            LOG(INFO) << "Attempting to find Var: " << buffer_var->name_hint;
-            LOG(INFO) << "Variable pointer: " << buffer_var.get();
-            
-            LOG(INFO) << "Available Vars in map:";
-            for (auto const& [key, val] : buffer_data_to_buffer_) {
-                LOG(INFO) << "  - Name: " << key->name_hint << " | Pointer: " << key.get();
-            }
-            
             // 抛出一个更有意义的错误，方便定位
             LOG(FATAL) << "KeyError: Var '" << buffer_var->name_hint << "' is not in buffer_data_to_buffer_";
         }
@@ -1787,10 +1775,6 @@ private:
     }
 
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
-        LOG(INFO) << "Block " << block << " accesses buffers:";
-                    for (auto const& [key, val] : buffer_data_to_buffer_) {
-                LOG(INFO) << "  - Name: " << key->name_hint << " | Pointer: " << key.get();
-            }
     Array<Array<BufferRegion>> access =
         GetBlockReadWriteRegion(block, buffer_data_to_buffer_);
     BlockNode *n = block.CopyOnWrite();

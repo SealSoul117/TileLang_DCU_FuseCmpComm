@@ -17,7 +17,7 @@ python -c "import tilelang; print(tilelang.__version__)"
 If you encounter the error ModuleNotFoundError: No module named 'tvm_ffi', it means the TVM foreign function interface package was not installed. This often happens if the submodules were built manually. Fix it by running:
 ```
 # Navigate to the tvm_ffi directory
-cd 3rdparty/tvm/3rdparty/tvm_ffi
+cd 3rdparty/tvm/3rdparty/tvm-ffi
 
 # Install the package in editable mode
 pip install .

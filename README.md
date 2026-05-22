@@ -34,27 +34,21 @@
 > **注**：更多高级算子（如转置矩阵乘、Dequant GEMM、FlashAttention 等）及更多布局的优化正在密集开发中。
 
 ## 快速安装 (Installation)
-
-### 环境依赖
-在编译和使用 TileLang-DCU 之前，请确保您的服务器已正确配置以下环境：
-- DTK (Deep Computing ToolKit) 驱动及开发环境
-- Python >= 3.8
-- CMake >= 3.18
-
 ### 从源码安装
 
 ```bash
 # 1. 克隆本仓库
-git clone [https://github.com/your-username/tilelang-dcu.git](https://github.com/your-username/tilelang-dcu.git)
-cd tilelang-dcu
+git clone https://developer.sourcefind.cn/codes/OpenDAS/tilelang.git
+cd tilelang
 
-# 2. 安装必要的系统依赖
-sudo apt-get update
-sudo apt-get install -y python3-setuptools gcc libtinfo-dev zlib1g-dev build-essential cmake libedit-dev libxml2-dev
+mkdir -p build
+cd build
+cmake .. -DUSE_CUDA=OFF -DUSE_ROCM=ON
+make -j
 
-# 3. 以可编辑模式安装 TileLang-DCU
-pip install -e . -v
 ```
+[具体可见本处文档](./docs/get_started/Installation_dcu.md)
+
 ## 快速上手 (Quick Start)
 以下是一个在海光 DCU 上运行高性能 GEMM (NN 布局) 并带有 ReLU 激活函数的完整示例。语法保持了与原生 TileLang 的高度一致，底层会自动编译为适配 DCU 的 HIP 内核。
 
@@ -96,8 +90,6 @@ print("c:")
 print(c)
 print("ref_c:")
 print(ref_c)
-print("CUDA Source:")
-print(kernel.get_kernel_source())
 profiler = kernel.get_profiler()
 latency = profiler.do_bench()
 print(f"tilelang Latency: {latency}ms")
@@ -108,5 +100,5 @@ print("All check passed.")
 
 ## 后续规划 (Upcoming Features)
 我们正紧锣密鼓地开展后续版本的开发，接下来的规划包括：
-1. 支持 NT/TN 等更多输入布局的 GEMM 算子优化。
+1. 支持 NT/TN/TT 等更多输入布局的 GEMM 算子优化。
 2. 针对大语言模型（LLM）的 FlashAttention 算子在 DCU 上的全量移植。

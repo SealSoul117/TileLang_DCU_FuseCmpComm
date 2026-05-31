@@ -27,11 +27,11 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    kernel = matmul(5120, 5120, 5120, 256, 256, 16)
+    kernel = matmul(19200, 5120, 5120, 256, 256, 16)
 
     import torch
 
-    a = torch.randn(5120, 5120).cuda().half()
+    a = torch.randn(19200, 5120).cuda().half()
     b = torch.randn(5120, 5120).cuda().half()
 
     c = kernel(a, b)

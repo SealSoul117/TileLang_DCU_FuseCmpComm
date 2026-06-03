@@ -300,6 +300,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
+    
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
@@ -308,6 +309,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
+        mod = tilelang.transform.InsertAsyncGldFence()(mod)
+        
         # it is unnecessary to insert shared fence after async copy, as the synchronization between async copy and mma is already handled by the hardware with async fence. And inserting shared fence may cause deadlock if there are not enough threads to execute the fence.
         # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
 
@@ -316,5 +319,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
+        mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
 
     return mod

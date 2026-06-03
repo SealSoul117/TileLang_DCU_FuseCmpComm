@@ -406,6 +406,11 @@ TIR_DEFINE_TL_BUILTIN(async_gld_fence)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(async_gld_sld_fence)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 
 TIR_DEFINE_TL_BUILTIN(cp_async_wait)
     .set_num_inputs(1)

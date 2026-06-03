@@ -269,7 +269,7 @@ public:
                     
                     Array<PrimExpr> args = {Integer(fence_val)};
                     
-                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_fence"), args);
+                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"), args);
                     new_seq.push_back(Evaluate(fence_call));
 
                     new_seq.push_back(MakeWaveBarrierStmt());

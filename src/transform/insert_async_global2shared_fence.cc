@@ -1,7 +1,7 @@
 /*!
  * \file insert_async_global2shared_fence.cc
  * \brief Move async global-to-shared wait from AttrStmt to tl.cp_async_wait after
- *        tl.async_gld_fence inside the main k-loop.
+ *        tl.async_gld_sld_fence inside the main k-loop.
  */
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
@@ -21,7 +21,7 @@ using namespace tir;
 bool IsAsyncGldFenceCall(const CallNode* call) {
   if (!call) return false;
   if (const auto* op = call->op.as<OpNode>()) {
-    return op->name == "tl.async_gld_fence";
+    return op->name == "tl.async_gld_sld_fence";
   }
   return false;
 }
@@ -33,7 +33,7 @@ Stmt MakeCpAsyncWaitStmt(int wait_count) {
 }
 
 // Rewrites the body of the main k-loop: strips async_wait AttrStmts and inserts
-// tl.cp_async_wait after each tl.async_gld_fence.
+// tl.cp_async_wait after each tl.async_gld_sld_fence.
 class KLoopBodyMutator : public StmtMutator {
  public:
   Stmt VisitStmt_(const AttrStmtNode* op) override {

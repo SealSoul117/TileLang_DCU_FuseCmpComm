@@ -623,6 +623,16 @@ def InsertAsyncGlobal2SharedFence():
     return _ffi_api.InsertAsyncGlobal2SharedFence()  # type: ignore
 
 
+def InsertAsyncGldFence():
+    """InsertAsyncGldFence"""
+    return _ffi_api.InsertAsyncGldFence()  # type: ignore
+
+
 def UnrollDCUKLoop():
     """Unroll the unique DCU GEMM k-loop by a configurable factor (default 4)."""
     return _ffi_api.UnrollDCUKLoop()  # type: ignore
+
+
+def InjectWarpKLoopDivergence():
+    """Split the DCU GEMM k-loop across warp halves with divergent mmac scheduling."""
+    return _ffi_api.InjectWarpKLoopDivergence()  # type: ignore

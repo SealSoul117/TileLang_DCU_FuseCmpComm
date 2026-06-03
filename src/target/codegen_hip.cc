@@ -1152,11 +1152,14 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << "((half_t*)" << dst_ptr << " + " << dst_off << "), ";
     this->stream << src_res << ", ";
     this->stream << src_off << " * sizeof(half_t));\n";
-  }
-    else if (op->op.same_as(Op::Get("tl.async_gld_fence"))) {
+  } else if (op->op.same_as(Op::Get("tl.async_gld_sld_fence"))) {
       int fence_num = Downcast<IntImm>(op->args[0])->value;
       this->PrintIndent();
       this->stream << "tl::async_gld_sld_fence(" << fence_num << ");\n";
+  } else if (op->op.same_as(Op::Get("tl.async_gld_fence"))) {
+      int fence_num = Downcast<IntImm>(op->args[0])->value;
+      this->PrintIndent();
+      this->stream << "tl::async_gld_fence(" << fence_num << ");\n";
   } else if (op->op.same_as(Op::Get("tl.cp_async_wait"))) {
     int n = Downcast<IntImm>(op->args[0])->value;
     std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";

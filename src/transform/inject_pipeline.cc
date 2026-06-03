@@ -56,6 +56,87 @@ inline bool IsSharedPipelineBuffer(const Buffer &buffer) {
   return IsSharedPipelineBufferScope(buffer.scope());
 }
 
+inline bool IsGlobalPipelineBufferScope(const ffi::String &scope) {
+  std::string s = scope;
+  return s.empty() || s == "global";
+}
+
+bool BlockBodyHasMmaCompute(const Block &block) {
+  class MmaDetector : public StmtExprVisitor {
+   public:
+    bool has_mma = false;
+    void VisitExpr_(const CallNode *op) final {
+      if (const auto *op_node = op->op.as<OpNode>()) {
+        if (op_node->name == "tl.tvm_mmac") {
+          has_mma = true;
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+  MmaDetector detector;
+  detector(block->body);
+  return detector.has_mma;
+}
+
+bool BlockBodyIsSharedToLocalCopy(const Block &block) {
+  class Classifier : public StmtExprVisitor {
+   public:
+    bool has_local_store = false;
+    bool reads_shared = false;
+    bool in_local_store_value = false;
+    void VisitStmt_(const BufferStoreNode *op) final {
+      if (IsRegisterPipelineLocalScope(op->buffer.scope())) {
+        has_local_store = true;
+        bool old = in_local_store_value;
+        in_local_store_value = true;
+        VisitExpr(op->value);
+        in_local_store_value = old;
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitExpr_(const BufferLoadNode *op) final {
+      if (in_local_store_value && IsSharedPipelineBufferScope(op->buffer.scope())) {
+        reads_shared = true;
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+  Classifier classifier;
+  classifier(block->body);
+  return classifier.has_local_store && classifier.reads_shared;
+}
+
+bool BlockBodyIsGlobalToSharedCopy(const Block &block) {
+  class Classifier : public StmtExprVisitor {
+   public:
+    bool has_shared_store = false;
+    bool reads_global = false;
+    bool in_shared_store_value = false;
+    void VisitStmt_(const BufferStoreNode *op) final {
+      if (IsSharedPipelineBufferScope(op->buffer.scope())) {
+        has_shared_store = true;
+        bool old = in_shared_store_value;
+        in_shared_store_value = true;
+        VisitExpr(op->value);
+        in_shared_store_value = old;
+        return;
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitExpr_(const BufferLoadNode *op) final {
+      if (in_shared_store_value && IsGlobalPipelineBufferScope(op->buffer.scope())) {
+        reads_global = true;
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+  Classifier classifier;
+  classifier(block->body);
+  return classifier.has_shared_store && classifier.reads_global;
+}
+
 inline ffi::String GetAllocateStorageScope(const AllocateNode *op) {
   if (auto *ptr_type = op->buffer_var->type_annotation.as<PointerTypeNode>()) {
     if (!ptr_type->storage_scope.empty()) {
@@ -566,15 +647,15 @@ public:
     // Step 2: Emit the pipeline prologue, body and epilogue.
     Stmt prologue =
         EmitImpl(pipeline_loop_->min, pipeline_loop_->min + max_stage_, true,
-                 true, false);
+                 true, false, true);
     Stmt body = EmitImpl(pipeline_loop_->min + max_stage_,
                          pipeline_loop_->min + pipeline_loop_->extent, false,
-                         false, false);
+                         false, false, false);
 
     Stmt epilogue =
         EmitImpl(pipeline_loop_->min + pipeline_loop_->extent,
                  pipeline_loop_->min + pipeline_loop_->extent + max_stage_,
-                 true, true, true);
+                 true, true, true, false);
     SeqStmt stmt = SeqStmt({prologue, body, epilogue});
 
     // Step 3: Make a new block that contains new buffer allocations after
@@ -975,6 +1056,54 @@ private:
   }
 
   /*!
+   * \brief Reverse shared→register and global→shared order in the prologue.
+   *
+   * Register pipeline planning uses s2r before g2s in the steady-state body.
+   * During prologue the last pipeline level should run g2s before s2r so the
+   * first shared tile can be consumed in the same iteration after it is loaded.
+   */
+  void ReversePrologueLastStageOrder(std::vector<RewrittenBlockInfo> *blocks) const {
+    std::vector<size_t> prefix_idx;
+    std::vector<size_t> s2r_idx;
+    std::vector<size_t> g2s_idx;
+    std::vector<size_t> suffix_idx;
+    prefix_idx.reserve(blocks->size());
+    s2r_idx.reserve(blocks->size());
+    g2s_idx.reserve(blocks->size());
+    suffix_idx.reserve(blocks->size());
+
+    for (size_t i = 0; i < blocks->size(); ++i) {
+      const Block &blk = (*blocks)[i].block;
+      if (BlockBodyHasMmaCompute(blk) && !BlockBodyIsSharedToLocalCopy(blk)) {
+        suffix_idx.push_back(i);
+      } else if (BlockBodyIsSharedToLocalCopy(blk)) {
+        s2r_idx.push_back(i);
+      } else if (BlockBodyIsGlobalToSharedCopy(blk)) {
+        g2s_idx.push_back(i);
+      } else {
+        prefix_idx.push_back(i);
+      }
+    }
+
+    if (s2r_idx.empty() || g2s_idx.empty()) {
+      return;
+    }
+
+    std::vector<RewrittenBlockInfo> reordered;
+    reordered.reserve(blocks->size());
+    auto append_idx = [&](const std::vector<size_t> &indices) {
+      for (size_t idx : indices) {
+        reordered.push_back(std::move((*blocks)[idx]));
+      }
+    };
+    append_idx(prefix_idx);
+    append_idx(g2s_idx);
+    append_idx(s2r_idx);
+    append_idx(suffix_idx);
+    *blocks = std::move(reordered);
+  }
+
+  /*!
    * \brief Emit the pipeline loop in the given range.
    * \param start The start of the range
    * \param end The end of the range
@@ -982,7 +1111,8 @@ private:
    * \return The result loop.
    */
   Stmt EmitImpl(const PrimExpr &start, const PrimExpr &end, bool unroll_loop,
-                bool need_bound_check, bool is_epilogue = false) {
+                bool need_bound_check, bool is_epilogue = false,
+                bool is_prologue = false) {
     PrimExpr new_loop_var;
     PrimExpr extent = end - start;
     auto make_nop = []() {
@@ -1076,6 +1206,10 @@ private:
       new_blocks.push_back({stage, order, start, end, inbound, new_block,
                             normalized_access_index,
                             pipeline_info_[block].async});
+    }
+
+    if (is_prologue) {
+      ReversePrologueLastStageOrder(&new_blocks);
     }
 
     PopulateWaitCounts(new_blocks, &async_states_local, is_epilogue);

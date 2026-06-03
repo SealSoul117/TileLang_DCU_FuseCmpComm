@@ -46,6 +46,9 @@ std::string GetGlobalBufferName(const PrimExpr& expr) {
   return "";
 }
 
+// Maximum pattern width (tile_width): 2^12 = 4096.
+constexpr int64_t kMaxTileWidth = 1LL << 12;
+
 int64_t LargestPow2LessThan(int64_t k) {
   ICHECK_GT(k, 1);
   int64_t p = 1;
@@ -53,6 +56,14 @@ int64_t LargestPow2LessThan(int64_t k) {
     p <<= 1;
   }
   return p;
+}
+
+int64_t TileWidthFromK(int64_t k) {
+  int64_t tile_width = LargestPow2LessThan(k);
+  if (tile_width > kMaxTileWidth) {
+    tile_width = kMaxTileWidth;
+  }
+  return tile_width;
 }
 
 int StructBitFromTileWidth(int64_t tile_width) {
@@ -303,7 +314,7 @@ PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
     return func;
   }
 
-  int64_t tile_width = LargestPow2LessThan(*k_dim);
+  int64_t tile_width = TileWidthFromK(*k_dim);
   int struct_bit = StructBitFromTileWidth(tile_width);
 
   InfoCollector collector;

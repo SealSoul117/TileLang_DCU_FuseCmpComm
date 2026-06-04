@@ -25,7 +25,11 @@
   - 成功适配海光 DCU 设备后端。
   - 实现了基础 **NN (Normal-Normal) 布局的高性能 GEMM**（矩阵乘）算子。
 
-## 性能
+## 性能对比 (Performance Comparison)
+
+<img src="./images/tilelang_gemm_fp16_performance_transpose_rocblas_level9_MFU_warpK.png" />
+
+上图为不同矩阵尺寸下TileLang与 rocBLAS 的 GEMM 性能对比。  
 
 ## 已测试设备 (Tested Devices)
 本分支专注于海光 AI 芯片生态，目前已在以下设备上进行了严格的验证与性能测试：

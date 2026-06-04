@@ -27,12 +27,15 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    kernel = matmul(16384, 16384, 16384, 256, 256, 16)
+    M = 5120
+    N = 5120
+    K = 5120
+    kernel = matmul(M, N, K, 256, 256, 16)
 
     import torch
 
-    a = torch.randn(16384, 16384).cuda().half()
-    b = torch.randn(16384, 16384).cuda().half()
+    a = torch.randn(M, K).cuda().half()
+    b = torch.randn(K, N).cuda().half()
 
     c = kernel(a, b)
 
@@ -47,6 +50,7 @@ def main():
     profiler = kernel.get_profiler()
     latency = profiler.do_bench()
     print(f"tilelang Latency: {latency}ms")
+    print(f"GEMM TFLops: {2 * M * N * K / (latency * 1e9)}")
 
     torch.testing.assert_close(c, ref_c, rtol=1e-1, atol=1e-1)
     print("All check passed.")

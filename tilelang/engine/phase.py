@@ -316,6 +316,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
 
+        mod = tilelang.transform.InjectADSRead()(mod)
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)

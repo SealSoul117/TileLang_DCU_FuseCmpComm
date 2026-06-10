@@ -227,6 +227,16 @@ TIR_DEFINE_TL_BUILTIN(ds_read_m32x32_b8)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ds_read_b64)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ds_read_b128)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(set_max_nreg)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",

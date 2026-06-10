@@ -420,6 +420,23 @@ def InjectDSRead():
     return _ffi_api.InjectDSRead()  # type: ignore
 
 
+def InjectADSRead():
+    """Rewrite A_local shared-to-register loads using ds_read_b64/b128 on DCU.
+
+    This pass replaces A_local BufferStore from A_shared with ds_read_b64 or
+    ds_read_b128 hardware instructions for AMD DCU (gfx936, gfx942, etc.).
+
+    - ds_read_b64: loads 8 bytes at once (e.g. 8 int8 or 4 half elements)
+    - ds_read_b128: loads 16 bytes at once (e.g. 4 float elements)
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectADSRead()  # type: ignore
+
+
 def InjectBLocalLayoutTransform():
     """Transform B_local layout from shared memory thread-interleaved to local row-major.
 

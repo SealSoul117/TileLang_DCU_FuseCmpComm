@@ -868,7 +868,23 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
        << "), "
        << lds_offset
        << " * sizeof(int8_t))";
-  }else if (op->op.same_as(tl::wait_wgmma())) {
+  } else if (op->op.same_as(tl::ds_read_b64())) {
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string local_offset = this->PrintExpr(op->args[1]);
+    std::string lds_offset = this->PrintExpr(op->args[2]);
+    std::string elem_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
+    os << "tl::ds_read_b64((void*)(" << dst << " + " << local_offset << "), "
+       << lds_offset << " * sizeof(" << hip_type << "))";
+  } else if (op->op.same_as(tl::ds_read_b128())) {
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string local_offset = this->PrintExpr(op->args[1]);
+    std::string lds_offset = this->PrintExpr(op->args[2]);
+    std::string elem_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
+    os << "tl::ds_read_b128((void*)(" << dst << " + " << local_offset << "), "
+       << lds_offset << " * sizeof(" << hip_type << "))";
+  } else if (op->op.same_as(tl::wait_wgmma())) {
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;
     this->stream << "tl::wait_wgmma<" << std::to_string(num_mma) << ">();\n";

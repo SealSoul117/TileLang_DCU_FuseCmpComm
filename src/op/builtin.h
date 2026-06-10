@@ -356,6 +356,26 @@ TVM_DLL const Op &ds_read_m32x16_b16();
 TVM_DLL const Op &ds_read_m32x32_b8();
 
 /*!
+ * \brief DS read from shared memory to register (64-bit)
+ *
+ * ds_read_b64(dst, local_offset, lds_offset, elem_dtype)
+ *
+ * dst + local_offset forms the destination address at codegen.
+ * lds_offset is the element index into shared memory (byte offset applied at codegen).
+ */
+TVM_DLL const Op &ds_read_b64();
+
+/*!
+ * \brief DS read from shared memory to register (128-bit)
+ *
+ * ds_read_b128(dst, local_offset, lds_offset, elem_dtype)
+ *
+ * dst + local_offset forms the destination address at codegen.
+ * lds_offset is the element index into shared memory (byte offset applied at codegen).
+ */
+TVM_DLL const Op &ds_read_b128();
+
+/*!
  * \brief Set reg hint for warp-specialized branched
  *
  * SetMaxNRegInc(num_reg, is_inc)

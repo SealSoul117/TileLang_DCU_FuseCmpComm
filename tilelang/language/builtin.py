@@ -112,6 +112,30 @@ def ds_read_m32x32_b8(dst: tir.Var, local_offset: tir.Var, shared_ptr: tir.Var) 
     )
 
 
+def ds_read_b64(dst: tir.Var, local_offset: tir.Var, lds_offset: tir.Var, elem_dtype: str) -> Call:
+    """Load 8 bytes from shared memory using ds_read_b64."""
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ds_read_b64"),
+        dst,
+        local_offset,
+        lds_offset,
+        elem_dtype,
+    )
+
+
+def ds_read_b128(dst: tir.Var, local_offset: tir.Var, lds_offset: tir.Var, elem_dtype: str) -> Call:
+    """Load 16 bytes from shared memory using ds_read_b128."""
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ds_read_b128"),
+        dst,
+        local_offset,
+        lds_offset,
+        elem_dtype,
+    )
+
+
 def get_mbarrier(*args):
     """Retrieve a memory barrier operation.
 

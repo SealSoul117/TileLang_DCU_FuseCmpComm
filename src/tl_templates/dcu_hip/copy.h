@@ -158,7 +158,7 @@
 
 
   TL_DEVICE void ds_read_b64(
-      half_t* dst_base, 
+      void* dst_base, 
       uint32_t lds_byte_addr) 
   {
       uint2* dst_ptr = (uint2*)(dst_base);
@@ -167,6 +167,20 @@
           "ds_read_b64 %0, %1 offset:0\n\t"
           : "=v"(*dst_ptr)       // %0: 写入的本地寄存器 (64位)
           : "v"(lds_byte_addr)   // %1: 算好的共享内存字节地址 (32位 VGPR)
+          : "memory"
+      );
+  }
+
+  TL_DEVICE void ds_read_b128(
+      void* dst_base,
+      uint32_t lds_byte_addr)
+  {
+      uint4* dst_ptr = (uint4*)(dst_base);
+
+      asm volatile(
+          "ds_read_b128 %0, %1 offset:0\n\t"
+          : "=v"(*dst_ptr)
+          : "v"(lds_byte_addr)
           : "memory"
       );
   }

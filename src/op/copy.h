@@ -230,7 +230,8 @@ protected:
 
   For MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const;
 
-  For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const;
+  For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr bn_size,
+                            DataType data_type) const;
 
   /*!
    * \brief Compute linear layout for tma copy.

@@ -2,6 +2,201 @@
 # from tvm.runtime import convert
 import tilelang.language as T
 
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class SharedToLocalKDim32LayoutA:
+    """
+    LDS memory access data layout for A matrix with k_dim=16.
+    """
+
+    @staticmethod
+    def base(tx, local_id):
+        row = tx % 16
+        col = (tx // 16) * 8 + local_id
+        return row, col
+
+    @staticmethod
+    def slab(row, col):
+        slab_num = 1024
+        row_num = 32
+        new_row = (row % 4) + (row // 4) * (slab_num // (row_num))
+        return new_row, col
+
+    @staticmethod
+    def warp(row, col, warp_m):
+        new_row = row + warp_m * 4
+        return new_row, col
+
+    @staticmethod
+    def itera(row, col, idx, block_row_warps):
+        slab_size = 1024
+        per_warp_itera_num = 4 * 32
+        per_warp_itera_row = 4
+        slab_4_row = slab_size * 4 // 32
+        intra_iter = slab_size // (per_warp_itera_num * block_row_warps)
+
+        new_row = (
+            row
+            + (idx % intra_iter) * per_warp_itera_row * block_row_warps
+            + (idx // intra_iter) * slab_4_row
+        )
+        return new_row, col
+    
+    def rewind(row, col, tx, warp_m, idx, block_row_warps):
+        slab_size = 1024
+        k_dim = 32
+        per_slab_row = slab_size // k_dim
+        slab_4_row = slab_size * 4 // k_dim
+        per_warp_itera_num = 4 * k_dim
+        intra_iter = slab_size // (per_warp_itera_num * block_row_warps)
+        new_col = (((row % slab_4_row) // per_slab_row) * 16 + col) % k_dim
+        new_row = (((row % slab_4_row) // per_slab_row) * 16 + col) // k_dim + row
+        select_thread = (((tx // 16)) + ((tx & 3) * 4) + (((tx & 15) // 4) * 2)) // 16
+        cond = select_thread & (warp_m == (block_row_warps - 1)) & ((idx % intra_iter) == (intra_iter - 1))
+        new_row = new_row - per_slab_row * cond
+        return new_row, new_col
+
+@dataclass(frozen=True)
+class SharedToLocalKDim32LayoutB:
+    """
+    LDS memory access data layout for B matrix with k_dim=16.
+    """
+
+    @staticmethod
+    def base(tx, local_id):
+        row = tx // 2
+        col = (tx & 1) * 16 + local_id
+        return row, col
+    
+    @staticmethod
+    def slab(row, col):
+        new_row = (row & 15) // 4 + ((row & 3)) * 4 + (row // 16) * 16
+        return new_row, col
+
+    @staticmethod
+    def warp(row, col, warp_n):
+        per_warp_itera_num = 2 * 16
+        new_col = col + warp_n * per_warp_itera_num
+        return row, new_col
+
+    @staticmethod
+    def itera(row, col, idx, block_col_warps):
+        per_warp_itera_num = 2 * 16
+        new_col = col + per_warp_itera_num * block_col_warps * idx
+        return row, new_col
+    
+    def rewind(row, col, tx, warp_n, idx, warp_cols, block_row_warps):
+        per_warp_itera_num = 2 * 16
+        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
+        col = (((tx & 3) // 2) * 64 + col)
+        new_col = col % col_size
+        new_row = row + (col // col_size)
+        cond = (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & ((tx // 8) == 3) & ((tx & 3) // 2)
+        new_row = new_row - 4 * cond
+        
+        return new_row, new_col
+        
+
+@dataclass(frozen=True)
+class SharedToLocalLayoutB:
+    """
+    LDS memory access data layout for B matrix with k_dim=16.
+    """
+
+    @staticmethod
+    def base(tx, local_id):
+        row = tx // 4
+        col = (tx % 4) * 8 + local_id
+        bit0 = row & 1
+        bit1 = (row >> 1) & 1
+        new_row = ((row // 4) << 2)  + (bit0 * 2) + bit1
+
+        return new_row, col
+    @staticmethod
+    def slab(row, col):
+        return row, col
+    
+    @staticmethod
+    def warp(row, col, warp_n):
+        per_warp_itera_num = 4 * 8
+        new_col = col + warp_n * per_warp_itera_num
+        return row, new_col
+
+    @staticmethod
+    def itera(row, col, idx, block_col_warps):
+        per_warp_itera_num = 4 * 8
+        new_col = col + per_warp_itera_num * block_col_warps * idx
+        return row, new_col
+    
+    
+    
+    def rewind(row, col, tx, warp_n, idx, warp_cols, block_row_warps):
+        per_warp_itera_num = 4 * 8
+        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
+        col = (((tx & 7) // 4) * 32 + col)
+        new_col = col % col_size
+        new_row = row + (col // col_size)
+        cond = (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & (((tx >> 2) & 3) == 3)
+        new_row = new_row - 2 * cond
+        
+        return new_row, new_col
+        
+
+@dataclass(frozen=True)
+class SharedToLocalLayoutA:
+    """
+    LDS memory access data layout for A matrix with k_dim=32.
+    """
+
+    @staticmethod
+    def base(tx, local_id):
+        row = tx % 16
+        col = (tx // 16) * 4 + local_id
+        return row, col
+
+    @staticmethod
+    def slab(row, col):
+        slab_num = 512
+        row_num = 16
+        new_row = (row % 4) + (row // 4) * (slab_num // (row_num))
+        return new_row, col
+
+    @staticmethod
+    def warp(row, col, warp_m):
+        new_row = row + warp_m * 4
+        return new_row, col
+
+    @staticmethod
+    def itera(row, col, idx, block_row_warps):
+        slab_size = 512
+        per_warp_itera_num = 4 * 16
+        per_warp_itera_row = 4
+        slab_4_row = slab_size * 4 // 16
+        intra_iter = slab_size // (per_warp_itera_num * block_row_warps)
+
+        new_row = (
+            row
+            + (idx % intra_iter) * per_warp_itera_row * block_row_warps
+            + (idx // intra_iter) * slab_4_row
+        )
+        return new_row, col
+    
+    def rewind(row, col, tx, warp_m, idx, block_row_warps):        
+        slab_size = 512
+        k_dim = 16
+        per_slab_row = slab_size // k_dim
+        slab_4_row = slab_size * 4 // k_dim
+        per_warp_itera_num = 4 * k_dim
+        intra_iter = slab_size // (per_warp_itera_num * block_row_warps)
+        new_col = (((row % slab_4_row) // per_slab_row) * 8 + col) % k_dim
+        new_row = (((row % slab_4_row) // per_slab_row) * 8 + col) // k_dim + row
+        select_thread = (((tx // 16)) + ((tx & 3) * 4) + (((tx & 15) // 4) * 2)) // 16
+        cond = select_thread & (warp_m == (block_row_warps - 1)) & ((idx % intra_iter) == (intra_iter - 1))
+        new_row = new_row - per_slab_row * cond
+        return new_row, new_col
+
 '''
 256x16 A share mem layout
   0   16   32   48
@@ -19,6 +214,30 @@ import tilelang.language as T
     2  18  34  50
     3  19  35  51
 '''
+
+def thread_id_shared_access_64x4_to_16x16_layout_A(tx, local_id):
+    row = tx % 4
+    col = (tx // 16) * 4 + local_id
+    return row, col
+
+def thread_id_shared_access_layout_slab_A(row, col):
+    slab_num = 512
+    row_num = 16
+    new_row = (row % 4) + (row // 4) * (slab_num // (row_num * 4))
+    return new_row, col
+
+def thread_id_shared_access_layout_warp_A(row, col, warp_m):
+    new_row = row + warp_m * 4
+    return new_row, col
+
+def thread_id_shared_access_layout_iter_A(row, col, idx, block_row_warps):
+    slab_size = 512
+    per_warp_iter_num = 4 * 16
+    per_warp_iter_row = 4
+    slab_4_row = slab_size * 4 // 16
+    intra_iter = slab_size // (per_warp_iter_num * block_row_warps)
+    new_row = row + (idx % intra_iter) * per_warp_iter_row * block_row_warps + (idx // intra_iter) * slab_4_row
+    return new_row, col
 
 def shared_to_local_layout_A_padding(row, col, idx, warp_rows, block_row_warps, tx, local_id):
     col = (tx // 16) * 4 + local_id

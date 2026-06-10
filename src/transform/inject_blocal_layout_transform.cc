@@ -20,7 +20,7 @@
 /*!
  * \file inject_blocal_layout_transform.cc
  * \brief Transform B_local layout from shared memory thread-interleaved layout
- *        to local row-major layout using ds_read_vector hardware instructions.
+ *        to local row-major layout using ds_read hardware instructions.
  */
 
 #include <tvm/ffi/reflection/registry.h>

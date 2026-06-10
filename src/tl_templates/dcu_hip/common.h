@@ -64,29 +64,35 @@ using float16x16 =
 
 using half_t = float16_t;
 
-using bfloat16_t = __hip_bfloat16;
+using bfloat16x2 = __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16;
+using bfloat16x4 = __attribute__((__vector_size__(4 * sizeof(__bf16)))) __bf16;
+using bfloat16x8 = __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16;
+using bfloat16x16 = __attribute__((__vector_size__(16 * sizeof(__bf16)))) __bf16;
 
-struct bfloat16x2 {
-  bfloat16_t x, y;
-};
+using bfloat16_t = __bf16;
 
-struct bfloat16x4 {
-  bfloat16_t data[4];
-};
+// struct bfloat16x2 {
+//   bfloat16_t x, y;
+// };
 
-struct bfloat16x8 {
-  bfloat16_t data[8];
-};
+// struct bfloat16x4 {
+//   bfloat16_t data[4];
+// };
 
-struct bfloat16x16 {
-  bfloat16_t data[16];
-};
+// struct bfloat16x8 {
+//   bfloat16_t data[8];
+// };
+
+// struct bfloat16x16 {
+//   bfloat16_t data[16];
+// };
 
 typedef
     __attribute__((__vector_size__(4 * sizeof(short)))) short bfloat16x4_vec;
 
 using int32x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using float32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+using float32x8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 using float32x16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
 using int8x4 = __attribute__((__vector_size__(4 * sizeof(int8_t)))) int8_t;

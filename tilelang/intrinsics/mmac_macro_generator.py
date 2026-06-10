@@ -35,7 +35,11 @@ from .mmac_layout import (
     shared_32x16_to_local_64x8_layout_B,
     thread_id_shared_access_64x8_to_32x16_layout_B,
     shared_to_local_layout_B_padding,
-    shared_to_local_layout_B_wrap
+    shared_to_local_layout_B_wrap,
+    SharedToLocalLayoutA,
+    SharedToLocalLayoutB,
+    SharedToLocalKDim32LayoutA,
+    SharedToLocalKDim32LayoutB
 )
 
 lift = convert
@@ -263,8 +267,6 @@ class MatrixCoreIntrinEmitter:
         warp_num = self.block_row_warps
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
-        warp_row_interval = warp_num * 1 * 4 if warp_rows == 1 else warp_num * 2 * 4
-        warp_row_init = warp_num * 1 * 4
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
@@ -273,6 +275,8 @@ class MatrixCoreIntrinEmitter:
         is_transposed = self.a_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+        layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
+        print("micro_size_k", micro_size_k)
 
         # legalize shared buffer to region
         A_region = self._legalize_to_buffer_region(A_shared_buf)
@@ -294,9 +298,7 @@ class MatrixCoreIntrinEmitter:
             # {4..7,20..23,36..39,52..55} -> 1
             # {8..11,24..27,40..43,56..59} -> 2
             # {12..15,28..31,44..47,60..63} -> 3
-            warp_interval_idx = (tx & 15)>>2
-            warp_group_idx = warp_n
-            warp_inter_stride = 4
+
             # warp_rows 轮次 warp需要拆分成多轮来访问完整的行块
             if is_transposed:
                 raise NotImplementedError("Transposed A is not implemented yet")
@@ -315,17 +317,16 @@ class MatrixCoreIntrinEmitter:
             else:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
-                        row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        # # 每轮初始位置行偏移
-                        # row += i * warp_row_init
-                        # # warp 组行间隔
-                        # row += warp_group_idx * 4
-                        # # warp 内行间隔
-                        # row += warp_interval_idx * warp_row_interval
-                        row, col = shared_to_local_layout_A_padding(row, col, i, warp_rows, self.block_row_warps, tx, local_id)
-                        row, col = shared_to_local_layout_A_wrap(row, col, i, warp_rows, warp_m, self.block_row_warps, tx)
-                        l, r = (0 * warp_m * warp_inter_stride, rk * chunk + ki * (k_pack * micro_size_k))
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+                        row, col = layoutInfer.base(tx, local_id)
+                        # slab padding
+                        row, col = layoutInfer.slab(row, col)
+                        # warp offset
+                        row, col = layoutInfer.warp(row, col, warp_m)
+                        # iteration offset
+                        row, col = layoutInfer.itera(row, col, i, self.block_row_warps)
+                        # rewind offset
+                        # row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col + ki * micro_size_k]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
 
@@ -341,9 +342,10 @@ class MatrixCoreIntrinEmitter:
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
-
+        layoutInfer = SharedToLocalLayoutB if micro_size_k == 16 else SharedToLocalKDim32LayoutB
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
+        print("block_col_warps", self.block_col_warps, "micro_size_y", micro_size_y)
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
@@ -372,16 +374,12 @@ class MatrixCoreIntrinEmitter:
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        # row, col = T.meta_var(reverse_index_map((tx & 15) // 4 + (tx & 3) * 4 + (tx // 16) * 16, local_id))
-                        row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        row, col = shared_to_local_layout_B_padding(row, col, j, warp_cols, self.block_col_warps, tx, local_id)
-                        row, col = shared_to_local_layout_B_wrap(row, col, j, warp_cols, warp_n, self.block_col_warps, tx, local_id)
-                        l, r = (
-                            rk * chunk + ki * (k_pack * micro_size_k),
-                            # warp_n * warp_col_tiles + j * micro_size_y,
-                            0 * warp_n * warp_inter_stride,
-                        )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+                        row, col = layoutInfer.base(tx, local_id)
+                        row, col = layoutInfer.slab(row, col)
+                        row, col = layoutInfer.warp(row, col, warp_n)
+                        row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
+                        # row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 

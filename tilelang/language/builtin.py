@@ -90,36 +90,25 @@ def __ldg(load_or_buf: BufferLoad | tir.Buffer, index: PrimExpr | int | None = N
 
 
 
-def ds_read_vector(dst: tir.Var, local_offset: tir.Var, shared_ptr: tir.Var) -> Call:
-    """
-    Load from shared memory using ds_read_b64 instruction.
-
-    This is a vectorized load instruction on AMD DCU that loads 64 bits (8 bytes)
-    from shared memory at the specified byte offset.
-    It writes 8 bytes to dst from shared memory at byte_offset.
-        
-    This is a vectorized load instruction on AMD DCU that loads a 32x16 matrix
-    of half (16-bit) values with hardware-managed bank conflict avoidance.
-
-    Load from shared memory using ds_read_m32x16_b16 instruction.
-    
-    The ds_read_vector intrinsic has signature:
-        ds_read_vector(dst + local_offset, shared_ptr)
-    
-    Args:
-        dst: Destination pointer (register/local buffer).
-        local_offset: Local offset in bytes for the destination register.
-        lds_base_ptr: Source pointer (shared memory buffer data).
-
-    Returns:
-        Call: A TIR call intrinsic for the ds_read_b64 instruction.
-    """
+def ds_read_m32x16_b16(dst: tir.Var, local_offset: tir.Var, shared_ptr: tir.Var) -> Call:
+    """Load from shared memory using ds_read_m32x16_b16 (2-byte elements)."""
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.ds_read_vector"),
+        tir.op.Op.get("tl.ds_read_m32x16_b16"),
         dst,
         local_offset,
-        shared_ptr
+        shared_ptr,
+    )
+
+
+def ds_read_m32x32_b8(dst: tir.Var, local_offset: tir.Var, shared_ptr: tir.Var) -> Call:
+    """Load from shared memory using ds_read_m32x32_b8 (1-byte elements)."""
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ds_read_m32x32_b8"),
+        dst,
+        local_offset,
+        shared_ptr,
     )
 
 

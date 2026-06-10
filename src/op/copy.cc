@@ -328,22 +328,24 @@ PrimExpr CopyNode::MakePredicate(arith::Analyzer *analyzer,
                                  const Array<IterVar> &ivs,
                                  Array<PrimExpr> extents, int src_dst) const {
   Array<Range> ranges = src_dst == 0 ? src_range : dst_range;
+  // Use actual buffer access indices instead of raw loop vars so that
+  // predicates stay aligned with BufferLoad/BufferStore indices after
+  // loop partition and layout remapping.
+  Array<PrimExpr> indices = MakeIndices(ivs, src_dst);
 
   Array<PrimExpr> cond_list;
   ICHECK(extents.size() == ranges.size()) << extents << " " << ranges;
-  size_t idx = 0;
   for (size_t i = 0; i < ranges.size(); i++) {
     if (is_one(ranges[i]->extent))
       continue;
-    PrimExpr cond = ranges[i]->min + ivs[idx]->var < extents[i];
+    PrimExpr cond = indices[i] < extents[i];
     if (!analyzer->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
       cond_list.push_back(cond);
     }
-    cond = ranges[i]->min + ivs[idx]->var >= 0;
+    cond = indices[i] >= 0;
     if (!analyzer->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
       cond_list.push_back(cond);
     }
-    idx++;
   }
   if (cond_list.empty())
     return {};
@@ -366,11 +368,13 @@ PrimExpr CopyNode::MakePredicate(arith::Analyzer *analyzer,
  * - binds the resulting iteration variables to the provided arithmetic
  *   analyzer for simplification,
  * - computes source and destination index expressions,
- * - applies per-buffer boundary predicates (if needed) to mask out-of-range
- *   accesses,
  * - inserts a cast when src and dst dtypes differ,
  * - applies an optional `coalesced_width` annotation to generated parallel
  *   loops when present.
+ *
+ * Out-of-bounds checks for global memory are intentionally omitted here and
+ * deferred to LegalizeSafeMemoryAccess, because loop partition/layout
+ * remapping can desynchronize predicates built from loop iterators.
  *
  * @param analyzer Analyzer used to simplify and bind loop variable domains.
  * @return For A nested For statement representing the generated SIMT loop nest.
@@ -394,18 +398,11 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
   Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
-  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
-  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
-
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype)
     value = Cast(dst->dtype, value);
-  if (src_predicate.defined())
-    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
 
   Stmt body = BufferStore(dst, value, dst_indices);
-  if (dst_predicate.defined())
-    body = IfThenElse(dst_predicate, body);
   if (is_scalar) {
     return For(Var("i"), 0, 1, ForKind::kSerial, body);
   }
@@ -442,6 +439,7 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
 
   PrimExpr i_mapped = part1 + part2 + part3;
   i_mapped = analyzer->Simplify(i_mapped);
+  LOG(INFO) << "i_raw: " << i_raw << ", i_mapped: " << i_mapped;
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
   // 我们手动替换第一个非 unit 维度的变量
@@ -463,17 +461,10 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
   // dst_indices 保持正常的一一映射
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
-  // 生成 Body 逻辑
-  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
-  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
-
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
-  if (src_predicate.defined())
-    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
 
   Stmt body = BufferStore(dst, value, dst_indices);
-  if (dst_predicate.defined()) body = IfThenElse(dst_predicate, body);
 
   // 构建循环嵌套
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
@@ -485,21 +476,21 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
   return Downcast<For>(body);
 }
 
-For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const {
+For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr bn_size,
+                                    DataType data_type) const {
   Array<IterVar> loop_vars = MakeIterVars();
   for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
-  
-  // 参数定义
-  int pattern_thread_num = 4;
 
-  PrimExpr i_in_four = floormod(loop_vars[0]->var, pattern_thread_num); 
-  PrimExpr bit0 = floormod(i_in_four, 2);
-  PrimExpr bit1 = floormod(floordiv(i_in_four, 2), 2);
-  PrimExpr part1 = (bit0 * 2) + bit1;
+  PrimExpr i_raw = loop_vars[0]->var;
+  PrimExpr r = floordiv(make_const(i_raw.dtype(), 1024 / data_type.bytes()), bn_size);
+  PrimExpr n = make_const(i_raw.dtype(), 4 / data_type.bytes());
+  PrimExpr rn = r * n;
 
-  PrimExpr part2 = floordiv(loop_vars[0]->var, pattern_thread_num) * pattern_thread_num; 
-  
-  PrimExpr i_mapped = part1 + part2;
+  PrimExpr part1 = floormod(i_raw, n) * r;
+  PrimExpr part2 = floordiv(floormod(i_raw, rn), n);
+  PrimExpr part3 = floordiv(i_raw, rn) * rn;
+
+  PrimExpr i_mapped = part1 + part2 + part3;
   i_mapped = analyzer->Simplify(i_mapped);
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
@@ -522,17 +513,10 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
   // dst_indices 保持正常的一一映射
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
-  // 生成 Body 逻辑
-  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
-  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
-
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
-  if (src_predicate.defined())
-    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
 
   Stmt body = BufferStore(dst, value, dst_indices);
-  if (dst_predicate.defined()) body = IfThenElse(dst_predicate, body);
 
   // 构建循环嵌套
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
@@ -1149,7 +1133,7 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
           simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, warp_num);
       } else {
           // 既然上面不成立，这里自然就是 dst->shape[0] < dst->shape[1]
-          simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, warp_num);
+          simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, dst->shape[1], src->dtype);
       }
   }
   else {

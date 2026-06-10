@@ -27,6 +27,9 @@
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt.h>
+
+#include <functional>
 
 namespace tvm {
 namespace tl {
@@ -35,6 +38,27 @@ namespace tl {
  * \brief Check if the target is AMD DCU (gfx936, gfx942, etc.)
  */
 bool IsDCUTarget(const IRModule& module);
+
+/*!
+ * \brief Attribute key for threadblock swizzle pattern.
+ */
+constexpr const char* kThreadblockSwizzleAttr = "threadblock_swizzle_pattern";
+
+/*!
+ * \brief Find the stmt where DCU-specific lets (warp_idx, shadow addr, dcu_res)
+ *        should be injected.
+ *
+ * If a threadblock swizzle attr exists, injection happens at the beginning of
+ * its body so codegen emits blockIdx before those lets. Otherwise injection
+ * happens at the beginning of the innermost threadIdx binding body.
+ */
+const tir::StmtNode* FindDCUInjectTarget(const tir::Stmt& body);
+
+/*!
+ * \brief Wrap the stmt at the DCU injection target with \p wrap_fn.
+ */
+tir::Stmt InjectAtDCUTarget(const tir::Stmt& body,
+                            const std::function<tir::Stmt(const tir::Stmt&)>& wrap_fn);
 
 }  // namespace tl
 }  // namespace tvm

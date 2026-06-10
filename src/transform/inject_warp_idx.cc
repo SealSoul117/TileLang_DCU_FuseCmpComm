@@ -189,7 +189,9 @@ class InjectWarpIdxMutator : public StmtExprMutator {
       warp_injected_ = true;
 
       Stmt body = StmtExprMutator::VisitStmt(op->body);
-      body = InjectWarpIdxIntoBody(body);
+      body = InjectAtDCUTarget(body, [&](const Stmt& target_body) {
+        return InjectWarpIdxIntoBody(target_body);
+      });
       return AttrStmt(op->node, op->attr_key, op->value, body);
     }
     return StmtExprMutator::VisitStmt_(op);
@@ -204,7 +206,9 @@ class InjectWarpIdxMutator : public StmtExprMutator {
       warp_injected_ = true;
 
       Stmt body = StmtExprMutator::VisitStmt(op->body);
-      body = InjectWarpIdxIntoBody(body);
+      body = InjectAtDCUTarget(body, [&](const Stmt& target_body) {
+        return InjectWarpIdxIntoBody(target_body);
+      });
       return For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,
                  op->annotations);
     }

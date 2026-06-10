@@ -409,7 +409,8 @@ def InjectDSRead():
     ds_read_m32x16_b16 hardware instructions for AMD DCU (gfx936, gfx942, etc.).
 
     - ds_read_b64: loads 8 bytes (4 halfs or 2 floats) at once
-    - ds_read_m32x16_b16: loads 32 bytes (16 halfs) at once
+    - ds_read_m32x16_b16: loads 32 bytes (16 half/bfloat16 elements) at once
+    - ds_read_m32x32_b8: loads 32 bytes (32 int8/uint8 elements) at once
 
     Returns
     -------
@@ -424,7 +425,7 @@ def InjectBLocalLayoutTransform():
 
     This pass specifically handles the B_local buffer layout transformation in GEMM kernels
     for AMD DCU (gfx936, gfx942, etc.). It converts complex indexed BufferStore patterns
-    from shared memory into vectorized ds_read_vector hardware instructions.
+    from shared memory into vectorized ds_read_m32x16_b16 hardware instructions.
 
     B Layout Transformation:
     - Shared Memory Layout (per thread in warp, 16 elements):
@@ -600,6 +601,23 @@ def LayoutReducer():
 def LowerSharedGlobalCopy():
     """DCUResourceRewriter"""
     return _ffi_api.LowerSharedGlobalCopy()  # type: ignore
+
+
+def VectorizeSharedLocalCopy():
+    """Merge inner loop dimensions into shared->local vector loads on DCU.
+
+    For nested loops such as ``for i, local_id in T.grid(4, 2)`` where both the
+    local and shared indices advance by ``local_id * lanes`` with a contiguous
+    ramp load, this pass eliminates the inner loop and widens the vector load up
+    to 16 bytes (e.g. 8 half or 16 int8 elements).
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.VectorizeSharedLocalCopy()  # type: ignore
+
 
 def SimplifyDCUAsyncCopy():
     """SimplifyDCUAsyncCopy"""

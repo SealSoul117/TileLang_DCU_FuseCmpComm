@@ -189,21 +189,20 @@ PrimExpr AtomicAddNode::MakePredicate(arith::Analyzer *analyzer,
                                       Array<PrimExpr> extents,
                                       int src_dst) const {
   Array<Range> ranges = src_dst == 0 ? src_range : dst_range;
+  Array<PrimExpr> indices = MakeIndices(ivs, src_dst);
   Array<PrimExpr> cond_list;
   ICHECK(extents.size() == ranges.size()) << extents << " " << ranges;
-  size_t idx = 0;
   for (size_t i = 0; i < ranges.size(); i++) {
     if (is_one(ranges[i]->extent))
       continue;
-    PrimExpr cond = ranges[i]->min + ivs[idx]->var < extents[i];
+    PrimExpr cond = indices[i] < extents[i];
     if (!analyzer->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
       cond_list.push_back(cond);
     }
-    cond = ranges[i]->min + ivs[idx]->var >= 0;
+    cond = indices[i] >= 0;
     if (!analyzer->CanProve(cond, arith::ProofStrength::kSymbolicBound)) {
       cond_list.push_back(cond);
     }
-    idx++;
   }
   if (cond_list.empty())
     return {};

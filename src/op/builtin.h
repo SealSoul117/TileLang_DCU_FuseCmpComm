@@ -336,14 +336,24 @@ TVM_DLL const Op &tma_store_arrive();
 TVM_DLL const Op &tma_store_wait();
 
 /*!
- * \brief DS read from shared memory to register
+ * \brief DS read from shared memory to register (16-bit elements)
  *
- * ds_read_vector(dst, lds_base_ptr, m, n, offset)
+ * ds_read_m32x16_b16(dst, local_offset, lds_offset)
  *
- * This is a tilelang intrinsic for DCU ds_read hardware instruction.
- * Generated code will call tl::ds_read_vector.
+ * This is a tilelang intrinsic for DCU ds_read_m32x16_b16 hardware instruction.
+ * Generated code will call tl::ds_read_m32x16_b16.
  */
-TVM_DLL const Op &ds_read_vector();
+TVM_DLL const Op &ds_read_m32x16_b16();
+
+/*!
+ * \brief DS read from shared memory to register (8-bit elements)
+ *
+ * ds_read_m32x32_b8(dst, local_offset, lds_offset)
+ *
+ * This is a tilelang intrinsic for DCU ds_read_m32x32_b8 hardware instruction.
+ * Generated code will call tl::ds_read_m32x32_b8.
+ */
+TVM_DLL const Op &ds_read_m32x32_b8();
 
 /*!
  * \brief Set reg hint for warp-specialized branched

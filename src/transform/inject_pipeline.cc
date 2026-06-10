@@ -264,6 +264,18 @@ struct BufferAccessInfo {
   int use = -1; // the last using stage of the buffer
 };
 
+/*! \brief Vector lane count from MMA dtype strings, e.g. float16x4 -> 4, int8x8 -> 8. */
+inline int ParseMmaDtypeVectorWidth(const PrimExpr &dtype_arg) {
+  if (const auto *str = dtype_arg.as<StringImmNode>()) {
+    std::string s = str->value;
+    size_t pos = s.rfind('x');
+    if (pos != std::string::npos && pos + 1 < s.size()) {
+      return std::stoi(s.substr(pos + 1));
+    }
+  }
+  return 1;
+}
+
 /*!
  * \brief Rewriter for the body of the software pipeline. This pass inserts
  * `floormod` to indices of the remapped buffer to select the version
@@ -324,11 +336,9 @@ private:
     return buffer_region;
   }
 
-  PrimExpr RewriteBufferAccess(const Call &call,
-                               const std::vector<int> &arg_indices,
-                               int divisor = 1) {
+  PrimExpr RewriteBufferAccess(
+      const Call &call, const std::vector<std::pair<int, int>> &arg_with_divisors) {
     auto product = [](const Array<PrimExpr> &input) {
-
       return foldl(
           [](PrimExpr a, PrimExpr b, Span span) {
             return mul(std::move(a), std::move(b), std::move(span));
@@ -336,16 +346,13 @@ private:
           make_const(DataType::Int(32), 1), input);
     };
     Array<PrimExpr> new_args = call->args;
-    for (int i : arg_indices) {
-            Var buffer_var = Downcast<Var>(call->args[i]);
-
-        // 2. 检查是否存在，如果不存在则打印并报错
-        if (buffer_data_to_buffer_.find(buffer_var) == buffer_data_to_buffer_.end()) {
-            // 抛出一个更有意义的错误，方便定位
-            LOG(FATAL) << "KeyError: Var '" << buffer_var->name_hint << "' is not in buffer_data_to_buffer_";
-        }
-      const Buffer &buffer =
-          buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
+    for (const auto &[i, divisor] : arg_with_divisors) {
+      Var buffer_var = Downcast<Var>(call->args[i]);
+      if (buffer_data_to_buffer_.find(buffer_var) == buffer_data_to_buffer_.end()) {
+        LOG(FATAL) << "KeyError: Var '" << buffer_var->name_hint
+                   << "' is not in buffer_data_to_buffer_";
+      }
+      const Buffer &buffer = buffer_data_to_buffer_.at(buffer_var);
       auto ob = LookupVersionedBuffer(buffer);
       if (ob.has_value()) {
         const Buffer &new_buffer = ob.value();
@@ -366,6 +373,16 @@ private:
       }
     }
     return Call(call->dtype, call->op, new_args, call->span);
+  }
+
+  PrimExpr RewriteBufferAccess(const Call &call, const std::vector<int> &arg_indices,
+                               int divisor = 1) {
+    std::vector<std::pair<int, int>> arg_with_divisors;
+    arg_with_divisors.reserve(arg_indices.size());
+    for (int i : arg_indices) {
+      arg_with_divisors.emplace_back(i, divisor);
+    }
+    return RewriteBufferAccess(call, arg_with_divisors);
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
@@ -419,17 +436,20 @@ private:
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     if (call->op.same_as(builtin::tvm_access_ptr())) {
-      return RewriteBufferAccess(call, {1});
+      return RewriteBufferAccess(call, std::vector<int>{1});
     }
     // tl.tvm_mmac / tvm_mfma / tvm_rdna_wmma: same layout as codegen — args
-    // 6,8,10 are A/B/C buffer handles, 7,9,11 are element offsets (see
-    // codegen_hip.cc). Pipeline versioning must apply here too, otherwise MMA
-    // keeps unversioned .data + bias while BufferLoad/Store use ping-pong.
+    // 6,8,10 are A/B/C buffer handles, 7,9,11 are vector-lane offsets (see
+    // codegen_hip.cc). Offsets are in units of {dtype}x{lanes} (e.g. float16x4
+    // -> divisor 4, int8x8 -> divisor 8), not raw scalar elements.
     if (call->op.same_as(tvm_mmac()) || call->op.same_as(tvm_mfma()) ||
         call->op.same_as(tvm_rdna_wmma())) {
       ICHECK_EQ(call->args.size(), 12U)
           << "tl MMA builtins expect 12 arguments for pipeline rewrite";
-      return RewriteBufferAccess(call, {6, 8, 10}, 4);
+      return RewriteBufferAccess(
+          call, {{6, ParseMmaDtypeVectorWidth(call->args[3])},
+                 {8, ParseMmaDtypeVectorWidth(call->args[4])},
+                 {10, ParseMmaDtypeVectorWidth(call->args[5])}});
     }
     return call;
   }

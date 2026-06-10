@@ -762,6 +762,26 @@ std::string CodeGenTileLangHIP::GetBufferRef(DataType t,
   return os.str();
 }
 
+static std::string RuntimeDTypeToHIPType(const std::string& runtime_dtype) {
+  if (runtime_dtype == "int8") {
+    return "int8_t";
+  } else if (runtime_dtype == "uint8") {
+    return "uint8_t";
+  } else if (runtime_dtype == "float16") {
+    return "half_t";
+  } else if (runtime_dtype == "float32") {
+    return "float";
+  } else if (runtime_dtype == "float64") {
+    return "double";
+  } else if (runtime_dtype == "int16") {
+    return "int16_t";
+  } else if (runtime_dtype == "int32") {
+    return "int32_t";
+  }
+  LOG(FATAL) << "Unsupported DCU async copy dtype: " << runtime_dtype;
+  return runtime_dtype;
+}
+
 void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
     this->PrintIndent();
@@ -830,15 +850,24 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (trans == 1)
       func_name += "_trans";
     print_extern_call_stmt(func_name, 2);
-  }else if(op->op.same_as(tl::ds_read_vector())){
+  } else if (op->op.same_as(tl::ds_read_m32x16_b16())) {
     std::string dst = this->PrintExpr(op->args[0]);
     std::string local_offset = this->PrintExpr(op->args[1]);
     std::string lds_offset = this->PrintExpr(op->args[2]);
-    os << "tl::ds_read_vector(*(float32x4 *)("
+    os << "tl::ds_read_m32x16_b16(*(float32x4 *)("
        << dst << " + " << local_offset
        << "), "
        << lds_offset
        << " * sizeof(half_t))";
+  } else if (op->op.same_as(tl::ds_read_m32x32_b8())) {
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string local_offset = this->PrintExpr(op->args[1]);
+    std::string lds_offset = this->PrintExpr(op->args[2]);
+    os << "tl::ds_read_m32x32_b8(*(float32x4 *)("
+       << dst << " + " << local_offset
+       << "), "
+       << lds_offset
+       << " * sizeof(int8_t))";
   }else if (op->op.same_as(tl::wait_wgmma())) {
     this->PrintIndent();
     int num_mma = Downcast<IntImm>(op->args[0])->value;
@@ -1122,11 +1151,16 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string src_res = this->PrintExpr(op->args[2]);
     std::string src_off = get_base_expr(op->args[3]);
     std::string idxen = get_base_expr(op->args[4]);
+    std::string elem_dtype = "float16";
+    if (op->args.size() >= 6) {
+      elem_dtype = Downcast<StringImm>(op->args[5])->value;
+    }
+    std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
     this->PrintIndent();
     this->stream << "tl::cp_async_gs_idxen<" << N << ">(";
-    this->stream << "((half_t*)" << dst_ptr << " + " << dst_off << "), ";
+    this->stream << "((" << hip_type << "*)" << dst_ptr << " + " << dst_off << "), ";
     this->stream << src_res << ", ";
-    this->stream << src_off << " * sizeof(half_t), ";
+    this->stream << src_off << " * sizeof(" << hip_type << "), ";
     this->stream << idxen << ");\n";
   }
   else if (op->op.same_as(Op::Get("tl.dcu_async_copy"))) {
@@ -1136,22 +1170,23 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
         }
         return this->PrintExpr(e);
     };
-    auto get_int_const = [](const PrimExpr& e) -> int {
-        if (const auto* val = e.as<IntImmNode>()) return static_cast<int>(val->value);
-        return 0; 
-    };
 
-    int N = 16; 
+    int N = 16;
     std::string dst_ptr = this->PrintExpr(op->args[0]);
     std::string dst_off = get_base_expr(op->args[1]);
     std::string src_res = this->PrintExpr(op->args[2]);
     std::string src_off = get_base_expr(op->args[3]);
+    std::string elem_dtype = "float16";
+    if (op->args.size() >= 5) {
+      elem_dtype = Downcast<StringImm>(op->args[4])->value;
+    }
+    std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
     this->PrintIndent();
     this->stream << "tl::cp_async_gs<" 
                  << N << ">(";
-    this->stream << "((half_t*)" << dst_ptr << " + " << dst_off << "), ";
+    this->stream << "((" << hip_type << "*)" << dst_ptr << " + " << dst_off << "), ";
     this->stream << src_res << ", ";
-    this->stream << src_off << " * sizeof(half_t));\n";
+    this->stream << src_off << " * sizeof(" << hip_type << "));\n";
   } else if (op->op.same_as(Op::Get("tl.async_gld_sld_fence"))) {
       int fence_num = Downcast<IntImm>(op->args[0])->value;
       this->PrintIndent();

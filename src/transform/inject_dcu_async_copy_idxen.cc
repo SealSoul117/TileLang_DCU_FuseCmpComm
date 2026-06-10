@@ -46,8 +46,8 @@ std::string GetGlobalBufferName(const PrimExpr& expr) {
   return "";
 }
 
-// Maximum pattern width (tile_width): 2^12 = 4096.
-constexpr int64_t kMaxTileWidth = 1LL << 12;
+// Maximum pattern width (tile_width): 2^13 = 8192 bytes.
+constexpr int64_t kMaxTileWidth = 1LL << 13;
 
 int64_t LargestPow2LessThan(int64_t k) {
   ICHECK_GT(k, 1);
@@ -75,28 +75,36 @@ int StructBitFromTileWidth(int64_t tile_width) {
   return bits;
 }
 
+struct ADimInfo {
+  std::optional<int64_t> k_dim;
+  int elem_bytes{1};
+};
+
 class KDimCollector : public StmtExprVisitor {
  public:
-  std::optional<int64_t> k_dim;
+  ADimInfo info;
 
  private:
   void VisitStmt_(const DeclBufferNode* op) final {
-    if (IsABufferName(op->buffer->name) && op->buffer->shape.size() == 2) {
-      if (const auto* imm = op->buffer->shape[1].as<IntImmNode>()) {
-        k_dim = imm->value;
+    if (IsABufferName(op->buffer->name)) {
+      info.elem_bytes = op->buffer->dtype.bytes();
+      if (op->buffer->shape.size() == 2) {
+        if (const auto* imm = op->buffer->shape[1].as<IntImmNode>()) {
+          info.k_dim = imm->value;
+        }
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 };
 
-std::optional<int64_t> ExtractKDimFromModule(const IRModule& mod) {
+std::optional<ADimInfo> ExtractADimInfoFromModule(const IRModule& mod) {
   for (const auto& kv : mod->functions) {
     if (const auto* func = kv.second.as<PrimFuncNode>()) {
       KDimCollector collector;
       collector(func->body);
-      if (collector.k_dim.has_value()) {
-        return collector.k_dim;
+      if (collector.info.k_dim.has_value()) {
+        return collector.info;
       }
     }
   }
@@ -263,6 +271,7 @@ class IdxenInjector : public StmtExprMutator {
     new_args.push_back(call->args[2]);
     new_args.push_back(new_src_off);
     new_args.push_back(idxen);
+    // Preserve trailing metadata such as element dtype (args[4] on tl.dcu_async_copy).
     for (size_t i = 4; i < call->args.size(); ++i) {
       new_args.push_back(call->args[i]);
     }
@@ -309,13 +318,21 @@ class IdxenInjector : public StmtExprMutator {
 }  // namespace
 
 PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
-  std::optional<int64_t> k_dim = ExtractKDimFromModule(mod);
-  if (!k_dim.has_value()) {
+  std::optional<ADimInfo> a_info = ExtractADimInfoFromModule(mod);
+  if (!a_info.has_value()) {
     return func;
   }
 
-  int64_t tile_width = TileWidthFromK(*k_dim);
-  int struct_bit = StructBitFromTileWidth(tile_width);
+  const int64_t k_dim = *a_info->k_dim;
+  const int elem_bytes = a_info->elem_bytes;
+  ICHECK_GT(elem_bytes, 0);
+  // StructBit template param: largest power-of-two less than K * elem_bytes
+  // (byte stride along K). E.g. K=5120, int8 -> 4096 (bit=12); half -> 8192 (bit=13).
+  const int64_t k_stride_bytes = k_dim * elem_bytes;
+  const int struct_bit = StructBitFromTileWidth(TileWidthFromK(k_stride_bytes));
+  // Idxen offset splitting still divides by K-scaled terms in element units;
+  // codegen already accounts for sizeof(data) on the offset path.
+  const int64_t tile_width = TileWidthFromK(k_dim);
 
   InfoCollector collector;
   collector(func->body);
@@ -348,7 +365,7 @@ PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
     return func;
   }
 
-  return IdxenInjector::Substitute(std::move(func), *k_dim, tile_width, struct_bit,
+  return IdxenInjector::Substitute(std::move(func), k_dim, tile_width, struct_bit,
                                    collector.a_dcu_res_vars);
 }
 

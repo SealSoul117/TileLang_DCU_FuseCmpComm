@@ -6,10 +6,13 @@
 #include <tvm/ffi/memory.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/arith/analyzer.h>
+#include <tvm/ffi/dtype.h>
 
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "inject_utils.h"
 
 using tvm::ffi::GetRef;
 using tvm::ffi::make_object;
@@ -20,20 +23,45 @@ using namespace tir;
 using ffi::Array;
 using ffi::String;
 
+PrimExpr MakeElementDTypeArg(DataType dtype) {
+    DataType elem_dtype = dtype;
+    if (dtype.lanes() > 1) {
+        elem_dtype = dtype.element_of();
+    }
+    return StringImm(ffi::DLDataTypeToString(elem_dtype));
+}
+
 struct CopyInfo {
     Buffer dst_buffer;
     Buffer src_buffer;
     Array<PrimExpr> dst_indices;
     Array<PrimExpr> src_indices;
     Stmt store_stmt;
+    bool predicated{false};
+    PrimExpr predicate;
+    PrimExpr else_value;
 };
+
+bool IsZeroValue(const PrimExpr& value) {
+    if (const auto* broadcast = value.as<BroadcastNode>()) {
+        return IsZeroValue(broadcast->value);
+    }
+    if (const auto* cast = value.as<CastNode>()) {
+        return IsZeroValue(cast->value);
+    }
+    if (const auto* f = value.as<FloatImmNode>()) {
+        return f->value == 0.0f;
+    }
+    if (const auto* i = value.as<IntImmNode>()) {
+        return i->value == 0;
+    }
+    return false;
+}
 
 struct CollectResult {
     std::vector<CopyInfo> copies;
     std::unordered_map<String, Var> global_to_res_var;
     std::unordered_map<String, std::pair<Var, PrimExpr>> shared_alloc_to_binding;
-
-    const StmtNode* inject_target = nullptr;
 };
 
 class VariableEliminator : public tvm::tir::ExprMutator {
@@ -81,7 +109,6 @@ CollectResult CollectResources(const Stmt& body) {
     private:
         bool in_async{false};
         std::unordered_set<const tvm::tir::VarNode*> loop_vars_;
-        std::vector<const tvm::tir::StmtNode*> scope_stack_;
         bool IsSharedScope(const Buffer& buf) {
             auto s = buf.scope();
             return s == "shared" || s == "shared.dyn";
@@ -92,7 +119,6 @@ CollectResult CollectResources(const Stmt& body) {
         }
 
         void VisitStmt_(const AttrStmtNode* attr) override {
-            scope_stack_.push_back(attr);
             if (attr->attr_key == tir::attr::thread_extent) {
                 auto iv = attr->node.as<tvm::tir::IterVarNode>();
                 const std::string& tag = iv->thread_tag;
@@ -119,21 +145,12 @@ CollectResult CollectResources(const Stmt& body) {
             else {
                 StmtExprVisitor::VisitStmt_(attr);
             }
-            scope_stack_.pop_back();
-        }
-
-        void VisitStmt_(const SeqStmtNode* op) override {
-            scope_stack_.push_back(op);
-            StmtExprVisitor::VisitStmt_(op);
-            scope_stack_.pop_back();
         }
 
         void VisitStmt_(const ForNode* op) override {
-            scope_stack_.push_back(op);
             loop_vars_.insert(op->loop_var.get());
             StmtExprVisitor::VisitStmt_(op);
             loop_vars_.erase(op->loop_var.get());
-            scope_stack_.pop_back();
         }
 
         static const BufferLoadNode* PeelGlobalLoadValue(const PrimExpr& v) {
@@ -146,72 +163,82 @@ CollectResult CollectResources(const Stmt& body) {
             return nullptr;
         }
 
-        void VisitStmt_(const BufferStoreNode* op) final {
+        bool TryCollectCopy(const BufferStoreNode* op, const BufferLoadNode* load,
+                            bool predicated, const PrimExpr& predicate,
+                            const PrimExpr& else_value) {
             Buffer dst = op->buffer;
-            if (IsSharedScope(dst) && op->value.defined() && in_async) {
-                if (const auto* load = PeelGlobalLoadValue(op->value)) {
-                    Buffer src = load->buffer;
-                    if (IsGlobalScope(src)) {
-                        const StmtNode* target = op;
-                        if (result.inject_target == nullptr) {
-                            for (int i = scope_stack_.size() - 1; i >= 0; --i) {
-                                if (scope_stack_[i]->IsInstance<AttrStmtNode>()) {
-                                    auto attr = static_cast<const AttrStmtNode*>(scope_stack_[i]);
-                                    if (attr->attr_key == tvm::tir::attr::thread_extent) {
-                                        if (i + 1 < scope_stack_.size()) {
-                                            result.inject_target = scope_stack_[i + 1];
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            if (result.inject_target == nullptr && !scope_stack_.empty()) {
-                                    for (const auto* node : scope_stack_) {
-                                        if (node->IsInstance<ForNode>() || node->IsInstance<SeqStmtNode>()) {
-                                            result.inject_target = node;
-                                            break;
-                                        }
-                                    }
-                                }
-                            if (result.inject_target == nullptr) result.inject_target = op;
-                        }
+            Buffer src = load->buffer;
+            if (!IsGlobalScope(src)) {
+                return false;
+            }
 
+            VariableKeeper keeper(loop_vars_);
+            tvm::arith::Analyzer analyzer;
+            Array<PrimExpr> for_var_only_indices;
 
-                        VariableKeeper keeper(loop_vars_);
-                        tvm::arith::Analyzer analyzer;
-                        Array<PrimExpr> for_var_only_indices;
+            for (const auto& idx : load->indices) {
+                PrimExpr filtered = keeper(idx);
+                for_var_only_indices.push_back(analyzer.Simplify(filtered));
+            }
+            CopyInfo info{dst,
+                          src,
+                          op->indices,
+                          for_var_only_indices,
+                          GetRef<Stmt>(op),
+                          predicated,
+                          predicate,
+                          else_value};
+            result.copies.push_back(info);
 
-                        for (const auto& idx : load->indices) {
-                            PrimExpr filtered = keeper(idx); 
-                            for_var_only_indices.push_back(analyzer.Simplify(filtered));
-                        }
-                        CopyInfo info{dst, src, op->indices, for_var_only_indices, GetRef<Stmt>(op)};
-                        result.copies.push_back(info);
+            if (result.global_to_res_var.find(src->name) == result.global_to_res_var.end()) {
+                Var var(src->name + "_dcu_res", DataType::Int(32, 4));
 
-                        if (result.global_to_res_var.find(src->name) == result.global_to_res_var.end()) {
-                            Var var(src->name + "_dcu_res", DataType::Int(32, 4));
+                VariableEliminator eliminator(loop_vars_);
+                tvm::arith::Analyzer resource_analyzer;
+                Array<PrimExpr> base_indices;
+                for (const auto& idx : load->indices) {
+                    PrimExpr no_loops = eliminator(idx);
+                    base_indices.push_back(resource_analyzer.Simplify(no_loops));
+                }
 
-                            VariableEliminator eliminator(loop_vars_);
-                            tvm::arith::Analyzer analyzer;
-                            Array<PrimExpr> base_indices;
-                            for (const auto& idx : load->indices) {
-                                PrimExpr no_loops = eliminator(idx);
-                                base_indices.push_back(analyzer.Simplify(no_loops));
-                            }
+                Array<PrimExpr> args;
+                args.push_back(src->data);
 
-                            Array<PrimExpr> args;
-                            args.push_back(src->data);
+                for (const auto& idx : base_indices) {
+                    args.push_back(idx);
+                }
+                PrimExpr val =
+                    Call(DataType::Int(32, 4), Op::Get("tl.make_dcu_resource"), args);
 
-                            for (const auto& idx : base_indices) {
-                                args.push_back(idx);
-                            }
-                            PrimExpr val = Call(DataType::Int(32, 4), 
-                                                Op::Get("tl.make_dcu_resource"), args);
-                            
-                            result.global_to_res_var[src->name] = var;
-                            result.shared_alloc_to_binding[src->name] = {var, val};
+                result.global_to_res_var[src->name] = var;
+                result.shared_alloc_to_binding[src->name] = {var, val};
+            }
+            return true;
+        }
+
+        void VisitStmt_(const BufferStoreNode* op) final {
+            if (IsSharedScope(op->buffer) && op->value.defined() && in_async) {
+                const BufferLoadNode* load = nullptr;
+                bool predicated = false;
+                PrimExpr predicate;
+                PrimExpr else_value;
+
+                if (const auto* direct_load = PeelGlobalLoadValue(op->value)) {
+                    load = direct_load;
+                } else if (const auto* call = op->value.as<CallNode>()) {
+                    if (call->op.same_as(builtin::if_then_else()) && call->args.size() == 3 &&
+                        IsZeroValue(call->args[2])) {
+                        load = PeelGlobalLoadValue(call->args[1]);
+                        if (load) {
+                            predicated = true;
+                            predicate = call->args[0];
+                            else_value = call->args[2];
                         }
                     }
+                }
+
+                if (load) {
+                    TryCollectCopy(op, load, predicated, predicate, else_value);
                 }
             }
             StmtExprVisitor::VisitStmt_(op);
@@ -249,16 +276,20 @@ private:
         for (const auto& copy : copies_) {
             if (copy.store_stmt.same_as(GetRef<Stmt>(op))) {
                 Var src_res = global_to_var_.at(copy.src_buffer->name);
-                PrimExpr dst_res = copy.dst_buffer->data; 
-                
-                PrimExpr copy_size = IntImm(DataType::Int(32), 1);
-                PrimExpr predicate = Bool(true);
-                
-                return Evaluate(
+                PrimExpr dst_res = copy.dst_buffer->data;
+
+                PrimExpr elem_dtype = MakeElementDTypeArg(copy.dst_buffer->dtype);
+                Stmt async_copy = Evaluate(
                     Call(DataType::Int(32), Op::Get("tl.dcu_async_copy"),
-                         {dst_res, Flatten(copy.dst_indices),
-                          src_res, Flatten(copy.src_indices),
-                          copy_size, predicate}));
+                         {dst_res, Flatten(copy.dst_indices), src_res, Flatten(copy.src_indices),
+                          elem_dtype}));
+
+                if (copy.predicated) {
+                    Stmt zero_store =
+                        BufferStore(copy.dst_buffer, copy.else_value, copy.dst_indices);
+                    return IfThenElse(copy.predicate, async_copy, zero_store);
+                }
+                return async_copy;
             }
         }
         return StmtExprMutator::VisitStmt_(op);
@@ -276,38 +307,21 @@ private:
     const std::unordered_map<String, Var>& global_to_var_;
 };
 
-class ResourceInjector : public tvm::tir::StmtExprMutator {
-public:
-    static Stmt Run(Stmt body, 
-                    const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings,
-                    const tvm::tir::StmtNode* target) {
-        if (!target || bindings.empty()) return body;
-        ResourceInjector mutator(bindings, target);
-        return mutator(std::move(body));
+Stmt InjectDCUResources(Stmt body,
+                        const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings) {
+    if (bindings.empty()) {
+        return body;
     }
-
-private:
-    ResourceInjector(const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings,
-                     const tvm::tir::StmtNode* target)
-        : bindings_(bindings), target_(target) {}
-
-    Stmt VisitStmt(const Stmt& stmt) override {
-        if (stmt.get() == target_) {
-            Stmt new_stmt = StmtExprMutator::VisitStmt(stmt);
-            
-            for (const auto& item : bindings_) {
-                Var res_var = item.second.first;
-                PrimExpr init_expr = item.second.second;
-                new_stmt = tvm::tir::LetStmt(res_var, init_expr, new_stmt);
-            }
-            return new_stmt; 
+    return InjectAtDCUTarget(body, [&](const Stmt& target_body) {
+        Stmt new_stmt = target_body;
+        for (const auto& item : bindings) {
+            Var res_var = item.second.first;
+            PrimExpr init_expr = item.second.second;
+            new_stmt = LetStmt(res_var, init_expr, new_stmt);
         }
-        return StmtExprMutator::VisitStmt(stmt);
-    }
-
-    std::unordered_map<String, std::pair<Var, PrimExpr>> bindings_;
-    const tvm::tir::StmtNode* target_;
-};
+        return new_stmt;
+    });
+}
 
 PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
     auto* n = f.CopyOnWrite();
@@ -317,7 +331,7 @@ PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
         return f;
     }
 
-    Stmt injected = ResourceInjector::Run(n->body, res.shared_alloc_to_binding, res.inject_target);
+    Stmt injected = InjectDCUResources(n->body, res.shared_alloc_to_binding);
     
     Stmt replaced = StoreReplacer::Run(injected, res.copies, res.global_to_res_var);
     

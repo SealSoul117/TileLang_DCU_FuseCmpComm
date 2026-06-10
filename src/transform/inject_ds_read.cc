@@ -92,9 +92,14 @@ class DSReadInjector : public StmtExprMutator {
       lds_offset
   };
 
+  const Op& ds_op = buffer->dtype.bytes() == 1 ? ds_read_m32x32_b8() : ds_read_m32x16_b16();
+  ICHECK(buffer->dtype.bytes() == 1 || buffer->dtype.bytes() == 2)
+      << "InjectDSRead only supports 1-byte and 2-byte element types, got "
+      << buffer->dtype;
+
   Call call = Call(
       DataType::Handle(),
-      ds_read_vector(),
+      ds_op,
       args
   );
 

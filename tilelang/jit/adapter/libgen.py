@@ -139,7 +139,7 @@ class LibraryGenerator:
             command += [item for flag in self.compile_flags for item in flag.split() if item not in command]
 
         command += ["-o", libpath]
-
+        print(self.lib_code)
         src.write(self.lib_code)
         src.flush()
 

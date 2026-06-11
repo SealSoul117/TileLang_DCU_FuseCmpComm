@@ -3,6 +3,7 @@
  * \brief Remap shared.dyn base pointers for tl.dcu_async_copy with warp-dependent
  *        shadow offsets, and replace buf_dyn_shmem with per-buffer shadow addresses.
  */
+#include <tvm/ffi/dtype.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/expr_functor.h>
@@ -10,6 +11,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -27,6 +29,23 @@ namespace {
 
 const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
 const Op& MakeDCUResourceOp() { return Op::Get("tl.make_dcu_resource"); }
+
+bool IsBBufferName(const std::string& name) { return name == "B" || name == "B_1"; }
+
+int GetElementBytes(DataType dtype) {
+  if (dtype.lanes() > 1) {
+    dtype = dtype.element_of();
+  }
+  return dtype.bytes();
+}
+
+std::optional<int> GetBElemBytesFromDType(DataType dtype) {
+  const int elem_bytes = GetElementBytes(dtype);
+  if (elem_bytes > 0) {
+    return elem_bytes;
+  }
+  return std::nullopt;
+}
 
 bool IsWarpIdxInit(const PrimExpr& expr) {
   if (const auto* call = expr.as<CallNode>()) {
@@ -87,6 +106,7 @@ class InfoCollector : public StmtExprVisitor {
   PrimExpr thread_extent;
   std::unordered_set<const VarNode*> a_dcu_res_vars;
   std::unordered_set<const VarNode*> b_dcu_res_vars;
+  std::optional<int> b_elem_bytes;
 
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -120,6 +140,9 @@ class InfoCollector : public StmtExprVisitor {
     if (op->buffer.scope() == "shared.dyn" && !buf_dyn_shmem.defined()) {
       buf_dyn_shmem = op->buffer->data;
     }
+    if (IsBBufferName(op->buffer->name)) {
+      b_elem_bytes = GetBElemBytesFromDType(op->buffer->dtype);
+    }
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -129,12 +152,26 @@ class InfoCollector : public StmtExprVisitor {
         const std::string global_name = GetGlobalBufferName(call->args[0]);
         if (global_name == "A" || global_name == "A_1") {
           a_dcu_res_vars.insert(op->var.get());
-        } else if (global_name == "B" || global_name == "B_1") {
+        } else if (IsBBufferName(global_name)) {
           b_dcu_res_vars.insert(op->var.get());
         }
       }
     }
     StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode* op) final {
+    if (op->op.same_as(DCUAsyncCopyOp()) && op->args.size() >= 5) {
+      if (const auto* var = op->args[2].as<VarNode>()) {
+        if (b_dcu_res_vars.count(var) > 0) {
+          if (const auto* dtype_str = op->args[4].as<StringImmNode>()) {
+            DataType elem_dtype = DataType(ffi::StringToDLDataType(dtype_str->value));
+            b_elem_bytes = GetBElemBytesFromDType(elem_dtype);
+          }
+        }
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
   }
 };
 
@@ -165,15 +202,16 @@ class ShadowAddrInjector : public StmtExprMutator {
  public:
   ShadowAddrInjector(Var buf_dyn_shmem, PrimExpr thread_extent,
                      std::unordered_set<const VarNode*> a_dcu_res_vars,
-                     std::unordered_set<const VarNode*> b_dcu_res_vars)
+                     std::unordered_set<const VarNode*> b_dcu_res_vars, int b_elem_bytes)
       : buf_dyn_shmem_(std::move(buf_dyn_shmem)),
         thread_extent_(std::move(thread_extent)),
         a_dcu_res_vars_(std::move(a_dcu_res_vars)),
-        b_dcu_res_vars_(std::move(b_dcu_res_vars)) {}
+        b_dcu_res_vars_(std::move(b_dcu_res_vars)),
+        b_elem_bytes_(b_elem_bytes) {}
 
-  static PrimFunc Substitute(PrimFunc func, const InfoCollector& info) {
+  static PrimFunc Substitute(PrimFunc func, const InfoCollector& info, int b_elem_bytes) {
     ShadowAddrInjector mutator(info.buf_dyn_shmem, info.thread_extent, info.a_dcu_res_vars,
-                               info.b_dcu_res_vars);
+                               info.b_dcu_res_vars, b_elem_bytes);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -217,8 +255,18 @@ class ShadowAddrInjector : public StmtExprMutator {
 
   PrimExpr BuildShadowOffsetB() const {
     const DataType u32 = DataType::UInt(32);
-    PrimExpr warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 2));
-    return left_shift(warp_mod, make_const(u32, 18));
+    PrimExpr warp_mod;
+    int shift_bits;
+    if (b_elem_bytes_ == 1) {
+      // int8 and other 1-byte types: (warp_idx & 3) << 17
+      warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 4));
+      shift_bits = 17;
+    } else {
+      // bf16/half and other 2-byte types: (warp_idx & 1) << 18
+      warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 2));
+      shift_bits = 18;
+    }
+    return left_shift(warp_mod, make_const(u32, shift_bits));
   }
 
   Stmt InjectShadowAddrLets(Stmt body) {
@@ -292,6 +340,7 @@ class ShadowAddrInjector : public StmtExprMutator {
   PrimExpr thread_extent_;
   std::unordered_set<const VarNode*> a_dcu_res_vars_;
   std::unordered_set<const VarNode*> b_dcu_res_vars_;
+  int b_elem_bytes_;
   Var warp_idx_var_;
   Var shmem_base_var_;
   Var shadow_offset_a_var_;
@@ -300,6 +349,21 @@ class ShadowAddrInjector : public StmtExprMutator {
   Var b_shared_addr_var_;
   bool shadow_injected_{false};
 };
+
+int ResolveBElemBytes(const PrimFunc& func, const InfoCollector& collector) {
+  for (const auto& kv : func->buffer_map) {
+    if (IsBBufferName(kv.second->name)) {
+      if (auto elem_bytes = GetBElemBytesFromDType(kv.second->dtype)) {
+        return *elem_bytes;
+      }
+    }
+  }
+  if (collector.b_elem_bytes.has_value()) {
+    return *collector.b_elem_bytes;
+  }
+  // Default to 2-byte behavior for backward compatibility with bf16/half.
+  return 2;
+}
 
 }  // namespace
 
@@ -332,7 +396,8 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
     return func;
   }
 
-  return ShadowAddrInjector::Substitute(func, collector);
+  const int b_elem_bytes = ResolveBElemBytes(func, collector);
+  return ShadowAddrInjector::Substitute(func, collector, b_elem_bytes);
 }
 
 namespace transform {

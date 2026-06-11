@@ -767,7 +767,7 @@ static std::string RuntimeDTypeToHIPType(const std::string& runtime_dtype) {
     return "int8_t";
   } else if (runtime_dtype == "uint8") {
     return "uint8_t";
-  } else if (runtime_dtype == "float16") {
+  } else if (runtime_dtype == "float16" || runtime_dtype == "bfloat16") {
     return "half_t";
   } else if (runtime_dtype == "float32") {
     return "float";

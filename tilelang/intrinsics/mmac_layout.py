@@ -48,7 +48,7 @@ class SharedToLocalKDim32LayoutA:
         slab_size = 1024
         k_dim = 32
         per_slab_row = slab_size // k_dim
-        slab_4_row = slab_size * 4 // k_dim
+        slab_4_row = per_slab_row * 4
         per_warp_itera_num = 4 * k_dim
         intra_iter = slab_size // (per_warp_itera_num * block_row_warps)
         new_col = (((row % slab_4_row) // per_slab_row) * 16 + col) % k_dim
@@ -89,12 +89,17 @@ class SharedToLocalKDim32LayoutB:
     
     def rewind(row, col, tx, warp_n, idx, warp_cols, block_row_warps):
         per_warp_itera_num = 2 * 16
-        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
-        col = (((tx & 3) // 2) * 64 + col)
+        col_size = 256# warp_cols * block_row_warps * per_warp_itera_num // 2
+        col = (((tx & 7) // 2) * 32 + col)
         new_col = col % col_size
         new_row = row + (col // col_size)
-        cond = (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & ((tx // 8) == 3) & ((tx & 3) // 2)
-        new_row = new_row - 4 * cond
+        # row_limit = row // 4 * 4 + 4
+        cond1 = (((tx & 31) == 26) | ((tx & 31) == 27)) & (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1))
+        cond2 = (((tx & 31) == 28) | ((tx & 31) == 29)) & (idx == ((warp_cols // 2) - 1))
+        cond3 = (((tx & 31) == 30) | ((tx & 31) == 31)) & (((warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 2))) | (idx == ((warp_cols // 2) - 1)))
+        
+        # (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & (((tx & 31) // 8) == 3) & ((tx & 3) // 2)
+        new_row = new_row - 4 * (cond1 | cond2 | cond3)
         
         return new_row, new_col
         

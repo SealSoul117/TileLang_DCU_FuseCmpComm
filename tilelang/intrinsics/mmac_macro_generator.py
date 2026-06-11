@@ -325,7 +325,7 @@ class MatrixCoreIntrinEmitter:
                         # iteration offset
                         row, col = layoutInfer.itera(row, col, i, self.block_row_warps)
                         # rewind offset
-                        # row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
+                        row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col + ki * micro_size_k]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
@@ -378,7 +378,7 @@ class MatrixCoreIntrinEmitter:
                         row, col = layoutInfer.slab(row, col)
                         row, col = layoutInfer.warp(row, col, warp_n)
                         row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
-                        # row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
+                        row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)

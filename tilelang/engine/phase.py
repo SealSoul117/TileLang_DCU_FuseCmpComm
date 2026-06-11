@@ -316,7 +316,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
 
-        mod = tilelang.transform.InjectADSRead()(mod)
+        # mod = tilelang.transform.InjectADSRead()(mod)
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
@@ -326,7 +326,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
 
         mod = tilelang.transform.InjectWarpIdx()(mod)
-        #mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
+        mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)

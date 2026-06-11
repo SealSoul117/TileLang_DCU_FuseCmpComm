@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "inject_utils.h"
+
 namespace tvm {
 namespace tl {
 using ffi::Array;
@@ -68,11 +70,6 @@ const Op& DCUAsyncCopyIdxenOp() { return Op::Get("tl.dcu_async_copy_idxen"); }
 bool IsDCUAsyncCopyCall(const CallNode* call) {
     if (!call) return false;
     return call->op.same_as(DCUAsyncCopyOp()) || call->op.same_as(DCUAsyncCopyIdxenOp());
-}
-
-bool IsKLoopVar(const Var& loop_var) {
-    const auto* var = loop_var.as<VarNode>();
-    return var && var->name_hint == "k";
 }
 
 bool StmtIsDCUAsyncCopyRoot(const Stmt& stmt) {
@@ -240,12 +237,12 @@ public:
     }
 
     Stmt VisitStmt_(const ForNode* op) override {
-        bool is_k_loop = IsKLoopVar(op->loop_var);
-        if (is_k_loop) {
+        bool is_main_loop = IsDCUMainLoop(op);
+        if (is_main_loop) {
             ++inside_k_loop_depth_;
         }
         Stmt body = VisitStmt(op->body);
-        if (is_k_loop) {
+        if (is_main_loop) {
             --inside_k_loop_depth_;
         }
         return For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,

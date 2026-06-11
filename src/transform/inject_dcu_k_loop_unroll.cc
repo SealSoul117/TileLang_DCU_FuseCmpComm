@@ -28,26 +28,6 @@ using namespace tir;
 
 namespace {
 
-const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
-
-bool IsKVar(const Var& v) { return v->name_hint == "k"; }
-
-class BodyFeatureChecker : public StmtExprVisitor {
- public:
-  bool has_dcu_async_copy{false};
-  bool has_tvm_mmac{false};
-
- private:
-  void VisitExpr_(const CallNode* op) final {
-    if (op->op.same_as(DCUAsyncCopyOp())) {
-      has_dcu_async_copy = true;
-    } else if (op->op.same_as(tvm_mmac())) {
-      has_tvm_mmac = true;
-    }
-    StmtExprVisitor::VisitExpr_(op);
-  }
-};
-
 struct CandidateLoop {
   const ForNode* node{nullptr};
 };
@@ -58,12 +38,8 @@ class CandidateCollector : public StmtVisitor {
 
  private:
   void VisitStmt_(const ForNode* op) final {
-    if (IsKVar(op->loop_var)) {
-      BodyFeatureChecker checker;
-      checker(op->body);
-      if (checker.has_dcu_async_copy && checker.has_tvm_mmac) {
-        candidates.push_back({op});
-      }
+    if (IsDCUMainLoop(op)) {
+      candidates.push_back({op});
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -212,13 +188,7 @@ class DCUKLoopUnrollMutator : public StmtMutator {
   bool* transformed_;
 
   Stmt VisitStmt_(const ForNode* op) final {
-    if (!IsKVar(op->loop_var) || *transformed_) {
-      return StmtMutator::VisitStmt_(op);
-    }
-
-    BodyFeatureChecker checker;
-    checker(op->body);
-    if (!checker.has_dcu_async_copy || !checker.has_tvm_mmac) {
+    if (!IsDCUMainLoop(op) || *transformed_) {
       return StmtMutator::VisitStmt_(op);
     }
 

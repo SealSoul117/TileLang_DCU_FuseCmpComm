@@ -11,6 +11,8 @@
 #include <optional>
 #include <string>
 
+#include "inject_utils.h"
+
 using tvm::ffi::Array;
 namespace tvm {
 namespace tl {
@@ -77,8 +79,7 @@ class KLoopBodyMutator : public StmtMutator {
 class InsertAsyncGlobal2SharedFenceMutator : public StmtMutator {
  public:
   Stmt VisitStmt_(const ForNode* op) final {
-    const auto* var = op->loop_var.as<VarNode>();
-    if (var && var->name_hint == "k") {
+    if (IsDCUMainLoop(op)) {
       KLoopBodyMutator body_mutator;
       Stmt new_body = body_mutator(op->body);
       return For(op->loop_var, op->min, op->extent, op->kind, new_body, op->thread_binding,

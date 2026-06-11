@@ -1318,19 +1318,38 @@ void CodeGenTileLangHIP::VisitExpr_(const RampNode *op, std::ostream &os) {
 void CodeGenTileLangHIP::VisitExpr_(const BroadcastNode *op,
                                     std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
-      lanes == 4) {
-    // make_int8x4
-    const int64_t *p = as_const_int(op->value);
-    ICHECK(p);
-    int64_t v = *p & 0xFF;
-    v = (v << 24) | (v << 16) | (v << 8) | v;
-    if (op->dtype.is_uint()) {
-      os << "(uint)" << v;
-    } else {
-      os << "(int)" << v;
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
+    if (lanes == 4 || lanes == 8 || lanes == 16) {
+      // Pack int8 values into native HIP vector types (int/int2/int4).
+      // HIP's make_int4 only accepts 4 int args, not 16 signed char args.
+      std::string packed;
+      const int64_t *p = as_const_int(op->value);
+      if (p) {
+        int64_t v = *p & 0xFF;
+        int64_t pv = (v << 24) | (v << 16) | (v << 8) | v;
+        if (op->dtype.is_uint()) {
+          packed = "(uint)" + std::to_string(pv);
+        } else {
+          packed = "(int)" + std::to_string(pv);
+        }
+      } else {
+        std::string v = PrintExpr(op->value);
+        std::string cast_v = op->dtype.is_uint()
+                                 ? "(unsigned char)(" + v + ")"
+                                 : "(signed char)(" + v + ")";
+        packed = "((int)" + cast_v + " | ((int)" + cast_v + " << 8) | ((int)" +
+                 cast_v + " << 16) | ((int)" + cast_v + " << 24))";
+      }
+      if (lanes == 4) {
+        os << packed;
+      } else if (lanes == 8) {
+        os << "make_int2(" << packed << ", " << packed << ")";
+      } else {
+        os << "make_int4(" << packed << ", " << packed << ", " << packed
+           << ", " << packed << ")";
+      }
+      return;
     }
-    return;
   }
 
   if (op->dtype.is_float16()) {

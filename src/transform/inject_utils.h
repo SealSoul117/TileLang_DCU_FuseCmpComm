@@ -30,6 +30,7 @@
 #include <tvm/tir/stmt.h>
 
 #include <functional>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -59,6 +60,32 @@ const tir::StmtNode* FindDCUInjectTarget(const tir::Stmt& body);
  */
 tir::Stmt InjectAtDCUTarget(const tir::Stmt& body,
                             const std::function<tir::Stmt(const tir::Stmt&)>& wrap_fn);
+
+/*!
+ * \brief Feature flags for identifying the DCU GEMM main loop body.
+ */
+struct DCUMainLoopFeatures {
+  bool has_mmac{false};
+  bool has_memory_access{false};
+  bool has_global_src_memory{false};
+};
+
+/*!
+ * \brief Analyze a loop body for DCU GEMM main-loop characteristics:
+ *        mmac, memory traffic (BufferLoad/Store, ds_read, async copy), and
+ *        at least one memory op with Global as source.
+ */
+DCUMainLoopFeatures AnalyzeDCUMainLoopBody(const tir::Stmt& body);
+
+/*!
+ * \brief Whether \p loop is the DCU GEMM main loop.
+ */
+bool IsDCUMainLoop(const tir::ForNode* loop);
+
+/*!
+ * \brief Collect all for-loops in \p stmt that match DCU main-loop features.
+ */
+std::vector<const tir::ForNode*> CollectDCUMainLoops(const tir::Stmt& stmt);
 
 }  // namespace tl
 }  // namespace tvm

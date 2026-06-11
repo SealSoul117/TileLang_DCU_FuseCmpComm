@@ -7,6 +7,8 @@
 
 #include <vector>
 
+#include "inject_utils.h"
+
 using namespace tvm::tir;
 
 using tvm::ffi::GetRef;
@@ -27,8 +29,8 @@ public:
 
 private:
     arith::Analyzer analyzer_;
-    Var k_var_;
-    PrimExpr k_extent_;
+    Var main_loop_var_;
+    PrimExpr main_loop_extent_;
     bool in_unrolled_i_ = false;
 
     std::pair<PrimExpr, PrimExpr> ExtractStride(PrimExpr expr, Var var) {
@@ -49,7 +51,7 @@ private:
         auto [base_i_dst, i_stride_dst] = ExtractStride(raw_dst_off, i_var);
         auto [base_i_src, i_stride_src] = ExtractStride(raw_src_off, i_var);
 
-        auto [final_src_offset, k_stride_src] = ExtractStride(base_i_src, k_var_);
+        auto [final_src_offset, k_stride_src] = ExtractStride(base_i_src, main_loop_var_);
 
         Array<PrimExpr> new_args = {
             call->args[0],
@@ -79,11 +81,10 @@ private:
     }
 
     Stmt VisitStmt_(const ForNode* op) final {
-        // 记录 k 信息 (假设 k 在外层)
-        bool is_k = (op->loop_var->name_hint == "k");
-        if (is_k) {
-            k_var_ = op->loop_var;
-            k_extent_ = op->extent;
+        bool is_main_loop = IsDCUMainLoop(op);
+        if (is_main_loop) {
+            main_loop_var_ = op->loop_var;
+            main_loop_extent_ = op->extent;
         }
 
         bool is_unrolled = (op->kind == ForKind::kUnrolled);
@@ -106,9 +107,9 @@ private:
             }
         }
         
-        if (is_k) {
-            k_var_ = Var();
-            k_extent_ = PrimExpr();
+        if (is_main_loop) {
+            main_loop_var_ = Var();
+            main_loop_extent_ = PrimExpr();
         }
 
         if (body.same_as(op->body)) return GetRef<Stmt>(op);

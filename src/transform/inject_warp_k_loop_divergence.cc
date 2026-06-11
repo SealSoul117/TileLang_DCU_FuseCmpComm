@@ -26,10 +26,6 @@ using namespace tir;
 
 namespace {
 
-const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
-
-bool IsKVar(const Var& v) { return v->name_hint == "k"; }
-
 std::optional<int64_t> GetConstIntValue(const PrimExpr& expr) {
   if (const auto* imm = expr.as<IntImmNode>()) {
     return imm->value;
@@ -113,31 +109,6 @@ Stmt MakeAsyncGldSldFenceStmt(int wait_count) {
   auto fence_call =
       Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"), {Integer(wait_count)});
   return Evaluate(fence_call);
-}
-
-class BodyFeatureChecker : public StmtExprVisitor {
- public:
-  bool has_dcu_async_copy{false};
-  bool has_tvm_mmac{false};
-
- private:
-  void VisitExpr_(const CallNode* op) final {
-    if (op->op.same_as(DCUAsyncCopyOp())) {
-      has_dcu_async_copy = true;
-    } else if (op->op.same_as(tvm_mmac())) {
-      has_tvm_mmac = true;
-    }
-    StmtExprVisitor::VisitExpr_(op);
-  }
-};
-
-bool IsMainKLoop(const ForNode* op) {
-  if (!IsKVar(op->loop_var)) {
-    return false;
-  }
-  BodyFeatureChecker checker;
-  checker(op->body);
-  return checker.has_dcu_async_copy && checker.has_tvm_mmac;
 }
 
 class ContainsMmacChecker : public StmtExprVisitor {
@@ -230,7 +201,7 @@ class InfoCollector : public StmtExprVisitor {
         op->thread_binding.value()->thread_tag == "threadIdx.x") {
       thread_extent = op->extent;
     }
-    if (IsMainKLoop(op)) {
+    if (IsDCUMainLoop(op)) {
       found_k_loop = true;
     }
     StmtExprVisitor::VisitStmt_(op);
@@ -253,8 +224,8 @@ class WarpKLoopDivergenceMutator : public StmtMutator {
 
  private:
   Stmt VisitStmt_(const ForNode* op) override {
-    if (IsMainKLoop(op)) {
-      ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before k-loop divergence";
+    if (IsDCUMainLoop(op)) {
+      ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before main loop divergence";
       ICHECK(warp_half_ > 0) << "warp_half must be positive";
 
       phase_ = PipelinePhase::kInMainLoop;

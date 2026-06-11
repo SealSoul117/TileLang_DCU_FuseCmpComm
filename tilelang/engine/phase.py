@@ -224,7 +224,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-        print(mod)
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.RegisterPipelinePlanning()(mod)
 
@@ -245,16 +244,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
-    print(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tir.transform.UnrollLoop()(mod)
-    print("aaaaaaaaa")
-    print(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
-    print("dsakjd")
-    print(mod)
     mod = tir.transform.RemoveNoOp()(mod)
     mod = tir.transform.RewriteUnsafeSelect()(mod)
     mod = tir.transform.HoistIfThenElse()(mod)
@@ -307,8 +301,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-    print("final lowered module:")
-    print(mod)
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)

@@ -15,6 +15,8 @@
 #include <deque>
 #include <string>
 
+#include "inject_utils.h"
+
 using tvm::ffi::Array;
 namespace tvm {
 namespace tl {
@@ -23,11 +25,6 @@ namespace {
 using namespace tir;
 
 enum class PipelinePhase { kBeforeMainLoop, kInMainLoop, kAfterMainLoop };
-
-bool IsKLoopVar(const Var& loop_var) {
-  const auto* var = loop_var.as<VarNode>();
-  return var && var->name_hint == "k";
-}
 
 bool IsAsyncGldSldFenceCall(const CallNode* call) {
   if (!call) return false;
@@ -76,7 +73,7 @@ Stmt MakeAsyncGldFenceStmt(int wait_count) {
 class InsertAsyncGldFenceMutator : public StmtMutator {
  public:
   Stmt VisitStmt_(const ForNode* op) override {
-    if (IsKLoopVar(op->loop_var)) {
+    if (IsDCUMainLoop(op)) {
       phase_ = PipelinePhase::kInMainLoop;
       Stmt new_body = VisitStmt(op->body);
       phase_ = PipelinePhase::kAfterMainLoop;

@@ -28,7 +28,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.int8, accum_dtype=T.int32
 
 
 def main():
-    M = 19200
+    M = 2430
     N = 5120
     K = 5120
     kernel = matmul(M, N, K, 256, 256, 32)

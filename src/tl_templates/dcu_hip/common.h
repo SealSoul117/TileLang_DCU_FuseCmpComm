@@ -121,7 +121,8 @@ template <typename T>
 inline constexpr bool is_half_v = is_half_type<std::decay_t<T>>::value;
 
 template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
+TL_DEVICE void AtomicAdd(T1 *address, T2 val, int t = 0) {
+  (void)t;
   if constexpr (is_half_v<T1>) {
     __half *addr = reinterpret_cast<__half *>(address);
     __half hval = __float2half(static_cast<float>(val));
@@ -131,7 +132,7 @@ TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
   }
 }
 
-template <typename T1, typename T2> TL_DEVICE void AtomicAdd(T1 &ref, T2 val) {
+template <typename T1, typename T2> TL_DEVICE void AtomicAdd(T1 &ref, T2 val, int t = 0) {
   AtomicAdd(&ref, val);
 }
 template <typename T1, typename T2> TL_DEVICE T1 AtomicAddRet(T1 &ref, T2 val) {

@@ -62,6 +62,7 @@ struct CollectResult {
     std::vector<CopyInfo> copies;
     std::unordered_map<String, Var> global_to_res_var;
     std::unordered_map<String, std::pair<Var, PrimExpr>> shared_alloc_to_binding;
+    std::unordered_set<const tvm::tir::VarNode*> thread_vars;
 };
 
 class VariableEliminator : public tvm::tir::ExprMutator {
@@ -101,6 +102,39 @@ class VariableKeeper : public tvm::tir::ExprMutator {
   const std::unordered_set<const tvm::tir::VarNode*>& keep_vars_;
 };
 
+int GetElementBytes(DataType dtype) {
+    DataType elem_dtype = dtype;
+    if (dtype.lanes() > 1) {
+        elem_dtype = dtype.element_of();
+    }
+    return elem_dtype.bytes();
+}
+
+PrimExpr ScaleToByteOffset(const PrimExpr& offset, int elem_bytes) {
+    if (elem_bytes <= 1) {
+        return offset;
+    }
+    return offset * make_const(offset.dtype(), elem_bytes);
+}
+
+PrimExpr GetScalarOffset(const PrimExpr& offset) {
+    if (const auto* ramp = offset.as<RampNode>()) {
+        return ramp->base;
+    }
+    return offset;
+}
+
+std::pair<PrimExpr, PrimExpr> SplitSmemOffset(
+    const PrimExpr& offset,
+    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars) {
+    VariableEliminator eliminator(thread_vars);
+    tvm::arith::Analyzer analyzer;
+    PrimExpr scalar = GetScalarOffset(offset);
+    PrimExpr smem_offset = analyzer.Simplify(eliminator(scalar));
+    PrimExpr thread_part = analyzer.Simplify(scalar - smem_offset);
+    return {GetScalarOffset(thread_part), GetScalarOffset(smem_offset)};
+}
+
 CollectResult CollectResources(const Stmt& body) {
     class Collector : public StmtExprVisitor {
     public:
@@ -109,6 +143,7 @@ CollectResult CollectResources(const Stmt& body) {
     private:
         bool in_async{false};
         std::unordered_set<const tvm::tir::VarNode*> loop_vars_;
+        std::unordered_set<const tvm::tir::VarNode*> thread_vars_;
         bool IsSharedScope(const Buffer& buf) {
             auto s = buf.scope();
             return s == "shared" || s == "shared.dyn";
@@ -126,6 +161,8 @@ CollectResult CollectResources(const Stmt& body) {
                 if (tag.find("threadIdx") != std::string::npos) {
                     tvm::tir::Var thread_var = iv->var;
                     loop_vars_.insert(thread_var.get());
+                    thread_vars_.insert(thread_var.get());
+                    result.thread_vars.insert(thread_var.get());
 
                     StmtExprVisitor::VisitStmt_(attr);
 
@@ -252,16 +289,18 @@ CollectResult CollectResources(const Stmt& body) {
 
 class StoreReplacer : public StmtExprMutator {
 public:
-    static Stmt Run(Stmt body, const std::vector<CopyInfo>& copies, 
-                    const std::unordered_map<String, Var>& global_to_var) {
-        StoreReplacer replacer(copies, global_to_var);
+    static Stmt Run(Stmt body, const std::vector<CopyInfo>& copies,
+                    const std::unordered_map<String, Var>& global_to_var,
+                    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars) {
+        StoreReplacer replacer(copies, global_to_var, thread_vars);
         return replacer(std::move(body));
     }
 
 private:
-    StoreReplacer(const std::vector<CopyInfo>& copies, 
-                  const std::unordered_map<String, Var>& global_to_var)
-        : copies_(copies), global_to_var_(global_to_var) {}
+    StoreReplacer(const std::vector<CopyInfo>& copies,
+                  const std::unordered_map<String, Var>& global_to_var,
+                  const std::unordered_set<const tvm::tir::VarNode*>& thread_vars)
+        : copies_(copies), global_to_var_(global_to_var), thread_vars_(thread_vars) {}
 
     Stmt VisitStmt_(const AttrStmtNode *attr) {
         if (attr->attr_key == tir::attr::async_scope) {
@@ -279,10 +318,15 @@ private:
                 PrimExpr dst_res = copy.dst_buffer->data;
 
                 PrimExpr elem_dtype = MakeElementDTypeArg(copy.dst_buffer->dtype);
+                const int elem_bytes = GetElementBytes(copy.src_buffer->dtype);
+                PrimExpr dst_offset = GetScalarOffset(Flatten(copy.dst_indices));
+                auto [thread_dst_off, smem_offset] = SplitSmemOffset(dst_offset, thread_vars_);
+                thread_dst_off = ScaleToByteOffset(thread_dst_off, elem_bytes);
+                smem_offset = ScaleToByteOffset(smem_offset, elem_bytes);
+                PrimExpr src_off = GetScalarOffset(Flatten(copy.src_indices));
                 Stmt async_copy = Evaluate(
                     Call(DataType::Int(32), Op::Get("tl.dcu_async_copy"),
-                         {dst_res, Flatten(copy.dst_indices), src_res, Flatten(copy.src_indices),
-                          elem_dtype}));
+                         {dst_res, thread_dst_off, src_res, src_off, smem_offset, elem_dtype}));
 
                 if (copy.predicated) {
                     Stmt zero_store =
@@ -305,6 +349,7 @@ private:
 
     const std::vector<CopyInfo>& copies_;
     const std::unordered_map<String, Var>& global_to_var_;
+    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars_;
 };
 
 Stmt InjectDCUResources(Stmt body,
@@ -333,7 +378,8 @@ PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
 
     Stmt injected = InjectDCUResources(n->body, res.shared_alloc_to_binding);
     
-    Stmt replaced = StoreReplacer::Run(injected, res.copies, res.global_to_res_var);
+    Stmt replaced =
+        StoreReplacer::Run(injected, res.copies, res.global_to_res_var, res.thread_vars);
     
     n->body = std::move(replaced);
     

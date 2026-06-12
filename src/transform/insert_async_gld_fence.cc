@@ -14,6 +14,7 @@
 
 #include <deque>
 #include <string>
+#include <vector>
 
 #include "inject_utils.h"
 
@@ -70,8 +71,89 @@ Stmt MakeAsyncGldFenceStmt(int wait_count) {
   return Evaluate(fence_call);
 }
 
+Stmt MakeWaveBarrierStmt() {
+  auto barrier_call = Call(DataType::Void(), Op::Get("tl.wave_barrier"), {});
+  return Evaluate(barrier_call);
+}
+
+int GetAsyncGldSldFenceValue(const Stmt& stmt) {
+  if (const auto* eval = stmt.as<EvaluateNode>()) {
+    if (const auto* call = eval->value.as<CallNode>()) {
+      if (IsAsyncGldSldFenceCall(call) && !call->args.empty()) {
+        if (const auto* imm = call->args[0].as<IntImmNode>()) {
+          return static_cast<int>(imm->value);
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+std::vector<int> CollectEpilogueWaitCounts(const Stmt& root) {
+  struct Collector : public StmtVisitor {
+    std::vector<int> counts;
+    bool past_main_loop = false;
+
+    void VisitStmt_(const ForNode* op) override {
+      StmtVisitor::VisitStmt_(op);
+      if (IsDCUMainLoop(op)) {
+        past_main_loop = true;
+      }
+    }
+
+    void VisitStmt_(const AttrStmtNode* op) override {
+      if (past_main_loop) {
+        if (op->attr_key == tir::attr::async_wait_queue_scope ||
+            op->attr_key == "async_wait_queue_scope") {
+          if (const auto* inner = op->body.as<AttrStmtNode>()) {
+            if (inner->attr_key == tir::attr::async_wait_inflight_count ||
+                inner->attr_key == "async_wait_inflight_count") {
+              if (const auto* imm = inner->value.as<IntImmNode>()) {
+                counts.push_back(static_cast<int>(imm->value));
+              }
+              // 【修复点 1】直接访问 inner->body 并 return，避免内层节点被二次统计
+              VisitStmt(inner->body);
+              return;
+            }
+          }
+        } else if (op->attr_key == tir::attr::async_wait_inflight_count ||
+                   op->attr_key == "async_wait_inflight_count") {
+          if (const auto* imm = op->value.as<IntImmNode>()) {
+            counts.push_back(static_cast<int>(imm->value));
+          }
+          // 【修复点 2】同理，直接访问 body 并 return
+          VisitStmt(op->body);
+          return;
+        }
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+  };
+
+  Collector collector;
+  collector(root);
+  return collector.counts;
+}
+// Original epilogue: BX1(4) CX1 BX2(2) CX2 BX3(0) CX3 CX4
+// Target epilogue:  CX1 BX2(2) CX2 BX3(0) CX3 CX4
+// Drop the first async_wait count and use the remainder as gld_fence values.
+std::vector<int> BuildEpilogueGldFenceValues(const std::vector<int>& wait_counts) {
+  std::vector<int> shifted;
+  if (wait_counts.size() <= 1) {
+    return shifted;
+  }
+  shifted.reserve(wait_counts.size() - 1);
+  for (size_t i = 1; i < wait_counts.size(); ++i) {
+    shifted.push_back(wait_counts[i]);
+  }
+  return shifted;
+}
+
 class InsertAsyncGldFenceMutator : public StmtMutator {
  public:
+  explicit InsertAsyncGldFenceMutator(const Stmt& root)
+      : epilogue_gld_fence_values_(BuildEpilogueGldFenceValues(CollectEpilogueWaitCounts(root))) {}
+
   Stmt VisitStmt_(const ForNode* op) override {
     if (IsDCUMainLoop(op)) {
       phase_ = PipelinePhase::kInMainLoop;
@@ -94,7 +176,9 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
       if (inner && (inner->attr_key == tir::attr::async_wait_inflight_count ||
                     inner->attr_key == "async_wait_inflight_count")) {
         if (const auto* imm = inner->value.as<IntImmNode>()) {
-          pending_wait_counts_.push_back(static_cast<int>(imm->value));
+          if (phase_ == PipelinePhase::kInMainLoop) {
+            pending_wait_counts_.push_back(static_cast<int>(imm->value));
+          }
         }
         return VisitStmt(inner->body);
       }
@@ -103,7 +187,9 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
     if (op->attr_key == tir::attr::async_wait_inflight_count ||
         op->attr_key == "async_wait_inflight_count") {
       if (const auto* imm = op->value.as<IntImmNode>()) {
-        pending_wait_counts_.push_back(static_cast<int>(imm->value));
+        if (phase_ == PipelinePhase::kInMainLoop) {
+          pending_wait_counts_.push_back(static_cast<int>(imm->value));
+        }
       }
       return VisitStmt(op->body);
     }
@@ -118,6 +204,7 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
     result.reserve(op->seq.size());
     for (const Stmt& s : op->seq) {
       result.push_back(VisitStmt(s));
+      TryInsertEpilogueGldFenceAfterSldFence(result);
       TryInsertGldFenceAfterPair(result);
     }
 
@@ -134,22 +221,47 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
 
  private:
   void TryInsertGldFenceAfterPair(Array<Stmt>& result) {
-    if (!ShouldTransform(phase_) || pending_wait_counts_.empty()) {
+    if (phase_ != PipelinePhase::kInMainLoop || pending_wait_counts_.empty()) {
       return;
     }
     size_t n = result.size();
-    if (n >= 2 && IsAsyncGldSldFenceStmt(result[n - 2]) && IsWaveBarrierStmt(result[n - 1])) {
-      int wait_count = pending_wait_counts_.front();
-      pending_wait_counts_.pop_front();
-      Stmt barrier = result[n - 1];
-      result.pop_back();
-      result.push_back(MakeAsyncGldFenceStmt(wait_count));
-      result.push_back(barrier);
+    if (n < 2 || !IsAsyncGldSldFenceStmt(result[n - 2]) || !IsWaveBarrierStmt(result[n - 1])) {
+      return;
     }
+
+    int wait_count = pending_wait_counts_.front();
+    pending_wait_counts_.pop_front();
+    Stmt barrier = result[n - 1];
+    result.pop_back();
+    result.push_back(MakeAsyncGldFenceStmt(wait_count));
+    result.push_back(barrier);
+  }
+
+  void TryInsertEpilogueGldFenceAfterSldFence(Array<Stmt>& result) {
+    if (phase_ != PipelinePhase::kAfterMainLoop) {
+      return;
+    }
+    size_t n = result.size();
+    if (n < 1 || !IsAsyncGldSldFenceStmt(result[n - 1])) {
+      return;
+    }
+    // CX4 uses async_gld_sld_fence(0) and has no async_gld_fence partner.
+    if (GetAsyncGldSldFenceValue(result[n - 1]) == 0) {
+      return;
+    }
+    if (epilogue_gld_insert_idx_ >= static_cast<int>(epilogue_gld_fence_values_.size())) {
+      return;
+    }
+
+    int wait_count = epilogue_gld_fence_values_[epilogue_gld_insert_idx_++];
+    result.push_back(MakeAsyncGldFenceStmt(wait_count));
+    result.push_back(MakeWaveBarrierStmt());
   }
 
   PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
   std::deque<int> pending_wait_counts_;
+  const std::vector<int> epilogue_gld_fence_values_;
+  int epilogue_gld_insert_idx_{0};
 };
 
 }  // namespace
@@ -160,7 +272,7 @@ using namespace tir::transform;
 Pass InsertAsyncGldFence() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     auto* n = f.CopyOnWrite();
-    InsertAsyncGldFenceMutator mutator;
+    InsertAsyncGldFenceMutator mutator(n->body);
     n->body = mutator(std::move(n->body));
     return f;
   };

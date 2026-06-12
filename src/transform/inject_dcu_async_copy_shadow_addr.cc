@@ -161,10 +161,10 @@ class InfoCollector : public StmtExprVisitor {
   }
 
   void VisitExpr_(const CallNode* op) final {
-    if (op->op.same_as(DCUAsyncCopyOp()) && op->args.size() >= 5) {
+    if (op->op.same_as(DCUAsyncCopyOp()) && op->args.size() >= 6) {
       if (const auto* var = op->args[2].as<VarNode>()) {
         if (b_dcu_res_vars.count(var) > 0) {
-          if (const auto* dtype_str = op->args[4].as<StringImmNode>()) {
+          if (const auto* dtype_str = op->args[5].as<StringImmNode>()) {
             DataType elem_dtype = DataType(ffi::StringToDLDataType(dtype_str->value));
             b_elem_bytes = GetBElemBytesFromDType(elem_dtype);
           }

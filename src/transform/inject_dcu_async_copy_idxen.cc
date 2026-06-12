@@ -271,7 +271,7 @@ class IdxenInjector : public StmtExprMutator {
     new_args.push_back(call->args[2]);
     new_args.push_back(new_src_off);
     new_args.push_back(idxen);
-    // Preserve trailing metadata such as element dtype (args[4] on tl.dcu_async_copy).
+    // Preserve smem_offset (args[4]) and element dtype (args[5]) on tl.dcu_async_copy.
     for (size_t i = 4; i < call->args.size(); ++i) {
       new_args.push_back(call->args[i]);
     }

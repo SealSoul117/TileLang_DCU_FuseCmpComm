@@ -87,10 +87,10 @@
                 : "memory");
   }
 
-  template <int N>
+  template <int N, int smem_offset = 0>
   TL_DEVICE void cp_async_gs(void *lds_base_ptr, int32x4_t res, int offset) {
     if constexpr (N == 16) {
-      async_buffer_load_dwordx4_v(
+      async_buffer_load_dwordx4_v<smem_offset>(
           lds_base_ptr,
           res,
           offset
@@ -149,10 +149,17 @@
                 : "v"(lds_base_ptr));
   }
 
-  TL_DEVICE void ds_read_m32x32_b8(float32x4& dst, uint32_t lds_base_ptr) {
+  TL_DEVICE void ds_read_m32x32_b8(float32x4& dst, uint32_t lds_base_ptr, int offset = 0) {
     asm volatile("ds_read_m32x32_b8 %0, %1 offset:0\n\t"
                 : "=v"(dst)
-                : "v"(lds_base_ptr)
+                : "v"(lds_base_ptr), "n"(offset)
+                : "memory");
+  }
+
+  TL_DEVICE void ds_read_m32x32_b8_offset(float32x4& dst, uint32_t lds_base_ptr, int offset) {
+    asm volatile("ds_read_m32x32_b8 %0, %1 offset:%2\n\t"
+                : "=v"(dst)
+                : "v"(lds_base_ptr), "n"(offset)
                 : "memory");
   }
 

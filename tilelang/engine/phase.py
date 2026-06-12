@@ -313,6 +313,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
         mod = tilelang.transform.InsertAsyncGldFence()(mod)
+
         
         # it is unnecessary to insert shared fence after async copy, as the synchronization between async copy and mma is already handled by the hardware with async fence. And inserting shared fence may cause deadlock if there are not enough threads to execute the fence.
         # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)

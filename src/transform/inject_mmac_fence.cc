@@ -210,12 +210,54 @@ Stmt ComputeGlobalLastFenceMMAStmt(const Stmt& root) {
     return fence_targets.back();
 }
 
+Stmt ComputeEpilogueLastMMAStmt(const Stmt& root) {
+    struct Collector : public StmtVisitor {
+        Stmt last_mma;
+        bool past_main_loop = false;
+
+        void VisitStmt_(const ForNode* op) override {
+            StmtVisitor::VisitStmt_(op);
+            if (IsDCUMainLoop(op)) {
+                past_main_loop = true;
+            }
+        }
+
+        void VisitStmt_(const SeqStmtNode* op) override {
+            for (const Stmt& s : op->seq) {
+                if (past_main_loop && StmtContainsMMA(s)) {
+                    last_mma = s;
+                }
+                VisitStmt(s);
+            }
+        }
+
+        void VisitStmt_(const IfThenElseNode* op) override {
+            if (past_main_loop) {
+                if (StmtContainsMMA(op->then_case)) {
+                    last_mma = op->then_case;
+                }
+                if (op->else_case.defined() && StmtContainsMMA(op->else_case.value())) {
+                    last_mma = op->else_case.value();
+                }
+            }
+            StmtVisitor::VisitStmt_(op);
+        }
+    };
+
+    Collector collector;
+    collector(root);
+    return collector.last_mma;
+}
+
+enum class PipelinePhase { kBeforeMainLoop, kInMainLoop, kAfterMainLoop };
+
 } 
 
 class MMABarrierMutator : public StmtExprMutator {
 public:
     explicit MMABarrierMutator(const Stmt& root_body)
-        : global_last_fence_mma_(ComputeGlobalLastFenceMMAStmt(root_body)) {}
+        : global_last_fence_mma_(ComputeGlobalLastFenceMMAStmt(root_body)),
+          epilogue_last_mma_(ComputeEpilogueLastMMAStmt(root_body)) {}
 
     bool ContainsMMA(const Stmt& stmt) {
         bool found = false;
@@ -239,11 +281,13 @@ public:
     Stmt VisitStmt_(const ForNode* op) override {
         bool is_main_loop = IsDCUMainLoop(op);
         if (is_main_loop) {
+            phase_ = PipelinePhase::kInMainLoop;
             ++inside_k_loop_depth_;
         }
         Stmt body = VisitStmt(op->body);
         if (is_main_loop) {
             --inside_k_loop_depth_;
+            phase_ = PipelinePhase::kAfterMainLoop;
         }
         return For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,
                    op->annotations);
@@ -259,19 +303,33 @@ public:
             
             if (ContainsMMA(stmt)) {
                 if (pending_load_count > 0) {
-                    int fence_val =
-                        (global_last_fence_mma_.defined() && stmt.same_as(global_last_fence_mma_))
-                            ? 0
-                            : pending_load_count;
-                    
-                    Array<PrimExpr> args = {Integer(fence_val)};
-                    
-                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"), args);
+                    int fence_val = pending_load_count;
+                    if (phase_ == PipelinePhase::kAfterMainLoop) {
+                        // Epilogue reuses the previous async_gld_sld_fence value.
+                        if (last_sld_fence_val_ > 0) {
+                            fence_val = last_sld_fence_val_;
+                        }
+                    } else if (global_last_fence_mma_.defined() &&
+                               stmt.same_as(global_last_fence_mma_)) {
+                        fence_val = 0;
+                    }
+
+                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"),
+                                           {Integer(fence_val)});
                     new_seq.push_back(Evaluate(fence_call));
+                    // wave_barrier only pairs with async_gld_fence in the main loop.
+                    if (phase_ != PipelinePhase::kAfterMainLoop) {
+                        new_seq.push_back(MakeWaveBarrierStmt());
+                    }
 
-                    new_seq.push_back(MakeWaveBarrierStmt());
-
-                    pending_load_count = 0; 
+                    last_sld_fence_val_ = fence_val;
+                    pending_load_count = 0;
+                } else if (phase_ == PipelinePhase::kAfterMainLoop &&
+                           epilogue_last_mma_.defined() && stmt.same_as(epilogue_last_mma_)) {
+                    // Final epilogue drain: sld_fence(0) before the last mmac.
+                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"),
+                                           {Integer(0)});
+                    new_seq.push_back(Evaluate(fence_call));
                 }
                 new_seq.push_back(this->VisitStmt(stmt));
                 prev_stmt_is_dcu_async_copy = false;
@@ -305,7 +363,10 @@ public:
 
 private:
     Stmt global_last_fence_mma_;
+    Stmt epilogue_last_mma_;
+    PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
     int inside_k_loop_depth_ = 0;
+    int last_sld_fence_val_ = 0;
 };
 
 namespace transform {

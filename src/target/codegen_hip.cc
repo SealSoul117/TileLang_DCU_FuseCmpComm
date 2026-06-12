@@ -1167,14 +1167,20 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string src_res = this->PrintExpr(op->args[2]);
     std::string src_off = get_base_expr(op->args[3]);
     std::string idxen = get_base_expr(op->args[4]);
+    std::string smem_offset = "0";
+    size_t dtype_arg_idx = 5;
+    if (op->args.size() >= 7) {
+      smem_offset = get_base_expr(op->args[5]);
+      dtype_arg_idx = 6;
+    }
     std::string elem_dtype = "float16";
-    if (op->args.size() >= 6) {
-      elem_dtype = Downcast<StringImm>(op->args[5])->value;
+    if (op->args.size() > dtype_arg_idx) {
+      elem_dtype = Downcast<StringImm>(op->args[dtype_arg_idx])->value;
     }
     std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
     this->PrintIndent();
-    this->stream << "tl::cp_async_gs_idxen<" << N << ">(";
-    this->stream << "((" << hip_type << "*)" << dst_ptr << " + " << dst_off << "), ";
+    this->stream << "tl::cp_async_gs_idxen<" << N << ", " << smem_offset << ">(";
+    this->stream << "(reinterpret_cast<char*>(" << dst_ptr << ") + " << dst_off << "), ";
     this->stream << src_res << ", ";
     this->stream << src_off << " * sizeof(" << hip_type << "), ";
     this->stream << idxen << ");\n";
@@ -1192,15 +1198,20 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string dst_off = get_base_expr(op->args[1]);
     std::string src_res = this->PrintExpr(op->args[2]);
     std::string src_off = get_base_expr(op->args[3]);
+    std::string smem_offset = "0";
+    size_t dtype_arg_idx = 4;
+    if (op->args.size() >= 6) {
+      smem_offset = get_base_expr(op->args[4]);
+      dtype_arg_idx = 5;
+    }
     std::string elem_dtype = "float16";
-    if (op->args.size() >= 5) {
-      elem_dtype = Downcast<StringImm>(op->args[4])->value;
+    if (op->args.size() > dtype_arg_idx) {
+      elem_dtype = Downcast<StringImm>(op->args[dtype_arg_idx])->value;
     }
     std::string hip_type = RuntimeDTypeToHIPType(elem_dtype);
     this->PrintIndent();
-    this->stream << "tl::cp_async_gs<" 
-                 << N << ">(";
-    this->stream << "((" << hip_type << "*)" << dst_ptr << " + " << dst_off << "), ";
+    this->stream << "tl::cp_async_gs<" << N << ", " << smem_offset << ">(";
+    this->stream << "(reinterpret_cast<char*>(" << dst_ptr << ") + " << dst_off << "), ";
     this->stream << src_res << ", ";
     this->stream << src_off << " * sizeof(" << hip_type << "));\n";
   } else if (op->op.same_as(Op::Get("tl.async_gld_sld_fence"))) {

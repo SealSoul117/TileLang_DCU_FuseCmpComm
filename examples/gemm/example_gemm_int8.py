@@ -1,7 +1,12 @@
 import tilelang
 import tilelang.language as T
+import torch
 
 tilelang.disable_cache()
+
+def torch_matmul(A, B):
+    ref_c = torch._int_mm(A, B)
+    return ref_c
 
 @tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M, block_N, block_K, dtype=T.int8, accum_dtype=T.int32):
@@ -28,9 +33,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.int8, accum_dtype=T.int32
 
 
 def main():
-    M = 2430
-    N = 5120
-    K = 5120
+    M = 10240
+    N = 10240
+    K = 10240
     kernel = matmul(M, N, K, 256, 256, 32)
 
     import torch
@@ -54,6 +59,9 @@ def main():
     latency = profiler.do_bench()
     print(f"tilelang Latency: {latency}ms")
     print(f"GEMM TFLops: {2 * M * N * K / (latency * 1e9)}")
+    profiler = kernel.get_profiler()
+    ref_latency = profiler.do_bench(torch_matmul)
+    print(f"Reference Latency: {ref_latency}ms")
 
     torch.testing.assert_close(c, ref_c, rtol=1e-1, atol=1e-1)
     print("All check passed.")

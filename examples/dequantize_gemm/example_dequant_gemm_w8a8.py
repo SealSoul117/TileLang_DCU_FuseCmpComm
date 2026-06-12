@@ -6,6 +6,8 @@ import itertools
 import torch
 import argparse
 
+tilelang.disable_cache()
+
 def get_configs():
     iter_params = dict(
         block_M=[64, 128],

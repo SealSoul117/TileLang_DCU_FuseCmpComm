@@ -24,12 +24,14 @@
 #ifndef TVM_TL_INJECT_UTILS_H_
 #define TVM_TL_INJECT_UTILS_H_
 
+#include <tvm/ir/function.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
 
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace tvm {
@@ -86,6 +88,49 @@ bool IsDCUMainLoop(const tir::ForNode* loop);
  * \brief Collect all for-loops in \p stmt that match DCU main-loop features.
  */
 std::vector<const tir::ForNode*> CollectDCUMainLoops(const tir::Stmt& stmt);
+
+/*!
+ * \brief Transpose flags collected from T.gemm lowering.
+ */
+struct DCUGemmTransposeFlags {
+  bool trans_a{false};
+  bool trans_b{false};
+  bool defined{false};
+};
+
+/*!
+ * \brief Read DCU GEMM transpose flags from PrimFunc attrs.
+ */
+DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const tir::PrimFunc& func);
+
+/*!
+ * \brief Whether InjectBLocalLayoutTransform / InjectDSRead should rewrite this local buffer.
+ *
+ * Layout-transform + ds_read_m32x16 applies when A is transposed (A_local) or B is not
+ * transposed (B_local).
+ */
+bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags, const std::string& buffer_name);
+
+/*!
+ * \brief Whether InjectADSRead should rewrite A_local.
+ *
+ * ds_read_b64/b128 applies when A is not transposed.
+ */
+bool NeedsDCUADSRead(const DCUGemmTransposeFlags& flags);
+
+/*!
+ * \brief Whether InjectDCUAsyncCopyIdxen should rewrite A-matrix async copies.
+ *
+ * Applies when A is not transposed.
+ */
+bool NeedsDCUAsyncCopyIdxenA(const DCUGemmTransposeFlags& flags);
+
+/*!
+ * \brief Whether InjectDCUAsyncCopyIdxen should rewrite B-matrix async copies.
+ *
+ * Applies when B is transposed.
+ */
+bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags);
 
 }  // namespace tl
 }  // namespace tvm

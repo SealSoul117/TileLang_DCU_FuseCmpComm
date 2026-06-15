@@ -377,6 +377,10 @@ def InjectDCUAsyncCopyShadowAddr():
     high shadow bits onto ``buf_dyn_shmem``, then replaces the first argument of
     ``tl.dcu_async_copy`` with the corresponding shadow address.
 
+    Shadow offset style follows T.gemm transpose flags (via ``AnnotateDCUGemmTranspose``):
+    - A: A-style when A is not transposed, B-style when A is transposed
+    - B: B-style when B is not transposed, A-style when B is transposed
+
     Returns
     -------
     fpass : tvm.transform.Pass
@@ -386,13 +390,14 @@ def InjectDCUAsyncCopyShadowAddr():
 
 
 def InjectDCUAsyncCopyIdxen():
-    """Convert A-matrix ``tl.dcu_async_copy`` to ``tl.dcu_async_copy_idxen`` for DCU.
+    """Convert ``tl.dcu_async_copy`` to ``tl.dcu_async_copy_idxen`` for DCU GEMM loads.
 
-    After ``LowerSharedGlobalCopy``, derives the A-matrix K dimension from buffer
-    shapes, sets structured-buffer ``StructBit`` on ``tl.make_dcu_resource`` for A,
-    and splits the global source offset by factoring K-scaled addends into idxen
-  (tile index along K) and ``idxen * (K - tile_width) + remainder`` for
-  ``cp_async_gs_idxen`` codegen.
+    Uses T.gemm transpose flags (via ``AnnotateDCUGemmTranspose``):
+    - A-matrix idxen when A is not transposed
+    - B-matrix idxen when B is transposed
+
+    Derives K from global buffer shapes, sets ``StructBit`` on ``tl.make_dcu_resource``,
+    and splits the global source offset into idxen and remainder for ``cp_async_gs_idxen``.
 
     Returns
     -------
@@ -400,6 +405,20 @@ def InjectDCUAsyncCopyIdxen():
         The result pass
     """
     return _ffi_api.InjectDCUAsyncCopyIdxen()  # type: ignore
+
+
+def AnnotateDCUGemmTranspose():
+    """Collect T.gemm transpose flags from lowered GEMM bodies into PrimFunc attrs.
+
+    Transpose information is emitted during GEMM lowering and merged here so later
+    DCU ds_read injection passes can target A_local or B_local correctly.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AnnotateDCUGemmTranspose()  # type: ignore
 
 
 def InjectDSRead():
@@ -438,13 +457,10 @@ def InjectADSRead():
 
 
 def InjectBLocalLayoutTransform():
-    """Transform B_local layout from shared memory thread-interleaved to local row-major.
+    """Transform local register layout from shared thread-interleaved to row-major.
 
-    This pass specifically handles the B_local buffer layout transformation in GEMM kernels
-    for AMD DCU (gfx936, gfx942, etc.). It converts complex indexed BufferStore patterns
-    from shared memory into vectorized ds_read_m32x16_b16 hardware instructions.
-
-    B Layout Transformation:
+    On DCU, this pass handles A_local when A is transposed, or B_local when B is not
+    transposed. It prepares the buffer stores for ds_read_m32x16_b16 injection.
     - Shared Memory Layout (per thread in warp, 16 elements):
         Thread 0: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15]
         Thread 1: [16,17,18,...                        ,31       ]

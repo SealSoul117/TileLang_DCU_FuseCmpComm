@@ -42,19 +42,17 @@ using namespace tir;
 
 class DSReadInjector : public StmtExprMutator {
  public:
-  bool IsBLocalBuffer(const Buffer& buffer) {
-    std::string name = buffer->name;
-    return name.find("B_local") != std::string::npos;
-  }
+  explicit DSReadInjector(const DCUGemmTransposeFlags& flags) : flags_(flags) {}
 
  private:
+  DCUGemmTransposeFlags flags_;
 
   Stmt VisitStmt_(const BufferStoreNode* op) final {
     Buffer buffer = op->buffer;
 
-  if (!IsBLocalBuffer(buffer)) {
-    return StmtExprMutator::VisitStmt_(op);
-  }
+    if (!NeedsDCULocalLayoutDSRead(flags_, buffer->name)) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
 
   const BufferLoadNode* load = op->value.as<BufferLoadNode>();
   if (!load) {
@@ -111,13 +109,17 @@ using namespace tir::transform;
 
 tvm::transform::Pass InjectDSRead() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    // Only apply to DCU targets
     if (!IsDCUTarget(m)) {
       return f;
     }
 
+    DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(f);
+    if (!flags.defined || (!flags.trans_a && flags.trans_b)) {
+      return f;
+    }
+
     auto *n = f.CopyOnWrite();
-    n->body = DSReadInjector()(n->body);
+    n->body = DSReadInjector(flags)(n->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectDSRead", {});

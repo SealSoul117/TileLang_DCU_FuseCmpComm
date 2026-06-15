@@ -1,7 +1,9 @@
 /*!
  * \file inject_dcu_async_copy_idxen.cc
- * \brief Convert A-matrix tl.dcu_async_copy to tl.dcu_async_copy_idxen with structured
+ * \brief Convert tl.dcu_async_copy to tl.dcu_async_copy_idxen with structured
  *        buffer resource for DCU global-to-shared loads.
+ *
+ * A-matrix idxen applies when A is not transposed; B-matrix idxen when B is transposed.
  */
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -34,6 +36,10 @@ const Op& MakeDCUResourceOp() { return Op::Get("tl.make_dcu_resource"); }
 
 bool IsABufferName(const std::string& name) {
   return name == "A" || name == "A_1";
+}
+
+bool IsBBufferName(const std::string& name) {
+  return name == "B" || name == "B_1";
 }
 
 std::string GetGlobalBufferName(const PrimExpr& expr) {
@@ -75,35 +81,51 @@ int StructBitFromTileWidth(int64_t tile_width) {
   return bits;
 }
 
-struct ADimInfo {
-  std::optional<int64_t> k_dim;
-  int elem_bytes{1};
+struct GemmDimInfo {
+  std::optional<int64_t> a_k_dim;
+  std::optional<int64_t> b_k_dim;
+  int a_elem_bytes{1};
+  int b_elem_bytes{1};
 };
 
-class KDimCollector : public StmtExprVisitor {
+std::optional<int64_t> ExtractKDimFromBuffer(const Buffer& buffer, bool transposed) {
+  if (buffer->shape.size() != 2) {
+    return std::nullopt;
+  }
+  const int k_axis = transposed ? 0 : 1;
+  if (const auto* imm = buffer->shape[k_axis].as<IntImmNode>()) {
+    return imm->value;
+  }
+  return std::nullopt;
+}
+
+class GemmDimCollector : public StmtExprVisitor {
  public:
-  ADimInfo info;
+  GemmDimInfo info;
 
  private:
   void VisitStmt_(const DeclBufferNode* op) final {
     if (IsABufferName(op->buffer->name)) {
-      info.elem_bytes = op->buffer->dtype.bytes();
-      if (op->buffer->shape.size() == 2) {
-        if (const auto* imm = op->buffer->shape[1].as<IntImmNode>()) {
-          info.k_dim = imm->value;
-        }
+      info.a_elem_bytes = op->buffer->dtype.bytes();
+      if (auto k_dim = ExtractKDimFromBuffer(op->buffer, /*transposed=*/false)) {
+        info.a_k_dim = k_dim;
+      }
+    } else if (IsBBufferName(op->buffer->name)) {
+      info.b_elem_bytes = op->buffer->dtype.bytes();
+      if (auto k_dim = ExtractKDimFromBuffer(op->buffer, /*transposed=*/true)) {
+        info.b_k_dim = k_dim;
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 };
 
-std::optional<ADimInfo> ExtractADimInfoFromModule(const IRModule& mod) {
+std::optional<GemmDimInfo> ExtractGemmDimInfoFromModule(const IRModule& mod) {
   for (const auto& kv : mod->functions) {
     if (const auto* func = kv.second.as<PrimFuncNode>()) {
-      KDimCollector collector;
+      GemmDimCollector collector;
       collector(func->body);
-      if (collector.info.k_dim.has_value()) {
+      if (collector.info.a_k_dim.has_value() || collector.info.b_k_dim.has_value()) {
         return collector.info;
       }
     }
@@ -111,16 +133,46 @@ std::optional<ADimInfo> ExtractADimInfoFromModule(const IRModule& mod) {
   return std::nullopt;
 }
 
+void FillGemmDimInfoFromBufferMap(const PrimFunc& func, bool trans_a, bool trans_b,
+                                  GemmDimInfo* info) {
+  for (const auto& kv : func->buffer_map) {
+    const Buffer& buffer = kv.second;
+    if (IsABufferName(buffer->name)) {
+      info->a_elem_bytes = buffer->dtype.bytes();
+      if (auto k_dim = ExtractKDimFromBuffer(buffer, trans_a)) {
+        info->a_k_dim = k_dim;
+      }
+    } else if (IsBBufferName(buffer->name)) {
+      info->b_elem_bytes = buffer->dtype.bytes();
+      if (auto k_dim = ExtractKDimFromBuffer(buffer, trans_b)) {
+        info->b_k_dim = k_dim;
+      }
+    }
+  }
+}
+
+struct IdxenMatrixParams {
+  bool enabled{false};
+  int64_t k_dim{0};
+  int64_t tile_width{0};
+  int struct_bit{0};
+  std::unordered_set<const VarNode*> dcu_res_vars;
+};
+
 class InfoCollector : public StmtExprVisitor {
  public:
   std::unordered_set<const VarNode*> a_dcu_res_vars;
+  std::unordered_set<const VarNode*> b_dcu_res_vars;
 
  private:
   void VisitStmt_(const LetStmtNode* op) final {
     if (const auto* call = op->value.as<CallNode>()) {
       if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
-        if (IsABufferName(GetGlobalBufferName(call->args[0]))) {
+        const std::string global_name = GetGlobalBufferName(call->args[0]);
+        if (IsABufferName(global_name)) {
           a_dcu_res_vars.insert(op->var.get());
+        } else if (IsBBufferName(global_name)) {
+          b_dcu_res_vars.insert(op->var.get());
         }
       }
     }
@@ -188,35 +240,53 @@ std::optional<PrimExpr> TryExtractIdxenTerm(const PrimExpr& term, int64_t k_dim)
   return std::nullopt;
 }
 
+IdxenMatrixParams BuildMatrixParams(bool enabled, int64_t k_dim, int elem_bytes,
+                                    const std::unordered_set<const VarNode*>& dcu_res_vars) {
+  IdxenMatrixParams params;
+  params.enabled = enabled;
+  params.dcu_res_vars = dcu_res_vars;
+  if (!enabled || dcu_res_vars.empty() || k_dim <= 0) {
+    params.enabled = false;
+    return params;
+  }
+  ICHECK_GT(elem_bytes, 0);
+  const int64_t k_stride_bytes = k_dim * elem_bytes;
+  params.k_dim = k_dim;
+  params.struct_bit = StructBitFromTileWidth(TileWidthFromK(k_stride_bytes));
+  params.tile_width = TileWidthFromK(k_dim);
+  return params;
+}
+
 class IdxenInjector : public StmtExprMutator {
  public:
-  IdxenInjector(int64_t k_dim, int64_t tile_width, int struct_bit,
-                std::unordered_set<const VarNode*> a_dcu_res_vars)
-      : k_dim_(k_dim),
-        tile_width_(tile_width),
-        struct_bit_(struct_bit),
-        a_dcu_res_vars_(std::move(a_dcu_res_vars)) {}
+  IdxenInjector(IdxenMatrixParams a_params, IdxenMatrixParams b_params)
+      : a_params_(std::move(a_params)), b_params_(std::move(b_params)) {}
 
-  static PrimFunc Substitute(PrimFunc func, int64_t k_dim, int64_t tile_width, int struct_bit,
-                             const std::unordered_set<const VarNode*>& a_dcu_res_vars) {
-    IdxenInjector mutator(k_dim, tile_width, struct_bit, a_dcu_res_vars);
+  static PrimFunc Substitute(PrimFunc func, const IdxenMatrixParams& a_params,
+                             const IdxenMatrixParams& b_params) {
+    IdxenInjector mutator(a_params, b_params);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
   }
 
  private:
-  bool IsADcuRes(const PrimExpr& expr) const {
+  const IdxenMatrixParams* ParamsForDcuRes(const PrimExpr& expr) const {
     if (const auto* var = expr.as<VarNode>()) {
-      return a_dcu_res_vars_.count(var) > 0;
+      if (a_params_.enabled && a_params_.dcu_res_vars.count(var) > 0) {
+        return &a_params_;
+      }
+      if (b_params_.enabled && b_params_.dcu_res_vars.count(var) > 0) {
+        return &b_params_;
+      }
     }
-    return false;
+    return nullptr;
   }
 
   // Split offset = sum(K-scaled terms) + sum(rest) into:
   //   idxen = sum(term / K) for terms whose coefficient is a multiple of K
   //   new_offset = idxen * (K - tile_width) + sum(rest)
-  std::pair<PrimExpr, PrimExpr> SplitSrcOffset(const PrimExpr& offset) {
+  std::pair<PrimExpr, PrimExpr> SplitSrcOffset(const PrimExpr& offset, const IdxenMatrixParams& params) {
     auto split_scalar = [&](const PrimExpr& base) -> std::pair<PrimExpr, PrimExpr> {
       std::vector<PrimExpr> terms;
       CollectAddTerms(base, &terms);
@@ -224,7 +294,7 @@ class IdxenInjector : public StmtExprMutator {
       PrimExpr idxen = make_zero(base.dtype());
       PrimExpr offset_rest = make_zero(base.dtype());
       for (const PrimExpr& term : terms) {
-        if (auto idxen_term = TryExtractIdxenTerm(term, k_dim_)) {
+        if (auto idxen_term = TryExtractIdxenTerm(term, params.k_dim)) {
           idxen = idxen + idxen_term.value();
         } else {
           offset_rest = offset_rest + term;
@@ -233,7 +303,7 @@ class IdxenInjector : public StmtExprMutator {
 
       idxen = analyzer_.Simplify(idxen);
       offset_rest = analyzer_.Simplify(offset_rest);
-      const int64_t k_residual = k_dim_ - tile_width_;
+      const int64_t k_residual = params.k_dim - params.tile_width;
       PrimExpr new_offset =
           analyzer_.Simplify(idxen * make_const(base.dtype(), k_residual) + offset_rest);
       return {new_offset, idxen};
@@ -251,20 +321,31 @@ class IdxenInjector : public StmtExprMutator {
     if (call->args.size() >= 3) {
       return GetRef<PrimExpr>(call);
     }
-    if (!IsABufferName(GetGlobalBufferName(call->args[0]))) {
+    const std::string global_name = GetGlobalBufferName(call->args[0]);
+    const IdxenMatrixParams* params = nullptr;
+    if (IsABufferName(global_name)) {
+      params = a_params_.enabled ? &a_params_ : nullptr;
+    } else if (IsBBufferName(global_name)) {
+      params = b_params_.enabled ? &b_params_ : nullptr;
+    }
+    if (params == nullptr) {
       return GetRef<PrimExpr>(call);
     }
     Array<PrimExpr> new_args = call->args;
-    new_args.push_back(IntImm(DataType::Int(32), struct_bit_));
+    new_args.push_back(IntImm(DataType::Int(32), params->struct_bit));
     return Call(call->dtype, call->op, new_args);
   }
 
   PrimExpr RewriteDCUAsyncCopy(const CallNode* call) {
-    if (!call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 4 || !IsADcuRes(call->args[2])) {
+    if (!call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 4) {
+      return GetRef<PrimExpr>(call);
+    }
+    const IdxenMatrixParams* params = ParamsForDcuRes(call->args[2]);
+    if (params == nullptr) {
       return GetRef<PrimExpr>(call);
     }
 
-    auto [new_src_off, idxen] = SplitSrcOffset(call->args[3]);
+    auto [new_src_off, idxen] = SplitSrcOffset(call->args[3], *params);
     Array<PrimExpr> new_args;
     new_args.push_back(call->args[0]);
     new_args.push_back(call->args[1]);
@@ -308,48 +389,25 @@ class IdxenInjector : public StmtExprMutator {
     return StmtExprMutator::VisitExpr_(op);
   }
 
-  int64_t k_dim_;
-  int64_t tile_width_;
-  int struct_bit_;
-  std::unordered_set<const VarNode*> a_dcu_res_vars_;
+  IdxenMatrixParams a_params_;
+  IdxenMatrixParams b_params_;
   arith::Analyzer analyzer_;
 };
 
-}  // namespace
-
-PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
-  std::optional<ADimInfo> a_info = ExtractADimInfoFromModule(mod);
-  if (!a_info.has_value()) {
-    return func;
+bool HasAsyncCopyForVars(const Stmt& body, const std::unordered_set<const VarNode*>& vars) {
+  if (vars.empty()) {
+    return false;
   }
-
-  const int64_t k_dim = *a_info->k_dim;
-  const int elem_bytes = a_info->elem_bytes;
-  ICHECK_GT(elem_bytes, 0);
-  // StructBit template param: largest power-of-two less than K * elem_bytes
-  // (byte stride along K). E.g. K=5120, int8 -> 4096 (bit=12); half -> 8192 (bit=13).
-  const int64_t k_stride_bytes = k_dim * elem_bytes;
-  const int struct_bit = StructBitFromTileWidth(TileWidthFromK(k_stride_bytes));
-  // Idxen offset splitting still divides by K-scaled terms in element units;
-  // codegen already accounts for sizeof(data) on the offset path.
-  const int64_t tile_width = TileWidthFromK(k_dim);
-
-  InfoCollector collector;
-  collector(func->body);
-  if (collector.a_dcu_res_vars.empty()) {
-    return func;
-  }
-
   class CopyChecker : public StmtExprVisitor {
    public:
-    bool has_a_copy{false};
+    bool has_copy{false};
 
    private:
     void VisitExpr_(const CallNode* op) final {
       if (op->op.same_as(DCUAsyncCopyOp()) && op->args.size() >= 3) {
         if (const auto* var = op->args[2].as<VarNode>()) {
-          if (a_vars_.count(var) > 0) {
-            has_a_copy = true;
+          if (vars_.count(var) > 0) {
+            has_copy = true;
           }
         }
       }
@@ -357,16 +415,64 @@ PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
     }
 
    public:
-    std::unordered_set<const VarNode*> a_vars_;
+    std::unordered_set<const VarNode*> vars_;
   } checker;
-  checker.a_vars_ = collector.a_dcu_res_vars;
-  checker(func->body);
-  if (!checker.has_a_copy) {
+  checker.vars_ = vars;
+  checker(body);
+  return checker.has_copy;
+}
+
+}  // namespace
+
+PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
+  DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(func);
+  const bool enable_a = NeedsDCUAsyncCopyIdxenA(flags);
+  const bool enable_b = NeedsDCUAsyncCopyIdxenB(flags);
+  if (!enable_a && !enable_b) {
     return func;
   }
 
-  return IdxenInjector::Substitute(std::move(func), k_dim, tile_width, struct_bit,
-                                   collector.a_dcu_res_vars);
+  GemmDimInfo dim_info;
+  if (auto module_info = ExtractGemmDimInfoFromModule(mod)) {
+    dim_info = *module_info;
+  }
+  FillGemmDimInfoFromBufferMap(func, flags.trans_a, flags.trans_b, &dim_info);
+
+  InfoCollector collector;
+  collector(func->body);
+
+  IdxenMatrixParams a_params =
+      BuildMatrixParams(enable_a, dim_info.a_k_dim.value_or(0), dim_info.a_elem_bytes,
+                        collector.a_dcu_res_vars);
+  IdxenMatrixParams b_params =
+      BuildMatrixParams(enable_b, dim_info.b_k_dim.value_or(0), dim_info.b_elem_bytes,
+                        collector.b_dcu_res_vars);
+
+  if (!a_params.enabled && !b_params.enabled) {
+    return func;
+  }
+
+  const bool has_a_copy = a_params.enabled && HasAsyncCopyForVars(func->body, a_params.dcu_res_vars);
+  const bool has_b_copy = b_params.enabled && HasAsyncCopyForVars(func->body, b_params.dcu_res_vars);
+  if (!has_a_copy && !has_b_copy) {
+    return func;
+  }
+
+  if (has_a_copy) {
+    ICHECK(dim_info.a_k_dim.has_value()) << "InjectDCUAsyncCopyIdxen: missing A K dimension";
+  }
+  if (has_b_copy) {
+    ICHECK(dim_info.b_k_dim.has_value()) << "InjectDCUAsyncCopyIdxen: missing B K dimension";
+  }
+
+  if (!has_a_copy) {
+    a_params.enabled = false;
+  }
+  if (!has_b_copy) {
+    b_params.enabled = false;
+  }
+
+  return IdxenInjector::Substitute(std::move(func), a_params, b_params);
 }
 
 namespace transform {

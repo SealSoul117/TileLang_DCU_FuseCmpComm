@@ -8,18 +8,18 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
     @T.prim_func
     def gemm(
         A: T.Tensor((M, K), dtype),
-        B: T.Tensor((K, N), dtype),
+        B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local)
+                T.copy(B[bx * block_N, k * block_K], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -35,11 +35,11 @@ def main():
     import torch
 
     a = torch.randn(M, K).cuda().half()
-    b = torch.randn(K, N).cuda().half()
+    b = torch.randn(N, K).cuda().half()
 
     c = kernel(a, b)
 
-    ref_c = a @ b
+    ref_c = a @ b.T
 
     print("c:")
     print(c)

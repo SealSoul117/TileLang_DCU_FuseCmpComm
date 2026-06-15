@@ -61,6 +61,13 @@ static constexpr const char *kLayoutVisualizationFormats =
     "tl.layout_visualization_formats";
 static constexpr const char *kDeviceCompileFlags = "tl.device_compile_flags";
 
+// DCU GEMM transpose flags propagated from T.gemm to late inject passes.
+static constexpr const char *kDCUGemmTransA = "tl.dcu_gemm_trans_a";
+static constexpr const char *kDCUGemmTransB = "tl.dcu_gemm_trans_b";
+// Temporary AttrStmt keys emitted during gemm lowering (merged by AnnotateDCUGemmTranspose).
+static constexpr const char *kDCUGemmTransAStmt = "tl.dcu_gemm_trans_a_stmt";
+static constexpr const char *kDCUGemmTransBStmt = "tl.dcu_gemm_trans_b_stmt";
+
 /*!
  * \brief Whether to disable thread storage synchronization
  *

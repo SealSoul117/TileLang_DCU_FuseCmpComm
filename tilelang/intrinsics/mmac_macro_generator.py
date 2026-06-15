@@ -342,7 +342,11 @@ class MatrixCoreIntrinEmitter:
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
-        layoutInfer = SharedToLocalLayoutB if micro_size_k == 16 else SharedToLocalKDim32LayoutB
+        layoutInfer = None
+        if self.b_transposed:
+            layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
+        else:
+            layoutInfer = SharedToLocalLayoutB if micro_size_k == 16 else SharedToLocalKDim32LayoutB
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
         print("block_col_warps", self.block_col_warps, "micro_size_y", micro_size_y)
@@ -361,15 +365,14 @@ class MatrixCoreIntrinEmitter:
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             warp_inter_stride = 32
             if is_transposed:
-                raise NotImplementedError("Transposed B is not implemented yet")
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = T.meta_var(reverse_index_map((tx & 15) // 4 + (tx & 3) * 4 + (tx // 16) * 16, local_id))
-                        l, r = (
-                            warp_n * warp_col_tiles + j * micro_size_y,
-                            rk * chunk + ki * (k_pack * micro_size_k),
-                        )
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+                        row, col = layoutInfer.base(tx, local_id)
+                        row, col = layoutInfer.slab(row, col)
+                        row, col = layoutInfer.warp(row, col, warp_n)
+                        row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
+                        row, col = layoutInfer.rewind(row, col, tx, warp_n, j, self.block_col_warps)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
 
             else:
                 for j in T.serial(warp_cols):
@@ -497,6 +500,7 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
+        print("local_size_out", local_size_out)
 
         def forward_thread(i: int, j: int) -> int:
             """
@@ -534,11 +538,53 @@ class MatrixCoreIntrinEmitter:
             return warp_j * ((micro_size_dcu_y // micro_size_y) * local_size_out) + warp_j_in_32_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
             # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
 
-        return T.Fragment(
-            shape,
-            forward_thread_fn=forward_thread,
-            forward_index_fn=forward_index,
-        )
+        def forward_thread_nt(i: int, j: int) -> int:
+            """
+            Map fragment row `i` and column `j` to a thread index.
+            """
+            micro_size_dcu_x = 32
+            micro_size_dcu_y = 32
+            warp_cols_dcu = warp_cols // (micro_size_dcu_y // micro_size_y)
+            block_i, block_j = (i // micro_size_dcu_x) % block_row_warps, (j // micro_size_dcu_y) % block_col_warps
+            mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
+            
+            lane_id, _ = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
+            
+            if is_m_first:
+                thread_id = block_i * (block_col_warps * warp_cols_dcu) + block_j * warp_size + lane_id
+            else:
+                thread_id = block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
+            return thread_id
+
+        def forward_index_nt(i: int, j: int) -> int:
+            """
+            Map fragment row `i` and column `j` to a local index within a thread's registers.
+            """
+            micro_size_dcu_x = 32
+            micro_size_dcu_y = 32
+            warp_i, warp_j = (i // micro_size_dcu_x) // block_row_warps, j // micro_size_dcu_y // block_col_warps
+            warp_j_in_64_16 = (j // 64)
+            warp_i_in_32_16 = (i // 16) % 2
+            warp_j_in_32_16 = (j // 16) % 2
+            mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
+            
+            # 使用 MMAC 的底层硬件逆映射获取局部偏移
+            _, local_id = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
+            return warp_j_in_32_16 * (4 * local_size_out) + warp_j_in_64_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
+            # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
+
+        if not self.b_transposed and not self.a_transposed:
+            return T.Fragment(
+                shape,
+                forward_thread_fn=forward_thread,
+                forward_index_fn=forward_index,
+            )
+        else:
+            return T.Fragment(
+                shape,
+                forward_thread_fn=forward_thread_nt,
+                forward_index_fn=forward_index_nt,
+            )
 
     @staticmethod
     def _legalize_to_buffer_region(obj: Buffer | BufferLoad | BufferRegion) -> BufferRegion:

@@ -58,6 +58,11 @@ public:
                               std::function<GlobalVar()> var_supply)
       : device_mod_(device_mod), var_supply_(std::move(var_supply)) {}
 
+  void SetHostGemmTranspose(Optional<Bool> trans_a, Optional<Bool> trans_b) {
+    host_trans_a_ = std::move(trans_a);
+    host_trans_b_ = std::move(trans_b);
+  }
+
   void SetNonRestrictParams(Optional<Array<tir::Var>> params) {
     for (auto param : params.value()) {
       non_restrict_params_.push_back(param);
@@ -166,6 +171,12 @@ private:
                    {tir::attr::kNoAlias, true},
                    {tir::attr::kIsGlobalFunc, true},
                    {tl::attr::kNonRestrictParams, non_restrict_params_}});
+    if (host_trans_a_.defined()) {
+      device_func = WithAttr(std::move(device_func), kDCUGemmTransA, host_trans_a_.value());
+    }
+    if (host_trans_b_.defined()) {
+      device_func = WithAttr(std::move(device_func), kDCUGemmTransB, host_trans_b_.value());
+    }
 
     GlobalVar kernel_symbol_global = var_supply_();
     (*device_mod_)->Add(kernel_symbol_global, device_func);
@@ -194,11 +205,17 @@ private:
   std::function<GlobalVar()> var_supply_;
   // Collect assumes in host side
   Array<const tir::AttrStmtNode *> host_assumes_;
+  Optional<Bool> host_trans_a_;
+  Optional<Bool> host_trans_b_;
 };
 
 tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
                               std::function<GlobalVar()> var_supply) {
   HostDeviceSplitter splitter(device_mod, std::move(var_supply));
+  if (func->attrs.defined()) {
+    splitter.SetHostGemmTranspose(func->attrs.GetAttr<Bool>(kDCUGemmTransA),
+                                func->attrs.GetAttr<Bool>(kDCUGemmTransB));
+  }
   // Propagate non-restrict parameter list from host func to device kernels
   if (auto opt = func->GetAttr<Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
     splitter.SetNonRestrictParams(opt.value());

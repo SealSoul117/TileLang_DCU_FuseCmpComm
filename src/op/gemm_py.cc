@@ -259,23 +259,35 @@ Stmt GemmPyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto global_symbol =
         prim_func->attrs.GetAttr<tvm::ffi::String>("global_symbol");
     ICHECK(global_symbol.has_value());
+    const bool annotate_transpose = TargetIsDCU(T.target) && gemm_inst == GemmInst::KMMAC;
+
+    auto wrap_transpose_attrs = [&](const Stmt& stmt) {
+      if (!annotate_transpose) {
+        return stmt;
+      }
+      Stmt wrapped = stmt;
+      wrapped = AttrStmt(IntImm(DataType::Int(32), 0), kDCUGemmTransAStmt, Bool(transA_), wrapped);
+      wrapped = AttrStmt(IntImm(DataType::Int(32), 0), kDCUGemmTransBStmt, Bool(transB_), wrapped);
+      return wrapped;
+    };
+
     if (prim_func->body.as<BlockRealizeNode>()) {
       BlockRealize block_realize = Downcast<BlockRealize>(prim_func->body);
       auto block = block_realize->block;
       {
         BlockNode *n = block.CopyOnWrite();
         n->name_hint = global_symbol.value();
+        n->body = wrap_transpose_attrs(n->body);
       }
-      return BlockRealize(block_realize->iter_values, block_realize->predicate,
-                          block);
+      return BlockRealize(block_realize->iter_values, block_realize->predicate, block);
     }
-    // warp with block realize node
+    Stmt body = wrap_transpose_attrs(prim_func->body);
     return BlockRealize(
         /*iter_values=*/Array<PrimExpr>(),
         /*predicate=*/const_true(),
         /*block=*/
         Block(/*iter_vars=*/{}, /*reads=*/{}, /*writes=*/{},
-              /*name_hint=*/global_symbol.value(), prim_func->body));
+              /*name_hint=*/global_symbol.value(), body));
   } else {
     LOG(FATAL) << "No lower function found for gemm_py";
     return Stmt(); // This line will never be reached due to LOG(FATAL), but

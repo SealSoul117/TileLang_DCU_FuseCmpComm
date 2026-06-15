@@ -170,6 +170,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    if dcu_async_copy_supported(target):
+        # Capture T.gemm transpose flags before later passes strip AttrStmt annotations.
+        mod = tilelang.transform.AnnotateDCUGemmTranspose()(mod)
 
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
@@ -306,8 +309,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)
 
+        # Device kernels are split out before this point; re-annotate ensures attrs exist on them.
+        mod = tilelang.transform.AnnotateDCUGemmTranspose()(mod)
         mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
-
         # mod = tilelang.transform.InjectADSRead()(mod)
         mod = tilelang.transform.InjectDSRead()(mod)
 
@@ -319,10 +323,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
 
         mod = tilelang.transform.InjectWarpIdx()(mod)
+        # Shadow offset: A uses A-style when !trans_A, B-style when trans_A; symmetric for B.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
-        mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
+        # mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
 
     return mod

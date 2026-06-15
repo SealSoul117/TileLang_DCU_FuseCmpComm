@@ -42,18 +42,17 @@ namespace tl {
 using namespace tir;
 
 /*!
- * \brief Transformer that handles B_local layout transformation with loop optimization
+ * \brief Transformer that handles local layout transformation with loop optimization.
  *
- * This transformer handles two cases:
- * 1. B_local store with outer loop: halve the loop extent and double the offset
- * 2. B_local store without outer loop: just double the offset
+ * Applies when A is transposed (A_local) or B is not transposed (B_local).
  */
-class BLocalLayoutTransformer : public StmtExprMutator {
+class LocalLayoutTransformer : public StmtExprMutator {
  public:
-  explicit BLocalLayoutTransformer(int expand)
-      : expand_(expand) {}
+  explicit LocalLayoutTransformer(const DCUGemmTransposeFlags& flags, int expand)
+      : flags_(flags), expand_(expand) {}
 
  private:
+  DCUGemmTransposeFlags flags_;
   int expand_;
 
   Stmt VisitStmt_(const ForNode* op) final {
@@ -70,7 +69,7 @@ class BLocalLayoutTransformer : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    if (!IsBLocal(store->buffer)) {
+    if (!IsTargetLocal(store->buffer)) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
@@ -91,9 +90,8 @@ class BLocalLayoutTransformer : public StmtExprMutator {
     return new_for;
   }
 
-  bool IsBLocal(const Buffer& buffer) {
-    std::string name = buffer->name;
-    return name.find("B_local") != std::string::npos;
+  bool IsTargetLocal(const Buffer& buffer) {
+    return NeedsDCULocalLayoutDSRead(flags_, buffer->name);
   }
   PrimExpr UpdateIndexBase(PrimExpr base, const Var& loop_var, int expand) {
       if (const auto* add = base.as<AddNode>()) {
@@ -135,8 +133,9 @@ class BLocalLayoutTransformer : public StmtExprMutator {
 };
 
 
-Stmt InjectBLocalLayoutTransformPass(Stmt stmt, int expand) {
-  return BLocalLayoutTransformer(expand)(std::move(stmt));
+Stmt InjectLocalLayoutTransformPass(Stmt stmt, const DCUGemmTransposeFlags& flags,
+                                    int expand) {
+  return LocalLayoutTransformer(flags, expand)(std::move(stmt));
 }
 
 
@@ -144,15 +143,18 @@ using namespace tir::transform;
 
 tvm::transform::Pass InjectBLocalLayoutTransform() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    // Only apply to DCU targets
-    if (!IsDCUTarget(m)) {
-      std::cout << "[DEBUG InjectBLocalLayoutTransform] Not a DCU target, skipping" << std::endl;
-      return f;
-    }
-
-    auto* n = f.CopyOnWrite();
-    n->body = InjectBLocalLayoutTransformPass(n->body, 2);
+  if (!IsDCUTarget(m)) {
     return f;
+  }
+
+  DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(f);
+  if (!flags.defined || (!flags.trans_a && flags.trans_b)) {
+    return f;
+  }
+
+  auto* n = f.CopyOnWrite();
+  n->body = InjectLocalLayoutTransformPass(n->body, flags, 2);
+  return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectBLocalLayoutTransform", {});
 }

@@ -127,6 +127,11 @@ tvm::transform::Pass InjectADSRead() {
       return f;
     }
 
+    DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(f);
+    if (!NeedsDCUADSRead(flags)) {
+      return f;
+    }
+
     auto* n = f.CopyOnWrite();
     n->body = ADSReadInjector()(n->body);
     return f;

@@ -244,5 +244,47 @@ std::vector<const ForNode*> CollectDCUMainLoops(const Stmt& stmt) {
   return collector.loops;
 }
 
+DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const PrimFunc& func) {
+  DCUGemmTransposeFlags flags;
+  if (!func->attrs.defined()) {
+    return flags;
+  }
+  if (auto trans_a = func->attrs.GetAttr<Bool>(kDCUGemmTransA)) {
+    flags.trans_a = trans_a.value()->value;
+    flags.defined = true;
+  }
+  if (auto trans_b = func->attrs.GetAttr<Bool>(kDCUGemmTransB)) {
+    flags.trans_b = trans_b.value()->value;
+    flags.defined = true;
+  }
+  return flags;
+}
+
+bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
+                               const std::string& buffer_name) {
+  if (!flags.defined) {
+    return false;
+  }
+  if (flags.trans_a && buffer_name.find("A_local") != std::string::npos) {
+    return true;
+  }
+  if (!flags.trans_b && buffer_name.find("B_local") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
+bool NeedsDCUADSRead(const DCUGemmTransposeFlags& flags) {
+  return flags.defined && !flags.trans_a;
+}
+
+bool NeedsDCUAsyncCopyIdxenA(const DCUGemmTransposeFlags& flags) {
+  return flags.defined && !flags.trans_a;
+}
+
+bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags) {
+  return flags.defined && flags.trans_b;
+}
+
 }  // namespace tl
 }  // namespace tvm

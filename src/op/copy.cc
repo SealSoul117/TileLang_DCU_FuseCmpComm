@@ -439,7 +439,6 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
 
   PrimExpr i_mapped = part1 + part2 + part3;
   i_mapped = analyzer->Simplify(i_mapped);
-  LOG(INFO) << "i_raw: " << i_raw << ", i_mapped: " << i_mapped;
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
   // 我们手动替换第一个非 unit 维度的变量

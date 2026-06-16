@@ -340,18 +340,8 @@ def shared_to_local_layout_B_wrap(row, col, idx, warp_cols, warp_n, block_col_wa
     return new_row, new_col
 
 def shared_16x16_to_local_64x4_layout_A(i, j):
-    # i: row (0-15), j: column (0-15)
-    # thread_id: which thread handles this position
-    # local_id: which element within the thread's 4-element vector
-    #
-    # Layout :
-    #   j=0-3      j=4-7      j=8-11     j=12-15
-    #   T0-T3      T16-T19    T32-T35    T48-T51   (i=0)
-    #   T4-T7      T20-T23    T36-T39    T52-T55   (i=1)
-    #   T8-T11     T24-T27    T40-T43    T56-T59   (i=2)
-    #   T12-T15    T28-T31    T44-T47    T60-T63   (i=3)
-    thread_id = i + 16 * (j // 4)  # 0-63
-    local_id = j % 4                # 0-3: 4 consecutive elements per thread
+    thread_id = i + 16 * (j // 4)
+    local_id = j % 4
     return thread_id, local_id
 
 def thread_id_shared_access_64x4_to_16x16_layout_A(tx, local_id):

@@ -88,11 +88,11 @@ struct GemmDimInfo {
   int b_elem_bytes{1};
 };
 
-std::optional<int64_t> ExtractKDimFromBuffer(const Buffer& buffer, bool transposed) {
+std::optional<int64_t> ExtractKDimFromBuffer(const Buffer& buffer, bool transposed, bool is_a = true) {
   if (buffer->shape.size() != 2) {
     return std::nullopt;
   }
-  const int k_axis = transposed ? 0 : 1;
+  const int k_axis = (transposed == is_a) ? 0 : 1;
   if (const auto* imm = buffer->shape[k_axis].as<IntImmNode>()) {
     return imm->value;
   }
@@ -112,7 +112,7 @@ class GemmDimCollector : public StmtExprVisitor {
       }
     } else if (IsBBufferName(op->buffer->name)) {
       info.b_elem_bytes = op->buffer->dtype.bytes();
-      if (auto k_dim = ExtractKDimFromBuffer(op->buffer, /*transposed=*/true)) {
+      if (auto k_dim = ExtractKDimFromBuffer(op->buffer, /*transposed=*/true, false)) {
         info.b_k_dim = k_dim;
       }
     }
@@ -144,7 +144,7 @@ void FillGemmDimInfoFromBufferMap(const PrimFunc& func, bool trans_a, bool trans
       }
     } else if (IsBBufferName(buffer->name)) {
       info->b_elem_bytes = buffer->dtype.bytes();
-      if (auto k_dim = ExtractKDimFromBuffer(buffer, trans_b)) {
+      if (auto k_dim = ExtractKDimFromBuffer(buffer, trans_b, false)) {
         info->b_k_dim = k_dim;
       }
     }
@@ -156,6 +156,7 @@ struct IdxenMatrixParams {
   int64_t k_dim{0};
   int64_t tile_width{0};
   int struct_bit{0};
+  int elem_bytes{0};
   std::unordered_set<const VarNode*> dcu_res_vars;
 };
 
@@ -254,6 +255,7 @@ IdxenMatrixParams BuildMatrixParams(bool enabled, int64_t k_dim, int elem_bytes,
   params.k_dim = k_dim;
   params.struct_bit = StructBitFromTileWidth(TileWidthFromK(k_stride_bytes));
   params.tile_width = TileWidthFromK(k_dim);
+  params.elem_bytes = elem_bytes;
   return params;
 }
 
@@ -303,7 +305,7 @@ class IdxenInjector : public StmtExprMutator {
 
       idxen = analyzer_.Simplify(idxen);
       offset_rest = analyzer_.Simplify(offset_rest);
-      const int64_t k_residual = params.k_dim - params.tile_width;
+      const int64_t k_residual = params.k_dim - params.tile_width / params.elem_bytes;
       PrimExpr new_offset =
           analyzer_.Simplify(idxen * make_const(base.dtype(), k_residual) + offset_rest);
       return {new_offset, idxen};

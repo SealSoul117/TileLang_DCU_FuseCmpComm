@@ -1,6 +1,7 @@
 from __future__ import annotations
 from tilelang import tvm as tvm
 import tilelang.language as T
+from typing import Literal, Callable
 from tvm import DataType
 from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion, BufferLoad
 from tvm.runtime import convert
@@ -473,7 +474,135 @@ class MatrixCoreIntrinEmitter:
             if is_global
             else _warp_stmatrix_shared(C_local_buf, C_buf, thread_binding)
         )
+    
+    def make_mmac_load_layout(self, local_buf: Buffer, matrix: Literal["A", "B"] = "A") -> T.Fragment:
+        """
+        Create a layout function for storing MFMA results into a fragment buffer.
 
+        Parameters
+        ----------
+        local_buf : tir.Buffer
+            The local buffer representing a fragment of a matrix.
+
+        Returns
+        -------
+        T.Fragment
+            A fragment object that describes how threads and indices
+            in `local_buf` are laid out.
+
+        Raises
+        ------
+        AssertionError
+            If `local_buf` is not detected to be a fragment buffer.
+        """
+        from tilelang.utils import is_fragment
+
+        assert matrix in ["A", "B"], "matrix should be either A or B"
+        matrix_is_a: bool = matrix == "A"
+        matrix_is_b: bool = matrix == "B"
+        transposed = self.a_transposed if matrix_is_a else self.b_transposed
+
+        # s represents spatial axis
+        # r represents reduction axis
+        # sr represents the two dims are spatial + reduction
+        # rs represents the two dims are reduction + spatial
+        # sr also can represent a non-transposed basic layout
+        # then rs also can represent a transposed basic layout
+        transform_func_sr_a: Callable = None
+        transform_func_sr_b: Callable = None
+
+        k_dim = self.k_dim * self.k_pack
+
+        if k_dim == 4:
+            transform_func_sr_a = shared_16x4_to_local_64x1_layout_A
+            transform_func_sr_b = shared_16x4_to_local_64x1_layout_A
+        elif k_dim == 16:
+            transform_func_sr_a = shared_16x16_to_local_64x4_layout_A
+            transform_func_sr_b = shared_16x16_to_local_64x4_layout_A
+        elif k_dim == 32:
+            transform_func_sr_a = shared_16x32_to_local_64x8_layout_A
+            transform_func_sr_b = shared_16x32_to_local_64x8_layout_A
+        elif k_dim == 64:
+            transform_func_sr_a = shared_16x64_to_local_64x16_layout_A
+            transform_func_sr_b = shared_16x64_to_local_64x16_layout_A
+        else:
+            raise ValueError("k_dim must be 4 or 16 or 32 or 64 currently")
+
+        is_sr_conditions = [False]
+        is_sr_conditions.append(matrix_is_a and not transposed)
+        is_sr_conditions.append(matrix_is_b and transposed)
+        is_sr_axis_order = any(is_sr_conditions)
+
+        transform_func: Callable = None
+        if matrix_is_a:
+            transform_func = transform_func_sr_a if is_sr_axis_order else lambda i, j: transform_func_sr_a(j, i)
+        elif matrix_is_b:
+            transform_func = transform_func_sr_b if is_sr_axis_order else lambda i, j: transform_func_sr_b(j, i)
+        else:
+            raise ValueError(f"Unsupported matrix {matrix}")
+
+        assert is_fragment(local_buf), f"local_buf must be a fragment, but got {local_buf.scope()}"
+
+        if matrix_is_a:
+            micro_size_s, micro_size_r = self.micro_size_x, self.micro_size_k
+        else:
+            micro_size_r, micro_size_s = self.micro_size_k, self.micro_size_y
+
+        block_row_warps, block_col_warps = (
+            self.block_row_warps,
+            self.block_col_warps,
+        )
+
+        inverse_mmac_load_layout = IndexMap.from_func(transform_func, index_dtype=T.int32)
+
+        def forward_thread(i: int, j: int) -> int:
+            """
+            Given the row index `i` and column index `j` in the fragment,
+            """
+            lane_id, _ = inverse_mmac_load_layout.map_indices([i, j])
+            return lane_id
+
+        def forward_index(i: int, j: int) -> int:
+            """
+            Given the row index `i` and column index `j` in the fragment,
+            """
+            _, local_id = inverse_mmac_load_layout.map_indices([i, j])
+            return local_id
+
+        base_fragment = T.Fragment(
+            [micro_size_s, micro_size_r * self.k_pack] if is_sr_axis_order else [micro_size_r * self.k_pack, micro_size_s],
+            forward_thread_fn=forward_thread,
+            forward_index_fn=forward_index,
+        )
+
+        warp_rows, warp_cols = self.warp_rows, self.warp_cols
+        chunk = self.chunk
+
+        warp_s = warp_rows if matrix_is_a else warp_cols
+        warp_r = chunk // (micro_size_r * self.k_pack)
+        block_s = block_row_warps if matrix_is_a else block_col_warps
+        replicate = block_col_warps if matrix_is_a else block_row_warps
+
+        if is_sr_axis_order:
+            warp_fragment = base_fragment.repeat([warp_s, warp_r], repeat_on_thread=False, lower_dim_first=False)
+            if matrix_is_a:
+                block_fragment = warp_fragment.repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
+            elif matrix_is_b:
+                block_fragment = warp_fragment.replicate(replicate).repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True)
+            else:
+                raise ValueError(f"Unsupported matrix type {matrix}")
+        else:
+            warp_fragment = base_fragment.repeat([warp_r, warp_s], repeat_on_thread=False, lower_dim_first=True)
+            if matrix_is_a:
+                block_fragment = warp_fragment.repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
+            elif matrix_is_b:
+                block_fragment = warp_fragment.replicate(replicate).repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True)
+            else:
+                raise ValueError(f"Unsupported matrix type {matrix}")
+
+        return block_fragment
+    
+    
     def make_mmac_store_layout(self, local_buf: Buffer) -> T.Fragment:
         """
         Create a layout function for storing MMAC results into a fragment buffer.

@@ -27,9 +27,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    M = 19200
-    N = 5120
-    K = 5120
+    M = 2048
+    N = 2048
+    K = 10240
     kernel = matmul(M, N, K, 256, 256, 16)
 
     import torch

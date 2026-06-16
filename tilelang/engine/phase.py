@@ -325,9 +325,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectWarpIdx()(mod)
         # Shadow offset: A uses A-style when !trans_A, B-style when trans_A; symmetric for B.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
+        print(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
-        # mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
+        mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
 
     return mod

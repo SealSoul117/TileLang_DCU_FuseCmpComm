@@ -58,7 +58,7 @@ constexpr int64_t kMaxTileWidth = 1LL << 13;
 int64_t LargestPow2LessThan(int64_t k) {
   ICHECK_GT(k, 1);
   int64_t p = 1;
-  while ((p << 1) < k) {
+  while ((p << 1) <= k) {
     p <<= 1;
   }
   return p;
@@ -254,7 +254,7 @@ IdxenMatrixParams BuildMatrixParams(bool enabled, int64_t k_dim, int elem_bytes,
   const int64_t k_stride_bytes = k_dim * elem_bytes;
   params.k_dim = k_dim;
   params.struct_bit = StructBitFromTileWidth(TileWidthFromK(k_stride_bytes));
-  params.tile_width = TileWidthFromK(k_dim);
+  params.tile_width = TileWidthFromK(k_stride_bytes) / elem_bytes;
   params.elem_bytes = elem_bytes;
   return params;
 }
@@ -305,7 +305,7 @@ class IdxenInjector : public StmtExprMutator {
 
       idxen = analyzer_.Simplify(idxen);
       offset_rest = analyzer_.Simplify(offset_rest);
-      const int64_t k_residual = params.k_dim - params.tile_width / params.elem_bytes;
+      const int64_t k_residual = params.k_dim - params.tile_width;
       PrimExpr new_offset =
           analyzer_.Simplify(idxen * make_const(base.dtype(), k_residual) + offset_rest);
       return {new_offset, idxen};

@@ -78,6 +78,21 @@ struct TMAIm2ColDesc {
 };
 
 /*!
+ * \brief Parameters bundled for DCU async copy mapping functions.
+ *
+ * Carries the shared-memory tile dimensions, element data type, and the
+ * pre-computed warp count along the partitioned dimension so that both
+ * row-major and col-major mapping functions receive a single argument.
+ */
+struct DCUAsyncCopyParams {
+  PrimExpr dim0;       // shared buffer shape[0]
+  PrimExpr dim1;       // shared buffer shape[1]
+  DataType dtype;      // element data type
+  PrimExpr warp_m;     // number of warps along the partitioned dimension
+  PrimExpr warp_num;   // total number of warps
+};
+
+/*!
  * \brief Get TVM Op handle for Conv2DIm2Col.
  */
 
@@ -92,6 +107,8 @@ public:
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
   IntImm coalesced_width; // Width (in elements) for coalesced memory access
   Bool disable_tma = Bool(false); // Whether to disable TMA acceleration
+  // 0: row_major, 1: col_major
+  int copy_major = 0;
 
   mutable ParallelOp par_op_; // Optional associated parallelization operator
 
@@ -228,10 +245,11 @@ protected:
    */
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
 
-  For MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const;
+  For MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
+                              const DCUAsyncCopyParams &params) const;
 
-  For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr bn_size,
-                            DataType data_type) const;
+  For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
+                              const DCUAsyncCopyParams &params) const;
 
   /*!
    * \brief Compute linear layout for tma copy.

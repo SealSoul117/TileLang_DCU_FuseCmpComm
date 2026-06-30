@@ -124,15 +124,39 @@ PrimExpr GetScalarOffset(const PrimExpr& offset) {
     return offset;
 }
 
-std::pair<PrimExpr, PrimExpr> SplitSmemOffset(
-    const PrimExpr& offset,
-    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars) {
-    VariableEliminator eliminator(thread_vars);
+class FreeVarCollector : public tvm::tir::ExprVisitor {
+ public:
+  std::unordered_set<const tvm::tir::VarNode*> vars;
+
+  void VisitExpr_(const tvm::tir::VarNode* op) final {
+    vars.insert(op);
+    ExprVisitor::VisitExpr_(op);
+  }
+};
+
+bool IsConstantPrimExpr(const PrimExpr& expr) {
+    FreeVarCollector collector;
+    collector(expr);
+    return collector.vars.empty();
+}
+
+// Split dst offset into runtime offset and compile-time smem template offset.
+// smem_offset must be a simplified constant (no threadIdx / loop vars).
+std::pair<PrimExpr, PrimExpr> SplitSmemOffset(const PrimExpr& offset) {
     tvm::arith::Analyzer analyzer;
     PrimExpr scalar = GetScalarOffset(offset);
+
+    FreeVarCollector collector;
+    collector(scalar);
+
+    VariableEliminator eliminator(collector.vars);
     PrimExpr smem_offset = analyzer.Simplify(eliminator(scalar));
-    PrimExpr thread_part = analyzer.Simplify(scalar - smem_offset);
-    return {GetScalarOffset(thread_part), GetScalarOffset(smem_offset)};
+    PrimExpr runtime_offset = analyzer.Simplify(scalar - smem_offset);
+
+    ICHECK(IsConstantPrimExpr(smem_offset))
+        << "tl.dcu_async_copy smem_offset must be constant, got: " << smem_offset;
+
+    return {GetScalarOffset(runtime_offset), GetScalarOffset(smem_offset)};
 }
 
 CollectResult CollectResources(const Stmt& body) {
@@ -290,17 +314,15 @@ CollectResult CollectResources(const Stmt& body) {
 class StoreReplacer : public StmtExprMutator {
 public:
     static Stmt Run(Stmt body, const std::vector<CopyInfo>& copies,
-                    const std::unordered_map<String, Var>& global_to_var,
-                    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars) {
-        StoreReplacer replacer(copies, global_to_var, thread_vars);
+                    const std::unordered_map<String, Var>& global_to_var) {
+        StoreReplacer replacer(copies, global_to_var);
         return replacer(std::move(body));
     }
 
 private:
     StoreReplacer(const std::vector<CopyInfo>& copies,
-                  const std::unordered_map<String, Var>& global_to_var,
-                  const std::unordered_set<const tvm::tir::VarNode*>& thread_vars)
-        : copies_(copies), global_to_var_(global_to_var), thread_vars_(thread_vars) {}
+                  const std::unordered_map<String, Var>& global_to_var)
+        : copies_(copies), global_to_var_(global_to_var) {}
 
     Stmt VisitStmt_(const AttrStmtNode *attr) {
         if (attr->attr_key == tir::attr::async_scope) {
@@ -320,7 +342,7 @@ private:
                 PrimExpr elem_dtype = MakeElementDTypeArg(copy.dst_buffer->dtype);
                 const int elem_bytes = GetElementBytes(copy.src_buffer->dtype);
                 PrimExpr dst_offset = GetScalarOffset(Flatten(copy.dst_indices));
-                auto [thread_dst_off, smem_offset] = SplitSmemOffset(dst_offset, thread_vars_);
+                auto [thread_dst_off, smem_offset] = SplitSmemOffset(dst_offset);
                 thread_dst_off = ScaleToByteOffset(thread_dst_off, elem_bytes);
                 smem_offset = ScaleToByteOffset(smem_offset, elem_bytes);
                 PrimExpr src_off = GetScalarOffset(Flatten(copy.src_indices));
@@ -329,9 +351,10 @@ private:
                          {dst_res, thread_dst_off, src_res, src_off, smem_offset, elem_dtype}));
 
                 if (copy.predicated) {
-                    Stmt zero_store =
-                        BufferStore(copy.dst_buffer, copy.else_value, copy.dst_indices);
-                    return IfThenElse(copy.predicate, async_copy, zero_store);
+                    // TODO: temporarily disable else branch zero-store
+                    // Stmt zero_store =
+                    //     BufferStore(copy.dst_buffer, copy.else_value, copy.dst_indices);
+                    return IfThenElse(copy.predicate, async_copy);
                 }
                 return async_copy;
             }
@@ -349,7 +372,45 @@ private:
 
     const std::vector<CopyInfo>& copies_;
     const std::unordered_map<String, Var>& global_to_var_;
-    const std::unordered_set<const tvm::tir::VarNode*>& thread_vars_;
+};
+
+class DCUAsyncCopySmemOffsetFixer : public StmtExprMutator {
+ public:
+  static Stmt Run(Stmt body) { return DCUAsyncCopySmemOffsetFixer()(std::move(body)); }
+
+ private:
+  arith::Analyzer analyzer_;
+
+  PrimExpr FixCall(const CallNode* call) {
+    if (!call->op.same_as(Op::Get("tl.dcu_async_copy")) || call->args.size() < 6) {
+      return GetRef<PrimExpr>(call);
+    }
+    PrimExpr smem_off = call->args[4];
+    if (IsConstantPrimExpr(smem_off)) {
+      return GetRef<PrimExpr>(call);
+    }
+
+    PrimExpr total = analyzer_.Simplify(call->args[1] + smem_off);
+    auto [runtime_off, const_off] = SplitSmemOffset(total);
+    Array<PrimExpr> new_args = call->args;
+    new_args.Set(1, runtime_off);
+    new_args.Set(4, const_off);
+    return Call(call->dtype, call->op, new_args);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode* op) final {
+    if (const auto* call = op->value.as<CallNode>()) {
+      PrimExpr fixed = FixCall(call);
+      if (!fixed.same_as(op->value)) {
+        return Evaluate(fixed);
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode* op) final {
+    return FixCall(op);
+  }
 };
 
 Stmt InjectDCUResources(Stmt body,
@@ -378,9 +439,9 @@ PrimFunc LowerSharedGlobalCopy(PrimFunc f) {
 
     Stmt injected = InjectDCUResources(n->body, res.shared_alloc_to_binding);
     
-    Stmt replaced =
-        StoreReplacer::Run(injected, res.copies, res.global_to_res_var, res.thread_vars);
-    
+    Stmt replaced = StoreReplacer::Run(injected, res.copies, res.global_to_res_var);
+    replaced = DCUAsyncCopySmemOffsetFixer::Run(std::move(replaced));
+
     n->body = std::move(replaced);
     
     return GetRef<PrimFunc>(n);

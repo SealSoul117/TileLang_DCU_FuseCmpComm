@@ -205,6 +205,9 @@ public:
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined()) << "LowerTileOpPass: Require the target attribute";
     substituter.target_ = target.value();
+    // Save the original function body before lowering so that
+    // CopyNode::LowerDCUAsyncCopy can inspect nearby T.gemm calls.
+    substituter.func_body_ = f->body;
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = substituter.VisitStmt(f->body);
     fptr->body =
@@ -644,7 +647,7 @@ private:
     }
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr},
+                  layout_map_, buffer_remap_, let_var_to_expr, func_body_},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
@@ -663,6 +666,7 @@ private:
   }
 
   Target target_;
+  Stmt func_body_;  // Original function body, saved before any tile-op lowering
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Layout> layout_remap_;

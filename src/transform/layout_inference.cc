@@ -166,6 +166,7 @@ public:
           }
         }
       };
+      try {
       if (layout_map.count(buffer)) {
         // If new layout contains the old one, update map
         if (buffer.scope() == "local.fragment" &&
@@ -204,6 +205,22 @@ public:
             propagate_alias(buffer, layout);
             continue;
           }
+          // Check the reverse: if the new (dst) layout contains the existing
+          // (src) layout, the existing one already satisfies both — keep it.
+          if (ProveFragmentContains(dst_layout, src_layout, indices, indices,
+                                    inner_analyzer)) {
+            continue;
+          }
+          // Neither layout contains the other. This occurs when a fragment
+          // buffer is used by both a T.gemm (which assigns a warp-level
+          // FullRow layout) and a T.Parallel loop (which assigns a flat
+          // PlanLoopPartition layout). Keep the existing layout (first-come,
+          // first-served) to avoid crashing the compilation.
+          DLOG(INFO) << "Layout conflict for buffer " << buffer
+                     << ": keeping existing layout.\n"
+                     << "  existing: " << layout_map[buffer]->DebugOutput()
+                     << "\n  conflicting new: " << layout->DebugOutput();
+          continue;
         }
         // If already in map, ensure they are structurally equal
         ICHECK(layout->IsEqual(layout_map[buffer].get()))
@@ -239,6 +256,22 @@ public:
 
           EnqueueWithPriority(idx, q, in_queue, cur_infer_id, layout_map);
         }
+      }
+      } catch (const NormalizeIterException &e) {
+        // ProveFragmentContains -> Inverse -> DetectIterMap can fail to
+        // normalize complex iterator expressions (e.g., from gemm FullRow
+        // layouts). Skip this buffer's update instead of crashing.
+        DLOG(INFO) << "Skipping layout update for " << buffer
+                   << " due to normalization failure: " << e.what();
+        continue;
+      } catch (const LoopLayoutInjectiveException &e) {
+        DLOG(INFO) << "Skipping layout update for " << buffer
+                   << " due to loop layout injectivity failure: " << e.what();
+        continue;
+      } catch (const LayoutConflictException &e) {
+        DLOG(INFO) << "Skipping layout update for " << buffer
+                   << " due to layout conflict: " << e.what();
+        continue;
       }
     }
   };

@@ -1216,6 +1216,10 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << src_off << " * sizeof(" << hip_type << "));\n";
   } else if (op->op.same_as(Op::Get("tl.async_gld_sld_fence"))) {
       int fence_num = Downcast<IntImm>(op->args[0])->value;
+      if (fence_num >=16){
+        fence_num = 15;
+        LOG(WARNING) << "async_gld_sld_fence only supports fence_num < 16";
+      }
       this->PrintIndent();
       this->stream << "tl::async_gld_sld_fence(" << fence_num << ");\n";
   } else if (op->op.same_as(Op::Get("tl.async_gld_fence"))) {

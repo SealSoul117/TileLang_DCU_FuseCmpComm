@@ -104,6 +104,23 @@ struct DCUGemmTransposeFlags {
 DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const tir::PrimFunc& func);
 
 /*!
+ * \brief Copy major order collected from T.copy(..., major=...) lowering.
+ *
+ * copy_major values: 0 = row_major, 1 = col_major.
+ */
+struct DCUCopyMajorFlags {
+  int copy_major_a{0};
+  int copy_major_b{0};
+  bool a_defined{false};
+  bool b_defined{false};
+};
+
+/*!
+ * \brief Read DCU async-copy major flags from PrimFunc attrs.
+ */
+DCUCopyMajorFlags GetDCUCopyMajorFlags(const tir::PrimFunc& func);
+
+/*!
  * \brief Whether InjectBLocalLayoutTransform / InjectDSRead should rewrite this local buffer.
  *
  * Layout-transform + ds_read_m32x16 applies when A is transposed (A_local) or B is not
@@ -111,12 +128,6 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const tir::PrimFunc& func);
  */
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags, const std::string& buffer_name);
 
-/*!
- * \brief Whether InjectADSRead should rewrite A_local.
- *
- * ds_read_b64/b128 applies when A is not transposed.
- */
-bool NeedsDCUADSRead(const DCUGemmTransposeFlags& flags);
 
 /*!
  * \brief Whether InjectDCUAsyncCopyIdxen should rewrite A-matrix async copies.

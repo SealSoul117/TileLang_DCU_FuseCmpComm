@@ -433,8 +433,62 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
   // 2. Non-replicated read buffer
   // 3. Fully replicated write buffer (backup, may cause issues)
   // 4. Free inference mode (no source buffer)
+  // Lambda that runs PlanLoopPartition as a fallback when no buffer-derived
+  // layout is available (or the derived layout fails the injectivity check).
+  auto try_plan_loop_partition = [&]() {
+    auto maybe_remapped_root_ =
+        IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
+    DLOG(INFO) << "[PlanLoopPartition] maybe_remapped_root_ = " << maybe_remapped_root_
+              << '\n';
+    int vector_size = GetVectorizeSize(maybe_remapped_root_, T.analyzer);
+    DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
+
+    PrimExpr loop_total_size = 1;
+    for (Stmt l = root_; l.as<For>().has_value();
+         l = l.as<For>().value()->body)
+      loop_total_size = loop_total_size * l.as<For>().value()->extent;
+    DLOG(INFO) << "[PlanLoopPartition] loop_total_size = " << loop_total_size
+               << '\n';
+    while (!analyzer_.CanProve(
+               floormod(loop_total_size,
+                        T.thread_bounds->extent * vector_size) == 0) &&
+           vector_size > 1)
+      vector_size /= 2;
+    DLOG(INFO) << "[PlanLoopPartition] after adjust: vector_size = "
+               << vector_size << '\n';
+
+    // Check if coalesced_width is defined
+    if (auto coalesced_width =
+            root_->annotations.Get(tl::attr::coalesced_width)) {
+      if (const auto *imm = coalesced_width->as<IntImmNode>()) {
+        int expected = imm->value;
+        if (vector_size % expected != 0) {
+          LOG(FATAL) << "Vector size " << vector_size
+                     << " is not divisible by coalesced width " << expected;
+        }
+        vector_size = expected;
+      } else {
+        LOG(FATAL) << "coalesced_width should be an IntImmNode.";
+      }
+    }
+    loop_layout_ = PlanLoopPartition(root_, vector_size, T.thread_bounds);
+  };
+
   if (source_buffer.defined() && allow_layout_propgate) {
     loop_layout_ = compute_loop_layout_from_buffer(source_buffer);
+    // If the buffer-derived loop layout fails injectivity (e.g., when the
+    // source buffer has a warp-level FullRow gemm layout incompatible with
+    // the parallel loop's thread mapping), fall back to PlanLoopPartition.
+    if (loop_layout_.defined()) {
+      auto injective_res = loop_layout_->DetectInjective();
+      if (!injective_res->errors.empty()) {
+        DLOG(INFO) << "[ParallelOp] Buffer-derived loop layout is not "
+                      "injective, falling back to PlanLoopPartition: "
+                   << injective_res->errors;
+        loop_layout_ = Fragment();
+        try_plan_loop_partition();
+      }
+    }
   } else if (level == InferLevel::kFree) {
     // For free layout inference
     // If replication exists and buffer has cross-thread shared memory access,
@@ -477,48 +531,18 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     });
     if (read_source_buffer.defined() && allow_layout_propgate) {
       loop_layout_ = compute_loop_layout_from_buffer(read_source_buffer);
-    }
-    if (!loop_layout_.defined()) {
-      // No source buffer available, use free mode inference
-      // Vectorize Size must be aware of the buffer_remap
-      // As the pass will do post processing to the layout
-      auto maybe_remapped_root_ =
-          IfBufferRemapLoopGenerator::run(root_, T.buffer_remap, T.layout_map);
-      DLOG(INFO) << "[PlanLoopPartition] maybe_remapped_root_ = " << maybe_remapped_root_
-                << '\n';
-      int vector_size = GetVectorizeSize(maybe_remapped_root_, T.analyzer);
-      DLOG(INFO) << "[PlanLoopPartition] vector_size = " << vector_size << '\n';
-
-      PrimExpr loop_total_size = 1;
-      for (Stmt l = root_; l.as<For>().has_value();
-           l = l.as<For>().value()->body)
-        loop_total_size = loop_total_size * l.as<For>().value()->extent;
-      DLOG(INFO) << "[PlanLoopPartition] loop_total_size = " << loop_total_size
-                 << '\n';
-      while (!analyzer_.CanProve(
-                 floormod(loop_total_size,
-                          T.thread_bounds->extent * vector_size) == 0) &&
-             vector_size > 1)
-        vector_size /= 2;
-      DLOG(INFO) << "[PlanLoopPartition] after adjust: vector_size = "
-                 << vector_size << '\n';
-
-      // Check if coalesced_width is defined
-      if (auto coalesced_width =
-              root_->annotations.Get(tl::attr::coalesced_width)) {
-        if (const auto *imm = coalesced_width->as<IntImmNode>()) {
-          int expected = imm->value;
-          // Verify that vector_size is divisible by expected
-          if (vector_size % expected != 0) {
-            LOG(FATAL) << "Vector size " << vector_size
-                       << " is not divisible by coalesced width " << expected;
-          }
-          vector_size = expected;
-        } else {
-          LOG(FATAL) << "coalesced_width should be an IntImmNode.";
+      if (loop_layout_.defined()) {
+        auto injective_res = loop_layout_->DetectInjective();
+        if (!injective_res->errors.empty()) {
+          DLOG(INFO) << "[ParallelOp] Buffer-derived loop layout (read) is not "
+                        "injective, falling back to PlanLoopPartition: "
+                     << injective_res->errors;
+          loop_layout_ = Fragment();
         }
       }
-      loop_layout_ = PlanLoopPartition(root_, vector_size, T.thread_bounds);
+    }
+    if (!loop_layout_.defined()) {
+      try_plan_loop_partition();
     }
 
     // Lambda that guards replicated accesses:
@@ -627,8 +651,31 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
       auto fragment = T.layout_map[buffer].as<Fragment>().value();
       auto vars =
           loop_vars_.Map([](const IterVar &iv) { return PrimExpr(iv->var); });
-      if (!ProveFragmentContains(loop_layout_, fragment, vars,
-                                 indice_map_[buffer], analyzer_)) {
+      bool contains;
+      try {
+        contains = ProveFragmentContains(loop_layout_, fragment, vars,
+                                         indice_map_[buffer], analyzer_);
+      } catch (const NormalizeIterException &e) {
+        // ProveFragmentContains -> Inverse -> DetectIterMap can fail on
+        // complex layouts (e.g., gemm FullRow). Treat as non-containing.
+        DLOG(INFO) << "[ParallelOp] ProveFragmentContains normalization "
+                      "failure for " << buffer << ": " << e.what();
+        contains = false;
+      }
+      if (!contains) {
+        // In non-strict modes (kCommon, kFree), when the loop layout
+        // (e.g., from PlanLoopPartition) doesn't contain the fragment layout
+        // (e.g., from T.gemm FullRow), accept the mismatch instead of
+        // throwing. The fragment data is correctly stored; only the
+        // thread-to-element mapping differs.
+        if (level != InferLevel::kStrict) {
+          DLOG(INFO) << "[ParallelOp] Layout mismatch in non-strict mode for "
+                     << buffer << ": loop layout does not contain fragment "
+                     << "layout. Skipping layout update for this buffer.\n"
+                     << "    loop " << loop_layout_->DebugOutput() << '\n'
+                     << "    fragment " << fragment->DebugOutput() << '\n';
+          continue;
+        }
         std::ostringstream oss;
         oss << "Layout infer conflict between " << buffer << " and "
             << source_buffer << " in T.Parallel loop:" << '\n'

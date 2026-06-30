@@ -63,6 +63,11 @@ public:
     host_trans_b_ = std::move(trans_b);
   }
 
+  void SetHostCopyMajor(Optional<Integer> copy_major_a, Optional<Integer> copy_major_b) {
+    host_copy_major_a_ = std::move(copy_major_a);
+    host_copy_major_b_ = std::move(copy_major_b);
+  }
+
   void SetNonRestrictParams(Optional<Array<tir::Var>> params) {
     for (auto param : params.value()) {
       non_restrict_params_.push_back(param);
@@ -177,6 +182,12 @@ private:
     if (host_trans_b_.defined()) {
       device_func = WithAttr(std::move(device_func), kDCUGemmTransB, host_trans_b_.value());
     }
+    if (host_copy_major_a_.defined()) {
+      device_func = WithAttr(std::move(device_func), kDCUCopyMajorA, host_copy_major_a_.value());
+    }
+    if (host_copy_major_b_.defined()) {
+      device_func = WithAttr(std::move(device_func), kDCUCopyMajorB, host_copy_major_b_.value());
+    }
 
     GlobalVar kernel_symbol_global = var_supply_();
     (*device_mod_)->Add(kernel_symbol_global, device_func);
@@ -207,6 +218,8 @@ private:
   Array<const tir::AttrStmtNode *> host_assumes_;
   Optional<Bool> host_trans_a_;
   Optional<Bool> host_trans_b_;
+  Optional<Integer> host_copy_major_a_;
+  Optional<Integer> host_copy_major_b_;
 };
 
 tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
@@ -215,6 +228,8 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
   if (func->attrs.defined()) {
     splitter.SetHostGemmTranspose(func->attrs.GetAttr<Bool>(kDCUGemmTransA),
                                 func->attrs.GetAttr<Bool>(kDCUGemmTransB));
+    splitter.SetHostCopyMajor(func->attrs.GetAttr<Integer>(kDCUCopyMajorA),
+                              func->attrs.GetAttr<Integer>(kDCUCopyMajorB));
   }
   // Propagate non-restrict parameter list from host func to device kernels
   if (auto opt = func->GetAttr<Array<tir::Var>>(tl::attr::kNonRestrictParams)) {

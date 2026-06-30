@@ -158,7 +158,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
     # Inject assumes to speedup tvm prover
     mod = tilelang.transform.InjectAssumes()(mod)
-    
+
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
     # Set layouts for reducers
@@ -230,14 +230,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.PipelinePlanning()(mod)
         mod = tilelang.transform.RegisterPipelinePlanning()(mod)
 
-
         mod = tilelang.transform.InjectRegisterSoftwarePipeline()(mod)
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
         mod = tilelang.transform.MergeIfStmt()(mod)
+
         if allow_fence_proxy(target=target):
             # in hopper device, wgmma is an async proxy
             # so we need to inject a fence proxy before it
             mod = tilelang.transform.InjectFenceProxy()(mod)
+
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
@@ -248,6 +249,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
+
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tir.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
@@ -255,7 +257,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.RemoveNoOp()(mod)
     mod = tir.transform.RewriteUnsafeSelect()(mod)
     mod = tir.transform.HoistIfThenElse()(mod)
-
     mod = tir.transform.VerifyMemory()(mod)
     mod = tir.transform.AnnotateEntryFunc()(mod)
 
@@ -304,6 +305,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
+
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)
@@ -311,19 +313,13 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         # Device kernels are split out before this point; re-annotate ensures attrs exist on them.
         mod = tilelang.transform.AnnotateDCUGemmTranspose()(mod)
-        mod = tilelang.transform.InjectBLocalLayoutTransform()(mod)
-        # mod = tilelang.transform.InjectADSRead()(mod)
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
         mod = tilelang.transform.InsertAsyncGldFence()(mod)
 
-        
-        # it is unnecessary to insert shared fence after async copy, as the synchronization between async copy and mma is already handled by the hardware with async fence. And inserting shared fence may cause deadlock if there are not enough threads to execute the fence.
-        # mod = tilelang.transform.InsertAsyncGlobal2SharedFence()(mod)
-
         mod = tilelang.transform.InjectWarpIdx()(mod)
-        # Shadow offset: A uses A-style when !trans_A, B-style when trans_A; symmetric for B.
+        # Shadow offset follows T.copy major order (row/col) on A_shared/B_shared.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 

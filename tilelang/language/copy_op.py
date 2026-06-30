@@ -17,6 +17,7 @@ def copy(
     coalesced_width: int | None = None,
     disable_tma: bool = False,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    major: Literal["row_major", "col_major"] | None = None,
 ):
     """Copy data between memory regions.
 
@@ -24,6 +25,8 @@ def copy(
         src (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Source memory region
         dst (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Destination memory region
         coalesced_width (Optional[int], optional): Width for coalesced memory access. Defaults to None.
+        major (Optional[Literal["row_major", "col_major"]], optional): Memory access
+            major order for DCU async copy lowering. Defaults to "row_major".
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -92,7 +95,20 @@ def copy(
         eviction_policy = 0
     else:
         eviction_policy = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}[eviction_policy]
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, coalesced_width, disable_tma, eviction_policy)
+    if major is None:
+        copy_major = 0
+    else:
+        copy_major = {"row_major": 0, "col_major": 1}[major]
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.copy"),
+        src,
+        dst,
+        coalesced_width,
+        disable_tma,
+        eviction_policy,
+        copy_major,
+    )
 
 
 def c2d_im2col(

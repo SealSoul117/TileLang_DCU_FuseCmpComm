@@ -67,6 +67,11 @@ static constexpr const char *kDCUGemmTransB = "tl.dcu_gemm_trans_b";
 // Temporary AttrStmt keys emitted during gemm lowering (merged by AnnotateDCUGemmTranspose).
 static constexpr const char *kDCUGemmTransAStmt = "tl.dcu_gemm_trans_a_stmt";
 static constexpr const char *kDCUGemmTransBStmt = "tl.dcu_gemm_trans_b_stmt";
+// DCU async-copy major order (0: row_major, 1: col_major) from T.copy(..., major=...).
+static constexpr const char *kDCUCopyMajorA = "tl.dcu_copy_major_a";
+static constexpr const char *kDCUCopyMajorB = "tl.dcu_copy_major_b";
+static constexpr const char *kDCUCopyMajorAStmt = "tl.dcu_copy_major_a_stmt";
+static constexpr const char *kDCUCopyMajorBStmt = "tl.dcu_copy_major_b_stmt";
 
 /*!
  * \brief Whether to disable thread storage synchronization

@@ -27,7 +27,9 @@ class GemmMMAC(GemmBase):
             warp_row_tiles=warp_row_tiles,
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
+            block_K=self.K,
             k_pack=self.k_pack,
+
         )
 
         if self.is_gemm_ss():
@@ -122,11 +124,12 @@ class GemmMMAC(GemmBase):
                     )
 
                     # Load B into fragment
-                    mmac_emitter.ldmatrix_b(
-                        B_local,
-                        B_region,
-                        ki,
-                    )
+                    for kj in T.serial(0, self.k_pack):
+                        mmac_emitter.ldmatrix_b(
+                            B_local,
+                            B_region,
+                            kj,
+                        )
 
                     # Perform Matrix Multiplication
                     mmac_emitter.mmac(A_local, B_local, C_buf, ki)

@@ -717,13 +717,9 @@ private:
       }
     }
 
-    // Finally, make the pipeline annotation
-    Map<String, Any> annotations;
-    for (const auto &[key, value] : loop->annotations) {
-      if (key != "num_stages") {
-        annotations.Set(key, value);
-      }
-    }
+    // Finally, make the pipeline annotation. Keep num_stages so downstream
+    // InjectSoftwarePipeline can size shared-memory banks (see use-def cap there).
+    Map<String, Any> annotations(loop->annotations);
     if (register_pipeline_enabled && !loop->annotations.count("num_register_stages")) {
       annotations.Set("num_register_stages", Integer(2));
     }

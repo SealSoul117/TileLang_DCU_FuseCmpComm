@@ -560,6 +560,12 @@ public:
             IsSharedPipelineBuffer(canonical) && pipeline_num_stages_ > 1) {
           num_versions = std::max(num_versions, pipeline_num_stages_);
         }
+        // Register-pipeline planning may place compute at stage == num_stages so
+        // the prologue prefetches enough tiles; use-def+1 then over-estimates
+        // shared banks by one (e.g. 5 banks for num_stages=4).
+        if (IsSharedPipelineBuffer(canonical) && pipeline_num_stages_ > 0) {
+          num_versions = std::min(num_versions, pipeline_num_stages_);
+        }
       } else if (stage_attr_key_ == "tl_register_pipeline_stage" &&
                  IsRegisterPipelineLocalBuffer(buffer) &&
                  register_pipeline_min_versions_ >= 2) {

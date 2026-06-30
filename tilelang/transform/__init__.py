@@ -377,9 +377,9 @@ def InjectDCUAsyncCopyShadowAddr():
     high shadow bits onto ``buf_dyn_shmem``, then replaces the first argument of
     ``tl.dcu_async_copy`` with the corresponding shadow address.
 
-    Shadow offset style follows T.gemm transpose flags (via ``AnnotateDCUGemmTranspose``):
-    - A: A-style when A is not transposed, B-style when A is transposed
-    - B: B-style when B is not transposed, A-style when B is transposed
+    Shadow offset style follows T.copy ``major`` (via ``AnnotateDCUGemmTranspose``):
+    - row_major (half_t): ``(warp_idx & 3) << 16``
+    - col_major (half_t): ``(warp_idx & 1) << 18``
 
     Returns
     -------
@@ -437,45 +437,6 @@ def InjectDSRead():
         The result pass
     """
     return _ffi_api.InjectDSRead()  # type: ignore
-
-
-def InjectADSRead():
-    """Rewrite A_local shared-to-register loads using ds_read_b64/b128 on DCU.
-
-    This pass replaces A_local BufferStore from A_shared with ds_read_b64 or
-    ds_read_b128 hardware instructions for AMD DCU (gfx936, gfx942, etc.).
-
-    - ds_read_b64: loads 8 bytes at once (e.g. 8 int8 or 4 half elements)
-    - ds_read_b128: loads 16 bytes at once (e.g. 4 float elements)
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.InjectADSRead()  # type: ignore
-
-
-def InjectBLocalLayoutTransform():
-    """Transform local register layout from shared thread-interleaved to row-major.
-
-    On DCU, this pass handles A_local when A is transposed, or B_local when B is not
-    transposed. It prepares the buffer stores for ds_read_m32x16_b16 injection.
-    - Shared Memory Layout (per thread in warp, 16 elements):
-        Thread 0: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15]
-        Thread 1: [16,17,18,...                        ,31       ]
-        ...
-    - Local Register Layout (16x32, row-major):
-        Row 0: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 0, 1,...]
-        Row 1: [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 0, 1,...]
-        ...
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.InjectBLocalLayoutTransform()  # type: ignore
 
 
 def LowerDeviceStorageAccessInfo():
@@ -642,7 +603,9 @@ def VectorizeSharedLocalCopy():
     For nested loops such as ``for i, local_id in T.grid(4, 2)`` where both the
     local and shared indices advance by ``local_id * lanes`` with a contiguous
     ramp load, this pass eliminates the inner loop and widens the vector load up
-    to 16 bytes (e.g. 8 half or 16 int8 elements).
+    to 16 bytes (e.g. 8 half or 16 int8 elements). Shared indices wrapped in
+    ``floormod(base + local_id * lanes, mod)`` are also merged when the mod
+    residue stays within one tile (e.g. DCU swizzled bases aligned to 8 elements).
 
     Returns
     -------
@@ -667,11 +630,6 @@ def RegisterPipelinePlanning():
 def InsertAsyncMMAFence():
     """InsertAsyncMMAFence"""
     return _ffi_api.InsertAsyncMMAFence()  # type: ignore
-
-
-def InsertAsyncGlobal2SharedFence():
-    """InsertAsyncGlobal2SharedFence"""
-    return _ffi_api.InsertAsyncGlobal2SharedFence()  # type: ignore
 
 
 def InsertAsyncGldFence():

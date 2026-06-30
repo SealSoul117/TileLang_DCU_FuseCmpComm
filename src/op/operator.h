@@ -42,6 +42,10 @@ struct LowerArgs {
   // Map from LetStmt variable to its bound expression, for resolving
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
+  // Original function body (before any tile-op lowering), used by
+  // CopyNode::LowerDCUAsyncCopy to locate the nearest T.gemm and
+  // compute the correct warp partition (m_warp / n_warp).
+  Optional<Stmt> func_body;
 };
 
 struct LayoutInferArgs {

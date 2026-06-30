@@ -21,11 +21,13 @@
 #include "../target/cuda.h"
 #include "../target/utils.h"
 #include "builtin.h"
+#include "gemm.h"
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
+#include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
-
+using tvm::ffi::GetRef;
 namespace tvm {
 namespace tl {
 
@@ -116,7 +118,8 @@ template <typename T> static Array<T> ReverseArray(Array<T> array) {
  * reads optional arguments:
  * - args[2] (IntImm): coalesced width (stored only if > 0),
  * - args[3] (Bool): disable TMA lowering flag,
- * - args[4] (IntImm): eviction policy.
+ * - args[4] (IntImm): eviction policy,
+ * - args[5] (IntImm): copy major (0: row_major, 1: col_major).
  *
  * Preconditions:
  * - `args` must contain at least two region-compatible PrimExpr entries
@@ -152,6 +155,9 @@ Copy::Copy(Array<PrimExpr> args) {
   }
   if (args.size() >= 5) {
     node->eviction_policy = args[4].as<IntImmNode>()->value;
+  }
+  if (args.size() >= 6) {
+    node->copy_major = Downcast<IntImm>(args[5])->value;
   }
   data_ = std::move(node);
 }
@@ -418,26 +424,52 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 }
 
 
-For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_num) const {
+For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
+                                      const DCUAsyncCopyParams &params) const {
   Array<IterVar> loop_vars = MakeIterVars();
   for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+  PrimExpr i_raw = loop_vars[0]->var;
+
+  // 从 params 中提取出编译期常量
+  int dim0 = params.dim0.as<IntImmNode>()->value;
+  int dim1 = params.dim1.as<IntImmNode>()->value;
+  int elem_bytes = params.dtype.bytes();
 
   // 参数定义
-  int pattern_thread_num = 4;
+  int slab_size = 1024;
+  int bank_size = 128;
+  int k_dim = dim1 >= 32 ? 32 : dim1;
+  int row_per_slab = slab_size / elem_bytes / k_dim;
+  int row_per_bank = bank_size / elem_bytes / k_dim;
+  int slab4_num = dim0 / (4 * row_per_slab);
   
+
+  PrimExpr part1 = floormod(i_raw, row_per_bank);
+  PrimExpr part2 = floordiv(floormod(i_raw, 4), row_per_bank) * 8;
+  PrimExpr part3 = floordiv(floormod(i_raw, row_per_slab), 4) * 16 * slab4_num;
+  PrimExpr part4 = floordiv(floormod(i_raw, 4 * row_per_slab), row_per_slab) * row_per_bank;
+  PrimExpr part5 = floordiv(i_raw, 4 * row_per_slab) * 16;
+
+  // PrimExpr part2 = floordiv(floormod(i_raw, 4 * row_per_bank), row_per_bank) * row_per_slab;
+  // PrimExpr part3 = floordiv(floormod(i_raw, 16), 4 * row_per_bank) * 2;
+  // PrimExpr part4 = floordiv(floormod(i_raw, slab4_num * 16), 16) * 4 * row_per_slab;
+  // PrimExpr part5 = floordiv(i_raw, slab4_num * 16) * 4;
+
+  // int pattern_thread_num = 4;
+
   // 假设第一个维度 loop_vars[0] 是我们要变换的 i
-  PrimExpr i_raw = loop_vars[0]->var;
-  DataType dtype = i_raw.dtype();
-  // 计算映射后的 i (i_mapped)
-  PrimExpr p_t_num_expr = make_const(i_raw.dtype(), pattern_thread_num);
 
-  // 使用 floordiv 和 floormod 代替运算符
-  // 公式: [(i // (P * L)) % warp_num] * warp_size + [i // (P * L * warp_num)] * pattern_thread_num + [i // L % P]
-  PrimExpr part1 = floormod(floordiv(i_raw, p_t_num_expr), warp_num) * p_t_num_expr * warp_num;
-  PrimExpr part2 = floordiv(i_raw, p_t_num_expr * warp_num) * p_t_num_expr;
-  PrimExpr part3 = floormod(i_raw, pattern_thread_num);
+  // DataType dtype = i_raw.dtype();
+  // // 计算映射后的 i (i_mapped)
+  // PrimExpr p_t_num_expr = make_const(i_raw.dtype(), pattern_thread_num);
 
-  PrimExpr i_mapped = part1 + part2 + part3;
+  // // 使用 floordiv 和 floormod 代替运算符
+  // // 公式: [(i // (P * L)) % warp_m] * warp_size + [i // (P * L * warp_m)] * pattern_thread_num + [i // L % P]
+  // PrimExpr part1 = floormod(floordiv(i_raw, p_t_num_expr), params.warp_m) * p_t_num_expr * params.warp_m;
+  // PrimExpr part2 = floordiv(i_raw, p_t_num_expr * params.warp_m) * p_t_num_expr;
+  // PrimExpr part3 = floormod(i_raw, pattern_thread_num);
+
+  PrimExpr i_mapped = part1 + part2 + part3 + part4 + part5;
   i_mapped = analyzer->Simplify(i_mapped);
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
@@ -475,22 +507,59 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr warp_n
   return Downcast<For>(body);
 }
 
-For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr bn_size,
-                                    DataType data_type) const {
+For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
+                                      const DCUAsyncCopyParams &params) const {
   Array<IterVar> loop_vars = MakeIterVars();
   for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
 
+  // 从 params 中提取出编译期常量
+  int dim0 = params.dim0.as<IntImmNode>()->value;
+  int dim1 = params.dim1.as<IntImmNode>()->value;
+  int elem_bytes = params.dtype.bytes();
+
   PrimExpr i_raw = loop_vars[0]->var;
-  PrimExpr r = floordiv(make_const(i_raw.dtype(), 1024 / data_type.bytes()), bn_size);
-  PrimExpr n = make_const(i_raw.dtype(), 4 / data_type.bytes());
+  PrimExpr r = floordiv(make_const(i_raw.dtype(), 1024 / elem_bytes), dim1);
+  PrimExpr n = make_const(i_raw.dtype(), 4 / elem_bytes);
   PrimExpr rn = r * n;
+  PrimExpr i_mapped;
+  
+  int slab_size = 1024;
+  int row_per_slab = slab_size / elem_bytes / dim1;
+  
+  PrimExpr part1 = floormod(i_raw, row_per_slab) * 2;
+  PrimExpr part2 = floormod(floordiv(i_raw, row_per_slab), 2);
+  PrimExpr part3 = floordiv(i_raw, 2 * row_per_slab) * 2 * row_per_slab;
 
-  PrimExpr part1 = floormod(i_raw, n) * r;
-  PrimExpr part2 = floordiv(floormod(i_raw, rn), n);
-  PrimExpr part3 = floordiv(i_raw, rn) * rn;
-
-  PrimExpr i_mapped = part1 + part2 + part3;
+  i_mapped = part1 + part2 + part3;
   i_mapped = analyzer->Simplify(i_mapped);
+
+  if (dim0 > 16){
+    PrimExpr part4 = floormod(i_mapped, 4);
+    PrimExpr part5 = floordiv(floormod(i_mapped, 16), 4) * 8;
+    PrimExpr part6 = floordiv(i_mapped, 16) * 4;
+    i_mapped = part4 + part5 + part6;
+    i_mapped = analyzer->Simplify(i_mapped);
+  }
+  
+  // if (dim0 == 16){
+  //   PrimExpr part1 = floormod(i_raw, n) * r;
+  //   PrimExpr part2 = floordiv(floormod(i_raw, rn), n);
+  //   PrimExpr part3 = floordiv(i_raw, rn) * rn;
+
+  //   i_mapped = part1 + part2 + part3;
+  // } 
+  //else{
+    
+  //   int half_dim0 = dim0 / 2;
+  //   PrimExpr part1 = floormod(floordiv(i_raw, 4), 2);
+  //   PrimExpr part2 = floormod(i_raw, 2) * 2;
+  //   PrimExpr part3 = floordiv(i_raw, half_dim0) * 4;
+  //   PrimExpr part4 = floormod(floordiv(i_raw, 2), 2) * 8;
+  //   PrimExpr part5 = floormod(floordiv(i_raw, 8), 2) * half_dim0;
+  //   i_mapped = part1 + part2 + part3 + part4 + part5;
+  // }
+                                      
+
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
   // 我们手动替换第一个非 unit 维度的变量
@@ -508,7 +577,6 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer, PrimExpr bn_siz
       idx_in_vars++;
     }
   }
-
   // dst_indices 保持正常的一一映射
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
@@ -1116,28 +1184,140 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
   return vectorized_thread_loop;
 }
 
+/*!
+ * \brief Search the original function body for a T.gemm call whose A or B
+ * buffer matches \p shared_buffer, then compute the warp partition to
+ * determine the number of warps along the relevant dimension.
+ *
+ * During DCU GEMM lowering, copies from global to shared.dyn happen before
+ * the gemm itself.  This helper inspects the (still-unlowered) function body
+ * to find the nearest T.gemm that consumes \p shared_buffer and returns the
+ * warp count along the dimension that this buffer is partitioned across:
+ *   - A matrix (M×K): returns m_warp
+ *   - B matrix (K×N): returns n_warp
+ *
+ * \param func_body  The original function body, saved before any tile-op
+ *                   lowering started.
+ * \param shared_buffer  The shared.dyn destination buffer of the copy.
+ * \param thread_bounds  The thread extent range.
+ * \param target         The compilation target.
+ * \return The warp count (m_warp or n_warp), or \p NullOpt if no matching
+ *         T.gemm is found.
+ */
+static Optional<int> ComputeWarpNForDCUAsyncCopy(
+    const Stmt &func_body,
+    const Buffer &shared_buffer,
+    const Range &thread_bounds,
+    const Target &target) {
+  if (!func_body.defined()) return Optional<int>();
+
+  // Collect all gemm calls from the original (unlowered) function body
+  struct GemmCollector : public StmtExprVisitor {
+    struct Info {
+      Buffer a_buffer;
+      Buffer b_buffer;
+      int M{0};
+      int N{0};
+      int policy_type{0};
+    };
+    std::vector<Info> infos;
+
+   private:
+    void VisitExpr_(const CallNode *op) final {
+      static const Op &gemm_op = Op::Get("tl.tileop.gemm");
+      static const Op &gemm_py_op = Op::Get("tl.tileop.gemm_py");
+      if ((op->op.same_as(gemm_op) || op->op.same_as(gemm_py_op)) && op->args.size() >= 9) {
+        Info info;
+        info.a_buffer = NormalizeToBufferRegion(op->args[0])->buffer;
+        info.b_buffer = NormalizeToBufferRegion(op->args[1])->buffer;
+        info.M = op->args[5].as<IntImmNode>()->value;
+        info.N = op->args[6].as<IntImmNode>()->value;
+        info.policy_type = op->args[8].as<IntImmNode>()->value;
+        infos.push_back(info);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+
+  GemmCollector collector;
+  collector(func_body);
+
+
+  for (const auto &info : collector.infos) {
+    // Exact match by buffer data variable
+    bool is_a = shared_buffer->data.same_as(info.a_buffer->data);
+    bool is_b = shared_buffer->data.same_as(info.b_buffer->data);
+    // Fallback: match by buffer name (handles double-buffering / remap)
+    if (!is_a && !is_b) {
+      is_a = (shared_buffer->name == info.a_buffer->name);
+      is_b = (shared_buffer->name == info.b_buffer->name);
+    }
+
+    if (is_a || is_b) {
+      int block_size = 0;
+      if (auto *imm = thread_bounds->extent.as<IntImmNode>()) {
+        block_size = imm->value;
+      }
+      if (block_size == 0) return Optional<int>();
+
+      GemmWarpPolicy policy(info.policy_type);
+      auto [m_warp, n_warp] = policy->computeWarpPartition(
+          info.M, info.N, block_size, target, GemmInst::KMMAC);
+
+      return is_a ? m_warp : n_warp;
+    }
+  }
+
+  return Optional<int>();
+}
+
 Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
                                  arith::Analyzer *analyzer) const {
   PrimExpr total_threads = T.thread_bounds->extent;
   PrimExpr warp_size_expr = make_const(total_threads.dtype(), 64);
-  // 使用 analyzer->Simplify 确保结果尽可能是一个常数
-  PrimExpr warp_num = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
-  // 安全起见，防止某些极端 case 下 total_threads < 64
+
+  // Compute the correct warp_m by inspecting the nearest T.gemm in the
+  // original (unlowered) function body.  For A-matrix shared buffers this
+  // is m_warp; for B-matrix it is n_warp.  Falls back to total_threads/64
+  // when no matching gemm can be found.
+  PrimExpr warp_m;
+  if (T.func_body.defined()) {
+    auto computed = ComputeWarpNForDCUAsyncCopy(
+        T.func_body.value(), dst, T.thread_bounds, T.target);
+    if (computed.has_value()) {
+      warp_m = make_const(total_threads.dtype(), computed.value());
+    } else {
+      warp_m = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
+    }
+  }
+
+ PrimExpr warp_num = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
+  
   warp_num = Max(warp_num, make_const(warp_num.dtype(), 1));
+
   // 直接生成针对 DCU 优化的 SIMT 循环
   Stmt simt_loop;
   if (dst->shape.size() == 2)
   {
-      if (analyzer->CanProve(dst->shape[0] >= dst->shape[1])) {
-          simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, warp_num);
+      DCUAsyncCopyParams copy_params;
+      copy_params.dim0 = dst->shape[0];
+      copy_params.dim1 = dst->shape[1];
+      copy_params.dtype = dst->dtype;
+      copy_params.warp_m = warp_m;
+      copy_params.warp_num = warp_num;
+
+      if (copy_major == 1) {
+        simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
       } else {
-          // 既然上面不成立，这里自然就是 dst->shape[0] < dst->shape[1]
-          simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, dst->shape[1], src->dtype);
+        ICHECK(copy_major == 0)
+            << "Invalid copy_major value: " << copy_major
+            << ", expected 0 (row_major) or 1 (col_major).";
+        simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
       }
   }
   else {
     LOG(FATAL) << "DCU async copy lowering error: Currently only 2D copies are supported. "
-               << "But found dst shape " << dst->shape 
+               << "But found dst shape " << dst->shape
                << " and src shape " << src->shape << ".";
   }
   // 这里的 Fuse 和 Substitute 逻辑保持一致，用于处理多维循环合并
@@ -1166,11 +1346,23 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   
   // 最后进行向量化优化（如果满足条件）
   auto vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+  Stmt result;
   if (par_op->GetPredicate(T.thread_var).defined()) {
-    return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
-                      vectorized_thread_loop);
+    result = IfThenElse(par_op->GetPredicate(T.thread_var).value(),
+                        vectorized_thread_loop);
+  } else {
+    result = vectorized_thread_loop;
   }
-  return vectorized_thread_loop;
+
+  const std::string& dst_name = dst->name;
+  if (dst_name.find("A_shared") != std::string::npos) {
+    result = AttrStmt(IntImm(DataType::Int(32), 0), kDCUCopyMajorAStmt,
+                      IntImm(DataType::Int(32), copy_major), result);
+  } else if (dst_name.find("B_shared") != std::string::npos) {
+    result = AttrStmt(IntImm(DataType::Int(32), 0), kDCUCopyMajorBStmt,
+                      IntImm(DataType::Int(32), copy_major), result);
+  }
+  return result;
 }
 /**
  * @brief Lower a Copy operator to LDSM/STSM (warp-level 8x8 matrix)
@@ -2275,11 +2467,11 @@ void CopyNode::CollectFragmentLayouts(const PrimExpr &expr,
 
 // Register the Copy operation with TVM's TIR system
 // This makes the copy operation available for use in TVM programs
-// - Takes 5 inputs: src_buffer, dst_buffer, coalesced_width, disable_tma,
-// eviction_policy
+// - Takes 6 inputs: src_buffer, dst_buffer, coalesced_width, disable_tma,
+// eviction_policy, copy_major
 // - Marked as opaque since it has side effects (memory writes)
 TIR_REGISTER_TL_TILE_OP(Copy, copy)
-    .set_num_inputs(5)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

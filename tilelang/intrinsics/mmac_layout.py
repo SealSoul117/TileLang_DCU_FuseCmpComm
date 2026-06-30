@@ -102,52 +102,84 @@ class SharedToLocalKDim32LayoutB:
         new_row = new_row - 4 * (cond1 | cond2 | cond3)
         
         return new_row, new_col
+
+class LayoutConfig():
+    def __init__(self, k_pack, warp_num, iter_num, dtype, is_B=False):
+        self.micro_m = 16
+        self.micro_n = 16
+        self.k_pack = k_pack
+        self.warp_num = warp_num
+        self.iter_num = iter_num
+        self.slab_size = 1024
+        self.bank_size = 128
+        self.infer_type_size(dtype)
+        self.slab_num = self.slab_size // self.type_size
+        self.bank_num = self.bank_size // self.type_size
+        self.intra_iter_num = self.slab_num * 4 // (self.warp_num * self.micro_m * self.micro_n * self.k_pack)
+        self.row_per_4slab = self.slab_num * 4 // (self.micro_n * self.k_pack)
+        self.row_per_slab = self.slab_num // (self.micro_n * self.k_pack)
+        if is_B:
+            self.padding_bytes = 64
+        else:
+            self.padding_bytes = 16
+        self.padding_num = self.padding_bytes // self.type_size
         
-
-@dataclass(frozen=True)
-class SharedToLocalLayoutB:
-    """
-    LDS memory access data layout for B matrix with k_dim=16.
-    """
-
-    @staticmethod
-    def base(tx, local_id):
-        row = tx // 4
-        col = (tx % 4) * 8 + local_id
-        bit0 = row & 1
-        bit1 = (row >> 1) & 1
-        new_row = ((row // 4) << 2)  + (bit0 * 2) + bit1
-
-        return new_row, col
-    @staticmethod
-    def slab(row, col):
-        return row, col
-    
-    @staticmethod
-    def warp(row, col, warp_n):
-        per_warp_itera_num = 4 * 8
-        new_col = col + warp_n * per_warp_itera_num
-        return row, new_col
-
-    @staticmethod
-    def itera(row, col, idx, block_col_warps):
-        per_warp_itera_num = 4 * 8
-        new_col = col + per_warp_itera_num * block_col_warps * idx
-        return row, new_col
-    
-    
-    
-    def rewind(row, col, tx, warp_n, idx, warp_cols, block_row_warps):
-        per_warp_itera_num = 4 * 8
-        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
-        col = (((tx & 7) // 4) * 32 + col)
-        new_col = col % col_size
-        new_row = row + (col // col_size)
-        cond = (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & (((tx >> 2) & 3) == 3)
-        new_row = new_row - 2 * cond
         
-        return new_row, new_col
+        self.row_per_warp = self.slab_num // (self.micro_n * self.k_pack * self.warp_num * self.intra_iter_num)
+        self.bank_row = self.bank_num // (self.micro_n * self.k_pack)
+        self.permute_offset = 2 * self.bank_row * self.bank_row // self.row_per_warp
+        if is_B:
+            self.element_per_row = 32
+            self.row_num = self.element_per_row * self.iter_num * self.warp_num
+            self.row_per_slab = self.slab_num // self.row_num
+            self.row_per_2slab = self.row_per_slab * 2
+            
+            
         
+    
+    def infer_type_size(self, dtype):
+        if dtype == "float16" or dtype == "bfloat16":
+            self.type_size = 2
+        elif dtype == "float32":
+            self.type_size = 4
+        elif dtype == "int8":
+            self.type_size = 1
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
+    # base
+    row = tx % 16
+    col = (tx // 16) * 4 * layout_config.k_pack + local_id
+    
+    # permute
+    row = (row // 8) * layout_config.permute_offset + ((row % 8) % layout_config.permute_offset) + ((row % 8) // layout_config.permute_offset) * layout_config.row_per_warp
+    row = (row % layout_config.row_per_warp)+ (row // layout_config.row_per_warp) * layout_config.row_per_slab
+    
+    # warp
+    row = row + warp_m * layout_config.row_per_warp
+    
+    # iter
+    row = (
+            row
+            + (idx % layout_config.intra_iter_num) * layout_config.row_per_warp * layout_config.warp_num
+            + (idx // layout_config.intra_iter_num) * layout_config.row_per_4slab
+        )
+    
+    # rewind
+    new_col = (((row % layout_config.row_per_4slab) // layout_config.row_per_slab) * layout_config.padding_num + col) % (layout_config.micro_n * layout_config.k_pack)
+    row = (((row % layout_config.row_per_4slab) // layout_config.row_per_slab) * layout_config.padding_num + col) // (layout_config.micro_n * layout_config.k_pack) + row
+    if layout_config.k_pack == 1:
+        select_thread = (((tx // 16)) + ((tx & 3) * 4) + (((tx & 15) // 4) * 2)) // 16
+    elif layout_config.k_pack == 2:
+        select_thread = (tx == 31) | (tx == 45) | (tx == 47) | (tx == 59) | (tx == 61) | (tx == 63)
+    else:
+        assert False
+    
+    cond = select_thread & (warp_m == (layout_config.warp_num - 1)) & ((idx % layout_config.intra_iter_num) == (layout_config.intra_iter_num - 1))
+    row = row - layout_config.row_per_slab * cond
+    return row, new_col
 
 @dataclass(frozen=True)
 class SharedToLocalLayoutA:
@@ -156,9 +188,20 @@ class SharedToLocalLayoutA:
     """
 
     @staticmethod
-    def base(tx, local_id):
+    def base(tx, local_id, k_pack):
         row = tx % 16
-        col = (tx // 16) * 4 + local_id
+        col = (tx // 16) * 4 * k_pack + local_id
+        return row, col
+    
+    @staticmethod
+    def permute(row, col, k_pack, warp_rows, block_row_warps):
+        k_dim = 16
+        col_size = k_pack * k_dim
+        bank_size = 128 // 2
+        bank_row = bank_size // col_size
+        slab_num = 512
+        row_per_iter_per_warp = slab_num // col_size // warp_rows // block_row_warps
+        
         return row, col
 
     @staticmethod
@@ -200,6 +243,93 @@ class SharedToLocalLayoutA:
         select_thread = (((tx // 16)) + ((tx & 3) * 4) + (((tx & 15) // 4) * 2)) // 16
         cond = select_thread & (warp_m == (block_row_warps - 1)) & ((idx % intra_iter) == (intra_iter - 1))
         new_row = new_row - per_slab_row * cond
+        return new_row, new_col
+
+    def permute(row, col, warp_cols, block_row_warps):
+        per_warp_itera_num = 4 * 8
+        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
+        slab_size = 512
+        row_per_slab = slab_size // col_size
+        assert row_per_slab % 2 == 0 or row_per_slab == 1
+        row_per_2_slab = 2 * row_per_slab
+        new_row = (row % row_per_2_slab) // 2 + (row % 2) * row_per_slab + (row // row_per_2_slab) * row_per_2_slab
+        return new_row ,col
+def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
+    # base
+    row = tx // 4
+    col = (tx % 4) * 8 + local_id
+    
+    # permute
+    row = (row % layout_config.row_per_2slab) // 2 + (row % 2) * layout_config.row_per_slab + (row // layout_config.row_per_2slab) * layout_config.row_per_2slab
+    
+    # warp
+    col = col + warp_n * layout_config.element_per_row
+    
+    # iter
+    col = col + idx * layout_config.element_per_row * layout_config.warp_num
+    
+    # rewind
+    col = (((row % layout_config.row_per_2slab) // layout_config.row_per_slab) * layout_config.padding_num + col)
+    new_col = col % layout_config.row_num
+    row = row + col // layout_config.row_num
+    if layout_config.row_num == 256:
+        select_thread = (((tx >> 2) & 3) == 3)
+    elif layout_config.row_num == 128:
+        select_thread = (((tx % 32) >> 2) == 7)
+    elif layout_config.row_num == 64:
+        select_thread = ((tx >> 2) == 15)
+    cond = select_thread & (warp_n == (layout_config.warp_num - 1)) & (idx == (layout_config.iter_num - 1))
+    row = row - layout_config.row_per_slab * cond
+    return row, new_col
+
+    
+@dataclass(frozen=True)
+class SharedToLocalLayoutB:
+    """
+    LDS memory access data layout for B matrix with k_dim=16.
+    """
+
+    @staticmethod
+    def base(tx, local_id):
+        row = tx // 4
+        col = (tx % 4) * 8 + local_id
+        return row, col
+    
+    @staticmethod
+    def slab(row, col):
+        return row, col
+    
+    @staticmethod
+    def warp(row, col, warp_n):
+        per_warp_itera_num = 4 * 8
+        new_col = col + warp_n * per_warp_itera_num
+        return row, new_col
+
+    @staticmethod
+    def itera(row, col, idx, block_col_warps):
+        per_warp_itera_num = 4 * 8
+        new_col = col + per_warp_itera_num * block_col_warps * idx
+        return row, new_col
+    
+    def permute(row, col, warp_cols, block_row_warps):
+        per_warp_itera_num = 4 * 8
+        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
+        slab_size = 512
+        row_per_slab = slab_size // col_size
+        assert row_per_slab % 2 == 0 or row_per_slab == 1
+        row_per_2_slab = 2 * row_per_slab
+        new_row = (row % row_per_2_slab) // 2 + (row % 2) * row_per_slab + (row // row_per_2_slab) * row_per_2_slab
+        return new_row ,col
+    
+    def rewind(row, col, tx, warp_n, idx, warp_cols, block_row_warps):
+        per_warp_itera_num = 4 * 8
+        col_size = warp_cols * block_row_warps * per_warp_itera_num // 2
+        col = (((tx & 7) // 4) * 32 + col)
+        new_col = col % col_size
+        new_row = row + (col // col_size)
+        cond = (warp_n == (block_row_warps - 1)) & (idx == ((warp_cols // 2) - 1)) & (((tx >> 2) & 3) == 3)
+        new_row = new_row - 2 * cond
+        
         return new_row, new_col
 
 '''

@@ -40,7 +40,10 @@ from .mmac_layout import (
     SharedToLocalLayoutA,
     SharedToLocalLayoutB,
     SharedToLocalKDim32LayoutA,
-    SharedToLocalKDim32LayoutB
+    SharedToLocalKDim32LayoutB,
+    shared_to_local_layout_A,
+    shared_to_local_layout_B,
+    LayoutConfig
 )
 
 lift = convert
@@ -84,6 +87,7 @@ class MatrixCoreIntrinEmitter:
         warp_row_tiles: int = 8,
         warp_col_tiles: int = 8,
         chunk: int = 16,
+        block_K: int = 16,
         reduce_k: int = 1,
         num_elems_per_byte: int = 1,
         k_pack: int | None = None,
@@ -102,6 +106,7 @@ class MatrixCoreIntrinEmitter:
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
+        self.block_K = block_K
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
@@ -277,8 +282,7 @@ class MatrixCoreIntrinEmitter:
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
         layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
-        print("micro_size_k", micro_size_k)
-
+        layout_config = LayoutConfig(k_pack, self.block_row_warps, warp_rows, self.a_dtype)
         # legalize shared buffer to region
         A_region = self._legalize_to_buffer_region(A_shared_buf)
         A_buf = A_region.buffer
@@ -318,15 +322,17 @@ class MatrixCoreIntrinEmitter:
             else:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
-                        row, col = layoutInfer.base(tx, local_id)
+                        row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
+                        # row, col = layoutInfer.base(tx, local_id)
                         # slab padding
-                        row, col = layoutInfer.slab(row, col)
+                        # row, col = layoutInfer.slab(row, col)
                         # warp offset
-                        row, col = layoutInfer.warp(row, col, warp_m)
+                        # row, col = layoutInfer.warp(row, col, warp_m)
                         # iteration offset
-                        row, col = layoutInfer.itera(row, col, i, self.block_row_warps)
+                        # row, col = layoutInfer.itera(row, col, i, self.block_row_warps)
+                        
                         # rewind offset
-                        row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
+                        # row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col + ki * micro_size_k]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
@@ -348,13 +354,13 @@ class MatrixCoreIntrinEmitter:
             layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
         else:
             layoutInfer = SharedToLocalLayoutB if micro_size_k == 16 else SharedToLocalKDim32LayoutB
+        if not is_transposed:
+            layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
-        print("block_col_warps", self.block_col_warps, "micro_size_y", micro_size_y)
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
-
         @T.macro
         def _warp_ldmatrix_b(
             B_local_buf,
@@ -364,11 +370,10 @@ class MatrixCoreIntrinEmitter:
             rk=0,
         ):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
-            warp_inter_stride = 32
             if is_transposed:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = layoutInfer.base(tx, local_id)
+                        row, col = layoutInfer.base(tx, local_id, k_pack)
                         row, col = layoutInfer.slab(row, col)
                         row, col = layoutInfer.warp(row, col, warp_n)
                         row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
@@ -376,14 +381,16 @@ class MatrixCoreIntrinEmitter:
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
 
             else:
-                for j in T.serial(warp_cols):
-                    for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = layoutInfer.base(tx, local_id)
-                        row, col = layoutInfer.slab(row, col)
-                        row, col = layoutInfer.warp(row, col, warp_n)
-                        row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
-                        row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
+                for j in T.serial(warp_cols // 2):
+                    for local_id in T.vectorized(2 * local_size_b):
+                        row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
+                        # row, col = layoutInfer.base(tx, local_id)
+                        # row, col = layoutInfer.slab(row, col)
+                        # row, col = layoutInfer.warp(row, col, warp_n)
+                        # row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
+                        # row, col = layoutInfer.permute(row, col, warp_cols, self.block_col_warps)
+                        # row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
+                        B_local_buf[ki * warp_cols * local_size_b + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
@@ -416,7 +423,7 @@ class MatrixCoreIntrinEmitter:
                     compute_b_dtype,
                     compute_out_dtype,
                     B_local_buf.data,
-                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                    (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b,
                     A_local_buf.data,
                     (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
                     C_local_buf.data,
@@ -629,14 +636,14 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
-        print("local_size_out", local_size_out)
-
+        data_byte = DataType(self.a_dtype).bits // 8
+        slab4_num = self.block_row_warps * self.warp_row_tiles * self.block_K // (1024 // data_byte * 4)
+        micro_size_dcu_x = slab4_num * 16
+        micro_size_dcu_y = 32
         def forward_thread(i: int, j: int) -> int:
             """
             Map fragment row `i` and column `j` to a thread index.
             """
-            micro_size_dcu_x = 32
-            micro_size_dcu_y = 32
             warp_cols_dcu = warp_cols // (micro_size_dcu_y // micro_size_y)
             block_i, block_j = (i // micro_size_dcu_x) % block_row_warps, (j // micro_size_dcu_y) % block_col_warps
             # (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
@@ -654,10 +661,8 @@ class MatrixCoreIntrinEmitter:
             """
             Map fragment row `i` and column `j` to a local index within a thread's registers.
             """
-            micro_size_dcu_x = 32
-            micro_size_dcu_y = 32
             warp_i, warp_j = (i // micro_size_dcu_x) // block_row_warps, j // micro_size_dcu_y // block_col_warps
-            warp_i_in_32_16 = (i // 16) % 2
+            warp_i_in_32_16 = (i // 16) % slab4_num
             warp_j_in_32_16 = (j // 16) % 2
             # (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y

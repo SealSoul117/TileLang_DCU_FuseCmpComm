@@ -42,6 +42,10 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
   bool trans_a{false};
   bool trans_b{false};
   bool found{false};
+  int copy_major_a{0};
+  int copy_major_b{0};
+  bool copy_major_a_found{false};
+  bool copy_major_b_found{false};
 
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -51,6 +55,12 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
     } else if (op->attr_key == kDCUGemmTransBStmt) {
       trans_b |= Downcast<Bool>(op->value)->value;
       found = true;
+    } else if (op->attr_key == kDCUCopyMajorAStmt) {
+      copy_major_a = Downcast<IntImm>(op->value)->value;
+      copy_major_a_found = true;
+    } else if (op->attr_key == kDCUCopyMajorBStmt) {
+      copy_major_b = Downcast<IntImm>(op->value)->value;
+      copy_major_b_found = true;
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -59,7 +69,8 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
 class DCUGemmTransposeStmtRemover : public StmtMutator {
  private:
   Stmt VisitStmt_(const AttrStmtNode* op) final {
-    if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt) {
+    if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt ||
+        op->attr_key == kDCUCopyMajorAStmt || op->attr_key == kDCUCopyMajorBStmt) {
       return VisitStmt(op->body);
     }
     return StmtMutator::VisitStmt_(op);
@@ -85,14 +96,32 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
       trans_b |= collector.trans_b;
     }
 
-    if (!collector.found && !existing.defined) {
+    DCUCopyMajorFlags existing_major = GetDCUCopyMajorFlags(f);
+    int copy_major_a = existing_major.a_defined ? existing_major.copy_major_a : 0;
+    int copy_major_b = existing_major.b_defined ? existing_major.copy_major_b : 0;
+    bool copy_major_found = collector.copy_major_a_found || collector.copy_major_b_found ||
+                            existing_major.a_defined || existing_major.b_defined;
+    if (collector.copy_major_a_found) {
+      copy_major_a = collector.copy_major_a;
+    }
+    if (collector.copy_major_b_found) {
+      copy_major_b = collector.copy_major_b;
+    }
+
+    if (!collector.found && !existing.defined && !copy_major_found) {
       return f;
     }
 
     auto* n = f.CopyOnWrite();
     n->body = DCUGemmTransposeStmtRemover()(n->body);
-    f = WithAttr(std::move(f), kDCUGemmTransA, Bool(trans_a));
-    f = WithAttr(std::move(f), kDCUGemmTransB, Bool(trans_b));
+    if (collector.found || existing.defined) {
+      f = WithAttr(std::move(f), kDCUGemmTransA, Bool(trans_a));
+      f = WithAttr(std::move(f), kDCUGemmTransB, Bool(trans_b));
+    }
+    if (copy_major_found) {
+      f = WithAttr(std::move(f), kDCUCopyMajorA, Integer(copy_major_a));
+      f = WithAttr(std::move(f), kDCUCopyMajorB, Integer(copy_major_b));
+    }
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.AnnotateDCUGemmTranspose", {});

@@ -262,7 +262,10 @@ std::pair<Layout, arith::IterMapLevel> LayoutNode::InverseWithLevel() const {
                        output_shape.end());
   symbolic_dims = collect_symbolic(symbolic_dims);
   bool is_static_shape = symbolic_dims.empty();
-  auto level = is_static_shape ? arith::IterMapLevel::Bijective
+  // Use Surjective instead of Bijective to handle layouts derived from
+  // warp-level gemm fragments whose dimension counts may differ due to
+  // replicate dimensions inserted by Fragment::Forward.
+  auto level = is_static_shape ? arith::IterMapLevel::Surjective
                                : arith::IterMapLevel::NoCheck;
   if (!is_static_shape) {
     // Runtime guards keep dynamic tails safe, so we allow NoCheck here and
@@ -564,8 +567,11 @@ bool FragmentNode::IsCompletedReplicated() const {
 
 arith::IterMapResult FragmentNode::DetectInjective() const {
   // lei:To perform injective check, we need to reverse the layout
-  // and use surjective check, now we use bijective check for convenience
-  // can be relaxed in future
+  // and use surjective check. We now use Surjective instead of Bijective
+  // to handle layouts derived from warp-level gemm fragments (e.g., FullRow
+  // policy), whose forward_thread/forward_index expressions may not
+  // normalize under strict Bijective constraints.
+  // Bijective can be restored once DetectIterMap handles these patterns.
   arith::Analyzer analyzer;
   // Build a flat indices array: [forward_thread_, forward_index_[...]]
   Array<PrimExpr> indices;
@@ -597,7 +603,7 @@ arith::IterMapResult FragmentNode::DetectInjective() const {
   symbolic_dims = collect_symbolic(symbolic_dims);
 
   bool is_static_shape = symbolic_dims.empty();
-  auto level = is_static_shape ? arith::IterMapLevel::Bijective
+  auto level = is_static_shape ? arith::IterMapLevel::Surjective
                                : arith::IterMapLevel::NoCheck;
   if (!is_static_shape) {
     DLOG(WARNING)

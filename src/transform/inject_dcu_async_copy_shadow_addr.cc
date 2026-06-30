@@ -203,24 +203,22 @@ PrimExpr MakeShadowAddr(const PrimExpr& base, const PrimExpr& shadow_bits) {
 
 class ShadowAddrInjector : public StmtExprMutator {
  public:
-  ShadowAddrInjector(Var buf_dyn_shmem, PrimExpr thread_extent,
+  ShadowAddrInjector(Var buf_dyn_shmem,
                      std::unordered_set<const VarNode*> a_dcu_res_vars,
-                     std::unordered_set<const VarNode*> b_dcu_res_vars, bool trans_a,
-                     bool trans_b, int a_elem_bytes, int b_elem_bytes)
+                     std::unordered_set<const VarNode*> b_dcu_res_vars, int a_copy_major,
+                     int b_copy_major, int a_elem_bytes, int b_elem_bytes)
       : buf_dyn_shmem_(std::move(buf_dyn_shmem)),
-        thread_extent_(std::move(thread_extent)),
         a_dcu_res_vars_(std::move(a_dcu_res_vars)),
         b_dcu_res_vars_(std::move(b_dcu_res_vars)),
-        trans_a_(trans_a),
-        trans_b_(trans_b),
+        a_copy_major_(a_copy_major),
+        b_copy_major_(b_copy_major),
         a_elem_bytes_(a_elem_bytes),
         b_elem_bytes_(b_elem_bytes) {}
 
-  static PrimFunc Substitute(PrimFunc func, const InfoCollector& info, bool trans_a,
-                             bool trans_b, int a_elem_bytes, int b_elem_bytes) {
-    ShadowAddrInjector mutator(info.buf_dyn_shmem, info.thread_extent, info.a_dcu_res_vars,
-                               info.b_dcu_res_vars, trans_a, trans_b, a_elem_bytes,
-                               b_elem_bytes);
+  static PrimFunc Substitute(PrimFunc func, const InfoCollector& info, int a_copy_major,
+                             int b_copy_major, int a_elem_bytes, int b_elem_bytes) {
+    ShadowAddrInjector mutator(info.buf_dyn_shmem, info.a_dcu_res_vars, info.b_dcu_res_vars,
+                               a_copy_major, b_copy_major, a_elem_bytes, b_elem_bytes);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -254,39 +252,25 @@ class ShadowAddrInjector : public StmtExprMutator {
     return false;
   }
 
-  PrimExpr BuildShadowOffsetA() const {
-    const DataType u32 = DataType::UInt(32);
-    PrimExpr warp_num = truncdiv(thread_extent_, make_const(u32, 64));
-    PrimExpr a_mod = truncdiv(warp_num, make_const(u32, 2));
-    PrimExpr warp_mod = floormod(Cast(u32, warp_idx_var_), a_mod);
-    return left_shift(warp_mod, make_const(u32, 16));
-  }
-
-  PrimExpr BuildShadowOffsetB(int elem_bytes) const {
+  // Shadow offset follows T.copy major order (0: row_major, 1: col_major).
+  // half_t (2-byte): row -> (warp_idx & 3) << 16, col -> (warp_idx & 1) << 18.
+  PrimExpr BuildShadowOffset(int copy_major, int elem_bytes) const {
     const DataType u32 = DataType::UInt(32);
     PrimExpr warp_mod;
     int shift_bits;
-    if (elem_bytes == 1) {
-      // int8 and other 1-byte types: (warp_idx & 3) << 17
+    if (copy_major == 0) {
       warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 4));
-      shift_bits = 17;
+      shift_bits = 16;
     } else {
-      // bf16/half and other 2-byte types: (warp_idx & 1) << 18
       warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 2));
-      shift_bits = 18;
+      shift_bits = (elem_bytes == 1) ? 17 : 18;
     }
     return left_shift(warp_mod, make_const(u32, shift_bits));
   }
 
-  PrimExpr ShadowOffsetForA() const {
-    // Default (A not transposed): A-style offset; A transposed: B-style offset.
-    return trans_a_ ? BuildShadowOffsetB(a_elem_bytes_) : BuildShadowOffsetA();
-  }
+  PrimExpr ShadowOffsetForA() const { return BuildShadowOffset(a_copy_major_, a_elem_bytes_); }
 
-  PrimExpr ShadowOffsetForB() const {
-    // Default (B not transposed): B-style offset; B transposed: A-style offset.
-    return trans_b_ ? BuildShadowOffsetA() : BuildShadowOffsetB(b_elem_bytes_);
-  }
+  PrimExpr ShadowOffsetForB() const { return BuildShadowOffset(b_copy_major_, b_elem_bytes_); }
 
   Stmt InjectShadowAddrLets(Stmt body) {
     ICHECK(buf_dyn_shmem_.defined())
@@ -356,11 +340,10 @@ class ShadowAddrInjector : public StmtExprMutator {
   }
 
   Var buf_dyn_shmem_;
-  PrimExpr thread_extent_;
   std::unordered_set<const VarNode*> a_dcu_res_vars_;
   std::unordered_set<const VarNode*> b_dcu_res_vars_;
-  bool trans_a_{false};
-  bool trans_b_{false};
+  int a_copy_major_{0};
+  int b_copy_major_{0};
   int a_elem_bytes_;
   int b_elem_bytes_;
   Var warp_idx_var_;
@@ -430,11 +413,11 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
   const int a_elem_bytes = ResolveAElemBytes(func, collector);
   const int b_elem_bytes = ResolveBElemBytes(func, collector);
 
-  DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(func);
-  const bool trans_a = flags.defined && flags.trans_a;
-  const bool trans_b = flags.defined && flags.trans_b;
+  DCUCopyMajorFlags major_flags = GetDCUCopyMajorFlags(func);
+  const int a_copy_major = major_flags.a_defined ? major_flags.copy_major_a : 0;
+  const int b_copy_major = major_flags.b_defined ? major_flags.copy_major_b : 0;
 
-  return ShadowAddrInjector::Substitute(func, collector, trans_a, trans_b, a_elem_bytes,
+  return ShadowAddrInjector::Substitute(func, collector, a_copy_major, b_copy_major, a_elem_bytes,
                                         b_elem_bytes);
 }
 

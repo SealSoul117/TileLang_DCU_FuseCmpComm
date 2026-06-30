@@ -260,6 +260,22 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const PrimFunc& func) {
   return flags;
 }
 
+DCUCopyMajorFlags GetDCUCopyMajorFlags(const PrimFunc& func) {
+  DCUCopyMajorFlags flags;
+  if (!func->attrs.defined()) {
+    return flags;
+  }
+  if (auto copy_major_a = func->attrs.GetAttr<Integer>(kDCUCopyMajorA)) {
+    flags.copy_major_a = copy_major_a.value()->value;
+    flags.a_defined = true;
+  }
+  if (auto copy_major_b = func->attrs.GetAttr<Integer>(kDCUCopyMajorB)) {
+    flags.copy_major_b = copy_major_b.value()->value;
+    flags.b_defined = true;
+  }
+  return flags;
+}
+
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
                                const std::string& buffer_name) {
   if (!flags.defined) {

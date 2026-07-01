@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "../op/builtin.h"
 #include "inject_utils.h"
@@ -55,6 +56,63 @@ bool IsWarpIdxInit(const PrimExpr& expr) {
     return call->op.same_as(tl::get_warp_idx_sync());
   }
   return false;
+}
+
+std::optional<int64_t> GetConstInt(const PrimExpr& expr) {
+  if (const auto* imm = expr.as<IntImmNode>()) {
+    return imm->value;
+  }
+  return std::nullopt;
+}
+
+constexpr int kDCUWarpSize = 64;
+
+int GetRequiredShadowSlots(int copy_major) { return copy_major == 0 ? 4 : 2; }
+
+int ComputeSplitFactor(int copy_major, int warp_num) {
+  const int required_slots = GetRequiredShadowSlots(copy_major);
+  if (warp_num >= required_slots) {
+    return 1;
+  }
+  ICHECK_GT(warp_num, 0) << "warp_num must be positive, got " << warp_num;
+  ICHECK_EQ(required_slots % warp_num, 0)
+      << "required shadow slots " << required_slots << " must be divisible by warp_num "
+      << warp_num;
+  return required_slots / warp_num;
+}
+
+class VarReplacer : public ExprMutator {
+ public:
+  VarReplacer(Var target, PrimExpr replacement)
+      : target_(std::move(target)), replacement_(std::move(replacement)) {}
+
+ private:
+  PrimExpr VisitExpr_(const VarNode* op) final {
+    if (op == target_.get()) {
+      return replacement_;
+    }
+    return GetRef<PrimExpr>(op);
+  }
+
+  Var target_;
+  PrimExpr replacement_;
+};
+
+PrimExpr ReplaceVar(const PrimExpr& expr, const Var& target, const PrimExpr& replacement) {
+  return VarReplacer(target, replacement)(expr);
+}
+
+enum class SplitBufferKind { kNone, kA, kB };
+
+const CallNode* ExtractDCUAsyncCopyFromStmt(const Stmt& stmt) {
+  if (const auto* eval = stmt.as<EvaluateNode>()) {
+    if (const auto* call = eval->value.as<CallNode>()) {
+      if (call->op.same_as(DCUAsyncCopyOp())) {
+        return call;
+      }
+    }
+  }
+  return nullptr;
 }
 
 bool IsThreadIdxXAttr(const AttrStmtNode* op, const IterVarNode** out_iv = nullptr) {
@@ -206,19 +264,25 @@ class ShadowAddrInjector : public StmtExprMutator {
   ShadowAddrInjector(Var buf_dyn_shmem,
                      std::unordered_set<const VarNode*> a_dcu_res_vars,
                      std::unordered_set<const VarNode*> b_dcu_res_vars, int a_copy_major,
-                     int b_copy_major, int a_elem_bytes, int b_elem_bytes)
+                     int b_copy_major, int a_elem_bytes, int b_elem_bytes, int warp_num)
       : buf_dyn_shmem_(std::move(buf_dyn_shmem)),
         a_dcu_res_vars_(std::move(a_dcu_res_vars)),
         b_dcu_res_vars_(std::move(b_dcu_res_vars)),
         a_copy_major_(a_copy_major),
         b_copy_major_(b_copy_major),
         a_elem_bytes_(a_elem_bytes),
-        b_elem_bytes_(b_elem_bytes) {}
+        b_elem_bytes_(b_elem_bytes),
+        warp_num_(warp_num),
+        a_split_factor_(ComputeSplitFactor(a_copy_major, warp_num)),
+        b_split_factor_(ComputeSplitFactor(b_copy_major, warp_num)) {}
 
   static PrimFunc Substitute(PrimFunc func, const InfoCollector& info, int a_copy_major,
                              int b_copy_major, int a_elem_bytes, int b_elem_bytes) {
+    const int64_t thread_extent = GetConstInt(info.thread_extent).value_or(0);
+    ICHECK_GT(thread_extent, 0) << "thread_extent must be positive for shadow addr injection";
+    const int warp_num = std::max(1, static_cast<int>(thread_extent / kDCUWarpSize));
     ShadowAddrInjector mutator(info.buf_dyn_shmem, info.a_dcu_res_vars, info.b_dcu_res_vars,
-                               a_copy_major, b_copy_major, a_elem_bytes, b_elem_bytes);
+                               a_copy_major, b_copy_major, a_elem_bytes, b_elem_bytes, warp_num);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -254,23 +318,58 @@ class ShadowAddrInjector : public StmtExprMutator {
 
   // Shadow offset follows T.copy major order (0: row_major, 1: col_major).
   // half_t (2-byte): row -> (warp_idx & 3) << 16, col -> (warp_idx & 1) << 18.
-  PrimExpr BuildShadowOffset(int copy_major, int elem_bytes) const {
+  // When warp_num is smaller than the required shadow slots, the missing slots are
+  // covered by splitting the surrounding loop and using per-sub shadow addresses:
+  //   ((warp_idx + sub_idx * warp_num) & mask) << shift_bits
+  // e.g. warp_num=2: sub0 -> (warp_idx & 3) << 16, sub1 -> ((warp_idx + 2) & 3) << 16.
+  PrimExpr BuildShadowOffset(int copy_major, int elem_bytes, int sub_idx) const {
     const DataType u32 = DataType::UInt(32);
-    PrimExpr warp_mod;
     int shift_bits;
+    int slot_mask;
     if (copy_major == 0) {
-      warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 4));
+      slot_mask = 4;
       shift_bits = 16;
     } else {
-      warp_mod = floormod(Cast(u32, warp_idx_var_), make_const(u32, 2));
+      slot_mask = 2;
       shift_bits = (elem_bytes == 1) ? 17 : 18;
     }
-    return left_shift(warp_mod, make_const(u32, shift_bits));
+    PrimExpr slot_index = floormod(Cast(u32, warp_idx_var_) + make_const(u32, sub_idx * warp_num_),
+                                   make_const(u32, slot_mask));
+    return left_shift(slot_index, make_const(u32, shift_bits));
   }
 
-  PrimExpr ShadowOffsetForA() const { return BuildShadowOffset(a_copy_major_, a_elem_bytes_); }
+  PrimExpr ShadowOffsetForA(int sub_idx = 0) const {
+    return BuildShadowOffset(a_copy_major_, a_elem_bytes_, sub_idx);
+  }
 
-  PrimExpr ShadowOffsetForB() const { return BuildShadowOffset(b_copy_major_, b_elem_bytes_); }
+  PrimExpr ShadowOffsetForB(int sub_idx = 0) const {
+    return BuildShadowOffset(b_copy_major_, b_elem_bytes_, sub_idx);
+  }
+
+  void InjectSplitBufferAddrs(Stmt& body, const DataType& ptr_type, const DataType& u32,
+                              int split_factor, bool is_a_buffer, const std::string& offset_tag,
+                              const std::string& addr_tag, std::vector<Var>* addr_vars) {
+    addr_vars->clear();
+    if (split_factor == 1) {
+      Var shadow_offset_var = Var("shadow_offset_" + offset_tag, u32);
+      Var shared_addr_var = Var(addr_tag + "_shared_addr", ptr_type);
+      addr_vars->push_back(shared_addr_var);
+      body = LetStmt(shared_addr_var, MakeShadowAddr(shmem_base_var_, shadow_offset_var), body);
+      body = LetStmt(shadow_offset_var, is_a_buffer ? ShadowOffsetForA() : ShadowOffsetForB(), body);
+      return;
+    }
+
+    for (int sub_idx = 0; sub_idx < split_factor; ++sub_idx) {
+      const std::string suffix = std::to_string(sub_idx);
+      Var shadow_offset_var = Var("shadow_offset_" + offset_tag + "_" + suffix, u32);
+      Var shared_addr_var = Var(addr_tag + "_shared_addr_" + suffix, ptr_type);
+      addr_vars->push_back(shared_addr_var);
+      PrimExpr shadow_offset =
+          is_a_buffer ? ShadowOffsetForA(sub_idx) : ShadowOffsetForB(sub_idx);
+      body = LetStmt(shared_addr_var, MakeShadowAddr(shmem_base_var_, shadow_offset_var), body);
+      body = LetStmt(shadow_offset_var, shadow_offset, body);
+    }
+  }
 
   Stmt InjectShadowAddrLets(Stmt body) {
     ICHECK(buf_dyn_shmem_.defined())
@@ -279,18 +378,56 @@ class ShadowAddrInjector : public StmtExprMutator {
     const DataType ptr_type = buf_dyn_shmem_->dtype;
     const DataType u32 = DataType::UInt(32);
     shmem_base_var_ = Var("shmem_base", ptr_type);
-    shadow_offset_a_var_ = Var("shadow_offset_a", u32);
-    shadow_offset_b_var_ = Var("shadow_offset_b", u32);
-    a_shared_addr_var_ = Var("A_shared_addr", ptr_type);
-    b_shared_addr_var_ = Var("B_shared_addr", ptr_type);
     // Outermost lets run first: bind shmem_base, then offsets, then shadow-tagged addrs.
-    body = LetStmt(a_shared_addr_var_, MakeShadowAddr(shmem_base_var_, shadow_offset_a_var_), body);
-    body = LetStmt(b_shared_addr_var_, MakeShadowAddr(shmem_base_var_, shadow_offset_b_var_), body);
-    body = LetStmt(shadow_offset_a_var_, ShadowOffsetForA(), body);
-    body = LetStmt(shadow_offset_b_var_, ShadowOffsetForB(), body);
+    InjectSplitBufferAddrs(body, ptr_type, u32, a_split_factor_, true, "a", "A",
+                           &a_shared_addr_vars_);
+    InjectSplitBufferAddrs(body, ptr_type, u32, b_split_factor_, false, "b", "B",
+                           &b_shared_addr_vars_);
     body = LetStmt(shmem_base_var_, buf_dyn_shmem_, body);
     shadow_injected_ = true;
     return body;
+  }
+
+  SplitBufferKind GetSplitBufferForCopy(const CallNode* call) const {
+    if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp())) {
+      return SplitBufferKind::kNone;
+    }
+    if (IsADcuRes(call->args[2])) {
+      return a_split_factor_ > 1 ? SplitBufferKind::kA : SplitBufferKind::kNone;
+    }
+    if (IsBDcuRes(call->args[2])) {
+      return b_split_factor_ > 1 ? SplitBufferKind::kB : SplitBufferKind::kNone;
+    }
+    return SplitBufferKind::kNone;
+  }
+
+  Stmt SplitForWithAsyncCopy(const ForNode* op, const CallNode* copy_call, SplitBufferKind kind,
+                             int split_factor) {
+    const std::vector<Var>& addr_vars =
+        kind == SplitBufferKind::kA ? a_shared_addr_vars_ : b_shared_addr_vars_;
+    ICHECK_EQ(static_cast<int>(addr_vars.size()), split_factor);
+
+    const auto extent_imm = GetConstInt(op->extent);
+    ICHECK(extent_imm.has_value()) << "loop extent must be constant for shadow loop split";
+    ICHECK_EQ(*extent_imm % split_factor, 0)
+        << "loop extent " << *extent_imm << " must be divisible by split factor "
+        << split_factor;
+
+    Array<Stmt> seq;
+    for (int sub_idx = 0; sub_idx < split_factor; ++sub_idx) {
+      PrimExpr loop_replacement = op->loop_var * split_factor + sub_idx;
+      Array<PrimExpr> new_args = copy_call->args;
+      new_args.Set(0, addr_vars[sub_idx]);
+      for (size_t arg_idx = 1; arg_idx < new_args.size(); ++arg_idx) {
+        new_args.Set(arg_idx, ReplaceVar(new_args[arg_idx], op->loop_var, loop_replacement));
+      }
+      seq.push_back(Evaluate(Call(copy_call->dtype, copy_call->op, new_args)));
+    }
+
+    Stmt new_body = seq.size() == 1 ? seq[0] : SeqStmt(seq);
+    const int64_t new_extent = *extent_imm / split_factor;
+    return For(op->loop_var, op->min, make_const(op->extent.dtype(), new_extent), op->kind,
+               new_body, op->thread_binding, op->annotations);
   }
 
   PrimExpr RewriteDCUAsyncCopy(const CallNode* op) {
@@ -300,15 +437,30 @@ class ShadowAddrInjector : public StmtExprMutator {
     }
     PrimExpr new_base = op->args[0];
     if (IsADcuRes(op->args[2])) {
-      new_base = a_shared_addr_var_;
+      ICHECK(!a_shared_addr_vars_.empty());
+      new_base = a_shared_addr_vars_[0];
     } else if (IsBDcuRes(op->args[2])) {
-      new_base = b_shared_addr_var_;
+      ICHECK(!b_shared_addr_vars_.empty());
+      new_base = b_shared_addr_vars_[0];
     } else {
       return GetRef<PrimExpr>(op);
     }
     Array<PrimExpr> new_args = op->args;
     new_args.Set(0, new_base);
     return Call(op->dtype, op->op, new_args);
+  }
+
+  Stmt VisitStmt_(const ForNode* op) final {
+    if (shadow_injected_) {
+      if (const CallNode* copy_call = ExtractDCUAsyncCopyFromStmt(op->body)) {
+        const SplitBufferKind kind = GetSplitBufferForCopy(copy_call);
+        if (kind != SplitBufferKind::kNone) {
+          const int split_factor = kind == SplitBufferKind::kA ? a_split_factor_ : b_split_factor_;
+          return SplitForWithAsyncCopy(op, copy_call, kind, split_factor);
+        }
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const LetStmtNode* op) final {
@@ -346,12 +498,13 @@ class ShadowAddrInjector : public StmtExprMutator {
   int b_copy_major_{0};
   int a_elem_bytes_;
   int b_elem_bytes_;
+  int warp_num_{1};
+  int a_split_factor_{1};
+  int b_split_factor_{1};
   Var warp_idx_var_;
   Var shmem_base_var_;
-  Var shadow_offset_a_var_;
-  Var shadow_offset_b_var_;
-  Var a_shared_addr_var_;
-  Var b_shared_addr_var_;
+  std::vector<Var> a_shared_addr_vars_;
+  std::vector<Var> b_shared_addr_vars_;
   bool shadow_injected_{false};
 };
 

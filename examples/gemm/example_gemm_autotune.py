@@ -10,6 +10,8 @@ from tilelang.carver.roller.rasterization import NoRasterization
 import torch
 import time
 
+tl.disable_cache()
+
 
 def ref_program(A, B):
     """
@@ -79,9 +81,12 @@ def get_configs(M, N, K, with_roller=False, topk=20):
     else:
         block_M = [64, 128, 256]
         block_N = [64, 128, 256]
-        block_K = [32, 64]
-        num_stages = [0, 1, 2, 3]
-        thread_num = [128, 256]
+        #block_K = [32, 64]
+        block_K = [16, 32]
+        #num_stages = [0, 1, 2, 3]
+        num_stages = [4]
+        #thread_num = [128, 256]
+        thread_num = [64, 128, 256, 512]
         enable_rasterization = [True, False]
         _configs = list(
             itertools.product(
@@ -94,6 +99,34 @@ def get_configs(M, N, K, with_roller=False, topk=20):
             )
         )
 
+        def is_config_valid(config):
+            """
+            Check if a configuration satisfies all hardware constraints.
+
+            Add new constraint checks here as needed. Return False to filter out
+            invalid configs.
+            """
+            BM = config["block_M"]
+            BN = config["block_N"]
+            BK = config["block_K"]
+            stages = config["num_stages"]
+
+            # Shared memory constraint:
+            #   (BM + BN) * BK * sizeof(half) * num_stages <= 65536
+            # sizeof(half) == 2 bytes. num_stages==0 means no pipelining (treated as 1).
+            effective_stages = max(stages, 1)
+            shared_mem_bytes = (BM + BN) * BK * 2 * effective_stages
+            if shared_mem_bytes > 65536:
+                return False
+            if BM * BK * 2 < 1024 or BN * BK * 2 < 1024:
+                return False
+            # TODO: add more constraints here, e.g.:
+            #   - thread_num <= BM * BN / BK
+            #   - BK must divide K evenly
+            #   - ...
+
+            return True
+
         configs = [
             {
                 "block_M": c[0],
@@ -104,6 +137,14 @@ def get_configs(M, N, K, with_roller=False, topk=20):
                 "enable_rasteration": c[5],  # keep param name for backward-compat
             }
             for c in _configs
+            if is_config_valid({
+                "block_M": c[0],
+                "block_N": c[1],
+                "block_K": c[2],
+                "num_stages": c[3],
+                "thread_num": c[4],
+                "enable_rasteration": c[5],
+            })
         ]
     return configs
 
@@ -123,27 +164,32 @@ def get_best_config(M, N, K, with_roller=False):
         @T.prim_func
         def main(
             A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            #B: T.Tensor((N, K), dtype),
             C: T.Tensor((M, N), dtype),
         ):
             with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
-                B_shared = T.alloc_shared((block_N, block_K), dtype)
+                B_shared = T.alloc_shared((block_K, block_N), dtype)
+                #B_shared = T.alloc_shared((block_N, block_K), dtype)
                 C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-                C_shared = T.alloc_shared((block_M, block_N), dtype)
+                #C_shared = T.alloc_shared((block_M, block_N), dtype)
                 T.use_swizzle(panel_size=10, enable=enable_rasteration)
                 T.clear(C_local)
                 for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                    T.copy(A[by * block_M, k * block_K], A_shared)
-                    T.copy(B[bx * block_N, k * block_K], B_shared)
+                    T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
+                    T.copy(B[ k * block_K, bx * block_N], B_shared, major="col_major")
+                    #T.copy(B[bx * block_N, k * block_K], B_shared)
                     T.gemm(
                         A_shared,
                         B_shared,
                         C_local,
-                        transpose_B=True,
+                        k_pack=block_K//16,
+                     #   transpose_B=True,
                     )
-                T.copy(C_local, C_shared)
-                T.copy(C_shared, C[by * block_M, bx * block_N])
+                #T.copy(C_local, C_shared)
+                #T.copy(C_shared, C[by * block_M, bx * block_N])
+                T.copy(C_local, C[by * block_M, bx * block_N])
 
         return main
 
@@ -209,7 +255,8 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, thread_num, enable_ra
 
 
 def main(M: int = 4096, N: int = 4096, K: int = 4096, use_autotune: bool = False, with_roller: bool = False):
-    use_autotune = False
+    #use_autotune = False
+    use_autotune = True
     if use_autotune:
         result = get_best_config(M, N, K, with_roller)
         print(result.config)

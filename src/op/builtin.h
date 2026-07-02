@@ -32,6 +32,8 @@ static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
+// When present in a kernel, enables InjectWarpKLoopDivergence during lowering.
+static constexpr const char *kUseWarpDivergence = "tl.use_warp_divergence";
 } // namespace attr
 
 static constexpr const char *kDebugMergeSharedMemoryAllocations =

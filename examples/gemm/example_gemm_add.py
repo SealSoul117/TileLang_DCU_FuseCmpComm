@@ -18,7 +18,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
         bias: T.Tensor((N,), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -26,7 +26,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
                 T.copy(B[k * block_K, bx * block_N], B_shared, major="col_major")
-                T.gemm(A_shared, B_shared, C_local)
+                T.gemm(A_shared, B_shared, C_local, k_pack=2)
 
             for i, j in T.Parallel(block_M, block_N):
                 C[by * block_M + i, bx * block_N + j] = C_local[i, j] + bias[bx * block_N + j]
@@ -36,10 +36,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    M = 7200
+    M = 2430
     N = 64
     K = 5120
-    kernel = matmul(M, N, K, 256, 256, 16)
+    kernel = matmul(M, N, K, 64, 64, 32)
 
     import torch
 
@@ -65,7 +65,7 @@ def main():
     print(f"tilelang Latency: {latency}ms")
     print(f"GEMM TFLops: {2 * M * N * K / (latency * 1e9)}")
 
-    profiler.assert_allclose(ref_gemm_add, rtol=1e-1, atol=1e-1)
+    profiler.assert_allclose(ref_gemm_add, rtol=1e-2, atol=1e-2)
     print("All check passed.")
 
     # Get CUDA Source

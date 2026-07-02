@@ -4,6 +4,7 @@
  *        scheduling, and zero async_gld_sld_fence in the prologue.
  */
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/attrs.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
@@ -25,6 +26,46 @@ namespace tl {
 using namespace tir;
 
 namespace {
+
+bool HasUseWarpDivergenceAttr(const PrimFunc& func) {
+  if (func->GetAttr<Bool>(attr::kUseWarpDivergence).value_or(false)) {
+    return true;
+  }
+
+  class Checker : public StmtVisitor {
+   public:
+    bool found{false};
+
+   private:
+    void VisitStmt_(const AttrStmtNode* op) final {
+      if (op->attr_key == attr::kUseWarpDivergence) {
+        found = true;
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const BlockNode* op) final {
+      if (op->annotations.count(attr::kUseWarpDivergence)) {
+        found = true;
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+  };
+
+  Checker checker;
+  checker(func->body);
+  return checker.found;
+}
+
+class StripUseWarpDivergenceMutator : public StmtMutator {
+ private:
+  Stmt VisitStmt_(const AttrStmtNode* op) override {
+    if (op->attr_key == attr::kUseWarpDivergence) {
+      return VisitStmt(op->body);
+    }
+    return StmtMutator::VisitStmt_(op);
+  }
+};
 
 std::optional<int64_t> GetConstIntValue(const PrimExpr& expr) {
   if (const auto* imm = expr.as<IntImmNode>()) {
@@ -276,6 +317,10 @@ std::optional<int> ComputeWarpHalf(const PrimExpr& thread_extent) {
 }
 
 PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
+  if (!HasUseWarpDivergenceAttr(func)) {
+    return func;
+  }
+
   InfoCollector collector;
   collector(func->body);
   if (!collector.found_k_loop || !collector.warp_idx_var.defined() ||
@@ -288,16 +333,14 @@ PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
     return func;
   }
 
-  bool transformed = false;
   auto* n = func.CopyOnWrite();
+  StripUseWarpDivergenceMutator stripper;
+  n->body = stripper(std::move(n->body));
+
   WarpKLoopDivergenceMutator mutator(collector.warp_idx_var, warp_half.value());
   n->body = mutator(std::move(n->body));
-  transformed = true;
-
-  if (transformed) {
-    n->body = ConvertSSA(std::move(n->body));
-  }
-  return func;
+  n->body = ConvertSSA(std::move(n->body));
+  return WithoutAttr(std::move(func), attr::kUseWarpDivergence);
 }
 
 }  // namespace

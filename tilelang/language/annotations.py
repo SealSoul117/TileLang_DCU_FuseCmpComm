@@ -8,6 +8,7 @@ from tvm.tir import FloatImm
 
 __all__ = [
     "use_swizzle",
+    "use_warp_divergence",
     "annotate_layout",
     "annotate_safe_value",
     "annotate_l2_hit_ratio",
@@ -21,6 +22,14 @@ def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
     if not enable:
         return None
     return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}>")
+
+
+def use_warp_divergence():
+    """Enable DCU warp K-loop divergence lowering for this kernel.
+
+    This is a compile-time hint only; it does not emit device code.
+    """
+    return attr(None, "tl.use_warp_divergence", True)
 
 
 def annotate_layout(layout_map: dict):

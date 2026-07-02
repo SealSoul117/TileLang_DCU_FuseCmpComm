@@ -321,7 +321,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectWarpIdx()(mod)
         # Shadow offset follows T.copy major order (row/col) on A_shared/B_shared.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
-        # mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
+        mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
         mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)

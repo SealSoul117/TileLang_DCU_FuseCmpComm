@@ -183,7 +183,7 @@ def main(
         total_flops *= 0.5
     tune = False
     if not tune:
-        kernel = flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=256, block_N=256, num_stages=0, threads=256)
+        kernel = flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=128, block_N=128, num_stages=0, threads=256)
         ref_program_processed = partial(ref_program, is_causal=is_causal)
         print(kernel.get_kernel_source())
         profiler = kernel.get_profiler()
@@ -212,7 +212,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=1, help="heads")
     parser.add_argument("--seq_q", type=int, default=4096, help="query sequence length")
     parser.add_argument("--seq_kv", type=int, default=4096, help="key/value sequence length")
-    parser.add_argument("--dim", type=int, default=64, help="dim")
+    parser.add_argument("--dim", type=int, default=32, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     parser.add_argument("--tune", action="store_true", help="tune configs")
     args = parser.parse_args()

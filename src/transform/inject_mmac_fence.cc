@@ -4,8 +4,11 @@
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/arith/analyzer.h>
+#include <tvm/node/structural_equal.h>
 
+#include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "inject_utils.h"
@@ -98,6 +101,190 @@ size_t CountConsecutiveDCUAsyncCopyRun(const Array<Stmt>& seq, size_t start) {
         ++len;
     }
     return len;
+}
+
+std::optional<PrimExpr> GetFirstDCUAsyncCopyResource(const Stmt& stmt) {
+    struct Finder : public StmtVisitor {
+        std::optional<PrimExpr> resource;
+
+        void VisitStmt_(const EvaluateNode* op) final {
+            if (resource.has_value()) {
+                return;
+            }
+            if (const auto* call = op->value.as<CallNode>()) {
+                if (IsDCUAsyncCopyCall(call) && call->args.size() >= 3) {
+                    resource = call->args[2];
+                }
+            }
+        }
+
+        void VisitStmt_(const AttrStmtNode* op) final {
+            if (!resource.has_value()) {
+                VisitStmt(op->body);
+            }
+        }
+
+        void VisitStmt_(const IfThenElseNode* op) final {
+            if (resource.has_value()) {
+                return;
+            }
+            VisitStmt(op->then_case);
+            if (!resource.has_value() && op->else_case.defined()) {
+                VisitStmt(op->else_case.value());
+            }
+        }
+    };
+
+    Finder finder;
+    finder(stmt);
+    return finder.resource;
+}
+
+struct PrefetchLoadGroup {
+    const Object* stmt;
+    PrimExpr first_global_resource;
+    int segment_id;
+};
+
+void CollectPrefetchLoadGroupsImpl(const Stmt& stmt, std::vector<PrefetchLoadGroup>* groups,
+                                   bool* past_main_loop, int* next_segment_id) {
+    if (*past_main_loop) {
+        return;
+    }
+
+    if (const auto* for_op = stmt.as<ForNode>()) {
+        if (IsDCUMainLoop(for_op)) {
+            *past_main_loop = true;
+            return;
+        }
+        if (auto resource = GetFirstDCUAsyncCopyResource(for_op->body)) {
+            groups->push_back({for_op, resource.value(), ++(*next_segment_id)});
+        }
+        return;
+    }
+
+    if (const auto* if_op = stmt.as<IfThenElseNode>()) {
+        if (auto resource = GetFirstDCUAsyncCopyResource(stmt)) {
+            groups->push_back({if_op, resource.value(), *next_segment_id});
+            return;
+        }
+        CollectPrefetchLoadGroupsImpl(if_op->then_case, groups, past_main_loop, next_segment_id);
+        if (if_op->else_case.defined()) {
+            CollectPrefetchLoadGroupsImpl(if_op->else_case.value(), groups, past_main_loop,
+                                            next_segment_id);
+        }
+        return;
+    }
+
+    if (StmtIsDCUAsyncCopyRoot(stmt)) {
+        if (auto resource = GetFirstDCUAsyncCopyResource(stmt)) {
+            groups->push_back({stmt.get(), resource.value(), *next_segment_id});
+        }
+        return;
+    }
+
+    if (const auto* seq = stmt.as<SeqStmtNode>()) {
+        int flat_segment_id = *next_segment_id;
+        for (size_t i = 0; i < seq->seq.size(); ++i) {
+            if (*past_main_loop) {
+                break;
+            }
+            const Stmt& child = seq->seq[i];
+            if (child.as<ForNode>() || child.as<IfThenElseNode>()) {
+                CollectPrefetchLoadGroupsImpl(child, groups, past_main_loop, next_segment_id);
+                flat_segment_id = *next_segment_id;
+            } else if (StmtIsDCUAsyncCopyRoot(child)) {
+                size_t run_len = CountConsecutiveDCUAsyncCopyRun(seq->seq, i);
+                for (size_t j = 0; j < run_len; ++j) {
+                    if (auto resource = GetFirstDCUAsyncCopyResource(seq->seq[i + j])) {
+                        groups->push_back(
+                            {seq->seq[i + j].get(), resource.value(), flat_segment_id});
+                    }
+                }
+                i += run_len - 1;
+                flat_segment_id = ++(*next_segment_id);
+            } else {
+                CollectPrefetchLoadGroupsImpl(child, groups, past_main_loop, next_segment_id);
+                flat_segment_id = *next_segment_id;
+            }
+        }
+        return;
+    }
+
+    if (const auto* op = stmt.as<AttrStmtNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<LetStmtNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<AllocateNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<AllocateConstNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<DeclBufferNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<BufferRealizeNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<AssertStmtNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<BlockNode>()) {
+        if (op->init.defined()) {
+            CollectPrefetchLoadGroupsImpl(op->init.value(), groups, past_main_loop, next_segment_id);
+        }
+        CollectPrefetchLoadGroupsImpl(op->body, groups, past_main_loop, next_segment_id);
+        return;
+    }
+    if (const auto* op = stmt.as<BlockRealizeNode>()) {
+        CollectPrefetchLoadGroupsImpl(op->block, groups, past_main_loop, next_segment_id);
+        return;
+    }
+}
+
+std::vector<PrefetchLoadGroup> CollectPrefetchLoadGroups(const Stmt& root) {
+    std::vector<PrefetchLoadGroup> groups;
+    bool past_main_loop = false;
+    int next_segment_id = 0;
+    CollectPrefetchLoadGroupsImpl(root, &groups, &past_main_loop, &next_segment_id);
+    return groups;
+}
+
+struct PrefetchBarrierPlan {
+    std::unordered_set<const Object*> before;
+    std::unordered_set<const Object*> after;
+};
+
+PrefetchBarrierPlan ComputePrefetchBarrierPlan(const Stmt& root) {
+    PrefetchBarrierPlan plan;
+    const auto groups = CollectPrefetchLoadGroups(root);
+    if (groups.empty()) {
+        return plan;
+    }
+
+    const PrimExpr& anchor = groups[0].first_global_resource;
+    for (size_t i = 1; i < groups.size(); ++i) {
+        const PrimExpr& cur = groups[i].first_global_resource;
+        const PrimExpr& prev = groups[i - 1].first_global_resource;
+        bool new_anchor_round = tvm::StructuralEqual()(cur, anchor) &&
+                                (!tvm::StructuralEqual()(prev, anchor) ||
+                                 groups[i].segment_id != groups[i - 1].segment_id);
+        if (new_anchor_round) {
+            plan.before.insert(groups[i].stmt);
+        }
+    }
+    plan.after.insert(groups.back().stmt);
+    return plan;
 }
 
 bool StmtContainsMMA(const Stmt& stmt) {
@@ -257,7 +444,8 @@ class MMABarrierMutator : public StmtExprMutator {
 public:
     explicit MMABarrierMutator(const Stmt& root_body)
         : global_last_fence_mma_(ComputeGlobalLastFenceMMAStmt(root_body)),
-          epilogue_last_mma_(ComputeEpilogueLastMMAStmt(root_body)) {}
+          epilogue_last_mma_(ComputeEpilogueLastMMAStmt(root_body)),
+          prefetch_barrier_plan_(ComputePrefetchBarrierPlan(root_body)) {}
 
     bool ContainsMMA(const Stmt& stmt) {
         bool found = false;
@@ -285,12 +473,54 @@ public:
             ++inside_k_loop_depth_;
         }
         Stmt body = VisitStmt(op->body);
+        Stmt for_stmt = For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,
+                            op->annotations);
         if (is_main_loop) {
             --inside_k_loop_depth_;
             phase_ = PipelinePhase::kAfterMainLoop;
+            return for_stmt;
         }
-        return For(op->loop_var, op->min, op->extent, op->kind, body, op->thread_binding,
-                   op->annotations);
+
+        if (phase_ == PipelinePhase::kBeforeMainLoop && inside_k_loop_depth_ == 0) {
+            Array<Stmt> seq;
+            if (prefetch_barrier_plan_.before.count(op)) {
+                seq.push_back(MakeWaveBarrierStmt());
+            }
+            seq.push_back(for_stmt);
+            if (prefetch_barrier_plan_.after.count(op)) {
+                seq.push_back(MakeWaveBarrierStmt());
+            }
+            if (seq.size() > 1) {
+                return SeqStmt::Flatten(seq);
+            }
+        }
+        return for_stmt;
+    }
+
+    Stmt VisitStmt_(const IfThenElseNode* op) override {
+        Stmt then_case = VisitStmt(op->then_case);
+        Stmt if_stmt;
+        if (op->else_case.defined()) {
+            Stmt else_case = VisitStmt(op->else_case.value());
+            if_stmt = IfThenElse(op->condition, then_case, else_case);
+        } else {
+            if_stmt = IfThenElse(op->condition, then_case);
+        }
+
+        if (phase_ == PipelinePhase::kBeforeMainLoop && inside_k_loop_depth_ == 0) {
+            Array<Stmt> seq;
+            if (prefetch_barrier_plan_.before.count(op)) {
+                seq.push_back(MakeWaveBarrierStmt());
+            }
+            seq.push_back(if_stmt);
+            if (prefetch_barrier_plan_.after.count(op)) {
+                seq.push_back(MakeWaveBarrierStmt());
+            }
+            if (seq.size() > 1) {
+                return SeqStmt::Flatten(seq);
+            }
+        }
+        return if_stmt;
     }
 
     Stmt VisitStmt_(const SeqStmtNode* op) override {
@@ -335,17 +565,35 @@ public:
                 prev_stmt_is_dcu_async_copy = false;
             } else if (StmtIsDCUAsyncCopyRoot(stmt)) {
                 size_t run_len = CountConsecutiveDCUAsyncCopyRun(op->seq, i);
-                // Skip leading wave_barrier inside the main k-loop; pipeline already
-                // serializes consecutive cp_async there.
-                if (!prev_stmt_is_dcu_async_copy && inside_k_loop_depth_ == 0) {
-                    new_seq.push_back(MakeWaveBarrierStmt());
-                }
-                for (size_t j = 0; j < run_len; ++j) {
-                    new_seq.push_back(this->VisitStmt(op->seq[i + j]));
-                    // When more than 2 consecutive async copies, insert a wave_barrier
-                    // after every pair.
-                    if (run_len > 2 && (j + 1) % 2 == 0) {
-                        new_seq.push_back(MakeWaveBarrierStmt());
+                if (phase_ == PipelinePhase::kBeforeMainLoop && inside_k_loop_depth_ == 0) {
+                    for (size_t j = 0; j < run_len; ++j) {
+                        const Stmt& copy_stmt = op->seq[i + j];
+                        Array<Stmt> wrapped;
+                        if (prefetch_barrier_plan_.before.count(copy_stmt.get())) {
+                            wrapped.push_back(MakeWaveBarrierStmt());
+                        }
+                        wrapped.push_back(this->VisitStmt(copy_stmt));
+                        if (prefetch_barrier_plan_.after.count(copy_stmt.get())) {
+                            wrapped.push_back(MakeWaveBarrierStmt());
+                        }
+                        if (wrapped.size() > 1) {
+                            new_seq.push_back(SeqStmt::Flatten(wrapped));
+                        } else {
+                            new_seq.push_back(wrapped[0]);
+                        }
+                    }
+                } else if (inside_k_loop_depth_ > 0) {
+                    for (size_t j = 0; j < run_len; ++j) {
+                        new_seq.push_back(this->VisitStmt(op->seq[i + j]));
+                        // When more than 2 consecutive async copies, insert a wave_barrier
+                        // after every pair.
+                        if (run_len > 2 && (j + 1) % 2 == 0) {
+                            new_seq.push_back(MakeWaveBarrierStmt());
+                        }
+                    }
+                } else {
+                    for (size_t j = 0; j < run_len; ++j) {
+                        new_seq.push_back(this->VisitStmt(op->seq[i + j]));
                     }
                 }
                 i += run_len - 1;
@@ -364,6 +612,7 @@ public:
 private:
     Stmt global_last_fence_mma_;
     Stmt epilogue_last_mma_;
+    PrefetchBarrierPlan prefetch_barrier_plan_;
     PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
     int inside_k_loop_depth_ = 0;
     int last_sld_fence_val_ = 0;

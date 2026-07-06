@@ -24,11 +24,17 @@ def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
     return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}>")
 
 
-def use_warp_divergence():
-    """Enable DCU warp K-loop divergence lowering for this kernel.
+def use_warp_divergence(enable: bool = True):
+    """Enable or disable DCU warp K-loop divergence lowering for this kernel.
+
+    Args:
+        enable: If True (default), the InjectWarpKLoopDivergence pass is applied.
+                If False, the pass is skipped for this kernel.
 
     This is a compile-time hint only; it does not emit device code.
     """
+    if not enable:
+        return None
     return attr(None, "tl.use_warp_divergence", True)
 
 

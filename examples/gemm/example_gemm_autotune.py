@@ -84,7 +84,7 @@ def get_configs(M, N, K, with_roller=False, topk=20):
         #block_K = [32, 64]
         block_K = [16, 32]
         #num_stages = [0, 1, 2, 3]
-        num_stages = [4]
+        num_stages = [3, 4]
         #thread_num = [128, 256]
         thread_num = [64, 128, 256, 512]
         enable_rasterization = [True, False]
@@ -110,6 +110,7 @@ def get_configs(M, N, K, with_roller=False, topk=20):
             BN = config["block_N"]
             BK = config["block_K"]
             stages = config["num_stages"]
+            thread_num = config["thread_num"]
 
             # Shared memory constraint:
             #   (BM + BN) * BK * sizeof(half) * num_stages <= 65536
@@ -119,6 +120,12 @@ def get_configs(M, N, K, with_roller=False, topk=20):
             if shared_mem_bytes > 65536:
                 return False
             if BM * BK * 2 < 1024 or BN * BK * 2 < 1024:
+                return False
+            if (BM * BK // thread_num // 8 < 1) or (BN * BK // thread_num // 8 < 1):
+                return False
+            # if (BM * BN // thread_num == 256):
+            #     return False
+            if ((BM + BN) * BK // thread_num // 8) >= 8:
                 return False
             # TODO: add more constraints here, e.g.:
             #   - thread_num <= BM * BN / BK
@@ -146,6 +153,9 @@ def get_configs(M, N, K, with_roller=False, topk=20):
                 "enable_rasteration": c[5],
             })
         ]
+        
+        for i,config in enumerate(configs):
+            print(f"config {i}:", config)
     return configs
 
 
@@ -169,6 +179,7 @@ def get_best_config(M, N, K, with_roller=False):
             C: T.Tensor((M, N), dtype),
         ):
             with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
+                T.use_warp_divergence(enable=(block_K == 16))
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
                 B_shared = T.alloc_shared((block_K, block_N), dtype)
                 #B_shared = T.alloc_shared((block_N, block_K), dtype)
@@ -278,9 +289,9 @@ def main(M: int = 4096, N: int = 4096, K: int = 4096, use_autotune: bool = False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autotuned MatMul Benchmark")
-    parser.add_argument("--m", type=int, default=4096, help="Matrix dimension M")
-    parser.add_argument("--n", type=int, default=4096, help="Matrix dimension N")
-    parser.add_argument("--k", type=int, default=4096, help="Matrix dimension K")
+    parser.add_argument("--m", type=int, default=1024, help="Matrix dimension M")
+    parser.add_argument("--n", type=int, default=1024, help="Matrix dimension N")
+    parser.add_argument("--k", type=int, default=1024, help="Matrix dimension K")
     parser.add_argument("--use_autotune", action="store_true", default=False, help="Whether to use autotune for matmul configs")
     parser.add_argument("--with_roller", action="store_true", default=False, help="Whether to enable BitBLAS roller for search space")
     args = parser.parse_args()

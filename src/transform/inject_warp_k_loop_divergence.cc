@@ -39,14 +39,23 @@ bool HasUseWarpDivergenceAttr(const PrimFunc& func) {
    private:
     void VisitStmt_(const AttrStmtNode* op) final {
       if (op->attr_key == attr::kUseWarpDivergence) {
-        found = true;
+        if (const auto* imm = op->value.as<IntImmNode>()) {
+          if (imm->value != 0) {
+            found = true;
+          }
+        }
       }
       StmtVisitor::VisitStmt_(op);
     }
 
     void VisitStmt_(const BlockNode* op) final {
-      if (op->annotations.count(attr::kUseWarpDivergence)) {
-        found = true;
+      auto it = op->annotations.find(attr::kUseWarpDivergence);
+      if (it != op->annotations.end()) {
+        if (const auto* imm = (*it).second.as<IntImmNode>()) {
+          if (imm->value != 0) {
+            found = true;
+          }
+        }
       }
       StmtVisitor::VisitStmt_(op);
     }

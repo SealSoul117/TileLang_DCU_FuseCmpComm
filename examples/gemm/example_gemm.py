@@ -12,7 +12,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
-            # T.use_warp_divergence()
+            T.use_warp_divergence(enable=False)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -28,10 +28,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    M = 4096
-    N = 4096
-    K = 4096
-    kernel = matmul(M, N, K, 64, 64, 16)
+    M = 3328
+    N = 3328
+    K = 3328
+    kernel = matmul(M, N, K, 256, 128, 16)
 
     import torch
 

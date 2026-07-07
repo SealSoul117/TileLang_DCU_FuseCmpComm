@@ -289,9 +289,9 @@ def main(M: int = 4096, N: int = 4096, K: int = 4096, use_autotune: bool = False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autotuned MatMul Benchmark")
-    parser.add_argument("--m", type=int, default=1024, help="Matrix dimension M")
-    parser.add_argument("--n", type=int, default=1024, help="Matrix dimension N")
-    parser.add_argument("--k", type=int, default=1024, help="Matrix dimension K")
+    parser.add_argument("--m", type=int, default=3840, help="Matrix dimension M")
+    parser.add_argument("--n", type=int, default=3840, help="Matrix dimension N")
+    parser.add_argument("--k", type=int, default=3840, help="Matrix dimension K")
     parser.add_argument("--use_autotune", action="store_true", default=False, help="Whether to use autotune for matmul configs")
     parser.add_argument("--with_roller", action="store_true", default=False, help="Whether to enable BitBLAS roller for search space")
     args = parser.parse_args()

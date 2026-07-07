@@ -318,6 +318,9 @@ std::optional<int> ComputeWarpHalf(const PrimExpr& thread_extent) {
     ICHECK(*extent > 0 && (*extent % 64) == 0)
         << "thread extent must be a positive multiple of 64, got " << *extent;
     int warp_num = static_cast<int>(*extent / 64);
+    if (warp_num == 1) {
+      return std::nullopt;
+    }
     ICHECK(warp_num >= 2 && (warp_num % 2) == 0)
         << "warp count must be an even number >= 2, got " << warp_num;
     return warp_num / 2;

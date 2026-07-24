@@ -592,6 +592,18 @@ def LayoutReducer():
     """
     return _ffi_api.LayoutReducer()  # type: ignore
 
+def InjectDCUAsyncScope():
+    """InjectDCUAsyncScope
+
+    Wrap non-pipelined global->shared BufferStores in tir::attr::async_scope so
+    that LowerSharedGlobalCopy can rewrite them into tl.dcu_async_copy calls.
+    Also appends a tl.cp_async_wait<0>() + tl.wave_barrier() pair after every
+    async copy so subsequent s2r reads observe complete shared-memory data
+    when num_stages == 0 (the InjectSoftwarePipeline bypass case).
+    """
+    return _ffi_api.InjectDCUAsyncScope()  # type: ignore
+
+
 def LowerSharedGlobalCopy():
     """DCUResourceRewriter"""
     return _ffi_api.LowerSharedGlobalCopy()  # type: ignore

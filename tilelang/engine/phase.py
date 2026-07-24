@@ -167,16 +167,16 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
-    print(mod)
+    
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
     if dcu_async_copy_supported(target):
         # Capture T.gemm transpose flags before later passes strip AttrStmt annotations.
         mod = tilelang.transform.AnnotateDCUGemmTranspose()(mod)
-    print(mod)
+
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
-    print(mod)
+    
     # Legalize vectorized loops to ensure they are valid
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     
@@ -190,7 +190,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     # Hoist any root-block annotations to PrimFunc attrs if pass is available
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
-
     return mod
 
 
@@ -308,6 +307,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.PersistThreadblock()(mod)
 
     if dcu_async_copy_supported(target):
+        mod = tilelang.transform.InjectDCUAsyncScope()(mod)
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)
         mod = tilelang.transform.FixDCUWaitCount()(mod)

@@ -124,12 +124,19 @@ class GemmMMAC(GemmBase):
                     )
 
                     # Load B into fragment
-                    for kj in T.serial(0, self.k_pack):
+                    if self.trans_B:
                         mmac_emitter.ldmatrix_b(
                             B_local,
                             B_region,
-                            kj,
+                            ki,
                         )
+                    else:
+                        for kj in T.serial(0, self.k_pack):
+                            mmac_emitter.ldmatrix_b(
+                                B_local,
+                                B_region,
+                                kj,
+                            )
 
                     # Perform Matrix Multiplication
                     mmac_emitter.mmac(A_local, B_local, C_buf, ki)

@@ -349,13 +349,10 @@ class MatrixCoreIntrinEmitter:
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
-        layoutInfer = None
-        if self.b_transposed:
-            layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
-        else:
-            layoutInfer = SharedToLocalLayoutB if micro_size_k == 16 else SharedToLocalKDim32LayoutB
         if not is_transposed:
             layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
+        else:
+            layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols, self.b_dtype)
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
         B_buf = B_region.buffer
@@ -373,23 +370,13 @@ class MatrixCoreIntrinEmitter:
             if is_transposed:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = layoutInfer.base(tx, local_id, k_pack)
-                        row, col = layoutInfer.slab(row, col)
-                        row, col = layoutInfer.warp(row, col, warp_n)
-                        row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
-                        row, col = layoutInfer.rewind(row, col, tx, warp_n, j, self.block_col_warps)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
+                        row, col = shared_to_local_layout_A(tx, local_id, warp_n, j, layout_config)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col + ki * micro_size_k]
 
             else:
                 for j in T.serial(warp_cols // 2):
                     for local_id in T.vectorized(2 * local_size_b):
                         row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
-                        # row, col = layoutInfer.base(tx, local_id)
-                        # row, col = layoutInfer.slab(row, col)
-                        # row, col = layoutInfer.warp(row, col, warp_n)
-                        # row, col = layoutInfer.itera(row, col, j, self.block_col_warps)
-                        # row, col = layoutInfer.permute(row, col, warp_cols, self.block_col_warps)
-                        # row, col = layoutInfer.rewind(row, col, tx, warp_n, j, warp_cols, self.block_col_warps)
                         B_local_buf[ki * warp_cols * local_size_b + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
@@ -415,21 +402,38 @@ class MatrixCoreIntrinEmitter:
         @T.macro
         def _warp_mmac(A_local_buf, B_local_buf, C_local_buf):
             for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
-                T.tvm_mmac(
-                    mmac_suffix,
-                    "row",
-                    "row",
-                    compute_a_dtype,
-                    compute_b_dtype,
-                    compute_out_dtype,
-                    B_local_buf.data,
-                    (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b,
-                    A_local_buf.data,
-                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
-                    C_local_buf.data,
-                    (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
-                    dtype=compute_out_dtype,
-                )
+                if self.b_transposed: 
+                    T.tvm_mmac(
+                                mmac_suffix,
+                                "row",
+                                "row",
+                                compute_a_dtype,
+                                compute_b_dtype,
+                                compute_out_dtype,
+                                B_local_buf.data,
+                                (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                                A_local_buf.data,
+                                (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                                C_local_buf.data,
+                                (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                                dtype=compute_out_dtype,
+                            )
+                else:
+                    T.tvm_mmac(
+                        mmac_suffix,
+                        "row",
+                        "row",
+                        compute_a_dtype,
+                        compute_b_dtype,
+                        compute_out_dtype,
+                        B_local_buf.data,
+                        (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b,
+                        A_local_buf.data,
+                        (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                        C_local_buf.data,
+                        (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                        dtype=compute_out_dtype,
+                    )
 
         return _warp_mmac(A_local_buf, B_local_buf, C_local_buf)
 
@@ -714,10 +718,15 @@ class MatrixCoreIntrinEmitter:
                 forward_index_fn=forward_index,
             )
         else:
+            # For NT/TN/TT cases the C register layout is the same as the NN case.
+            # The MMA intrinsic transpose flags only affect how A/B inputs are
+            # interpreted; the output C is always stored in the same register
+            # layout. Use forward_index (not forward_index_nt) to avoid index
+            # collisions and ensure the per-thread buffer size is correct.
             return T.Fragment(
                 shape,
-                forward_thread_fn=forward_thread_nt,
-                forward_index_fn=forward_index_nt,
+                forward_thread_fn=forward_thread,
+                forward_index_fn=forward_index,
             )
 
     @staticmethod

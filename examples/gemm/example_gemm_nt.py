@@ -11,7 +11,8 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+            T.use_warp_divergence(enable=False)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -19,7 +20,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
                 T.copy(B[bx * block_N, k * block_K], B_shared, major="row_major")
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -27,10 +28,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    M = 8192
-    N = 8192
-    K = 8192
-    kernel = matmul(M, N, K, 128, 128, 32)
+    M = 4096
+    N = 4096
+    K = 4096
+    kernel = matmul(M, N, K, 256, 256, 16)
 
     import torch
 
@@ -52,6 +53,21 @@ def main():
     print(f"tilelang Latency: {latency}ms")
     print(f"GEMM TFLops: {2 * M * N * K / (latency * 1e9)}")
 
+    if not torch.allclose(c, ref_c, rtol=1e-3, atol=1e-3):
+        mismatch = torch.nonzero(~torch.isclose(c, ref_c, rtol=1e-3, atol=1e-3))
+        total = mismatch.size(0)
+        print(f"\n[FAIL] Total mismatches: {total}")
+        for i in range(min(5, total)):
+            idx = tuple(mismatch[i].tolist())
+            abs_err = abs(c[idx].item() - ref_c[idx].item())
+            print(f"  [{i}] idx={idx}  actual={c[idx].item():.8f}  expected={ref_c[idx].item():.8f}  abs_err={abs_err:.6e}")
+
+        # Debug: print row 0 cols 16-31 and rows 16-31 col 0
+        print("\n--- Debug slices ---")
+        print(f"c[0, 16:32]:    {c[0, 32:48]}")
+        print(f"ref_c[0, 16:32]: {ref_c[0, 32:48]}")
+        print(f"c[16:32, 0]:     {c[16:32, 0]}")
+        print(f"ref_c[16:32, 0]:  {ref_c[16:32, 0]}")
     torch.testing.assert_close(c, ref_c, rtol=1e-3, atol=1e-3)
     print("All check passed.")
 

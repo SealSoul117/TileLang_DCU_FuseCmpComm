@@ -646,9 +646,6 @@ class MatrixCoreIntrinEmitter:
         micro_size_dcu_y = 32
         if self.b_transposed:
             slab4_num_b = self.block_col_warps * self.warp_col_tiles * self.block_K // (1024 // data_byte * 4)
-            # total_slab4_num_b = 
-            print("slab_num__b")
-            print(slab4_num_b)
             micro_size_dcu_y = slab4_num_b * 16
         def forward_thread(i: int, j: int) -> int:
             """

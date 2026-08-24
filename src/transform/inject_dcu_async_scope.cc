@@ -14,6 +14,12 @@
  *        AttrStmt (e.g. coming from a previous pipeline injection) are also
  *        skipped to avoid double wrapping.
  *
+ *        The scan covers the whole function body, not just For bodies: with
+ *        num_stages == 0 an extent-1 pipelined loop is collapsed by earlier
+ *        passes (Simplify/VectorizeLoop/StorageRewrite), leaving the g2s
+ *        stores at the top level of the kernel body where a For-only scan
+ *        would miss them.
+ *
  *        When num_stages == 0 the InjectSoftwarePipeline pass is bypassed,
  *        so the pipeline-style async_commit / async_wait AttrStmts that drive
  *        cp_async_wait<N> emission are never produced. To keep semantics
@@ -66,12 +72,30 @@ const BufferLoadNode *PeelBufferLoad(const PrimExpr &value) {
  *        shared/shared.dyn Buffer. Only direct BufferLoad / Cast<BufferLoad>
  *        values are matched (mirrors the predicate inside
  *        LowerSharedGlobalCopy::CollectResources).
+ *
+ *        Stores inside For loops annotated with num_stages are skipped: those
+ *        belong to the software-pipeline path, which already emits its own
+ *        async_scope wrappers and must not be wrapped twice.
+ *
+ *        Note that g2s stores may appear outside any For loop entirely: with
+ *        num_stages == 0 the pipelined loop is bypassed and, when its extent
+ *        is 1 (or it gets unrolled by earlier passes), earlier passes collapse
+ *        it so the copies sit directly in the kernel body. Scanning the whole
+ *        body (not just For bodies) is what makes those top-level copies
+ *        visible to this pass.
  */
 class GlobalToSharedStoreCollector : public StmtExprVisitor {
  public:
   std::vector<const BufferStoreNode *> stores;
 
  private:
+  void VisitStmt_(const ForNode *op) final {
+    if (op->annotations.count("num_stages")) {
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const BufferStoreNode *op) final {
     if (IsSharedScope(op->buffer.scope())) {
       const BufferLoadNode *load = PeelBufferLoad(op->value);
@@ -85,10 +109,10 @@ class GlobalToSharedStoreCollector : public StmtExprVisitor {
 
 /*!
  * \brief Cheap outer scan: returns true iff the function body contains at
- *        least one For loop without a num_stages annotation that has a
- *        global→shared BufferStore in its body. If the function already has
- *        an attr::async_scope AttrStmt, we skip it to avoid double wrapping
- *        (pipelines already take care of it).
+ *        least one global→shared BufferStore outside of a num_stages-annotated
+ *        For loop. If the function already has an attr::async_scope AttrStmt,
+ *        we skip it to avoid double wrapping (pipelines already take care of
+ *        it).
  */
 class NeedsInjectionScanner : public StmtVisitor {
  public:
@@ -105,10 +129,16 @@ class NeedsInjectionScanner : public StmtVisitor {
   }
 
   void VisitStmt_(const ForNode *op) final {
-    if (!op->annotations.count("num_stages")) {
-      GlobalToSharedStoreCollector inner;
-      inner(op->body);
-      if (!inner.stores.empty()) {
+    if (op->annotations.count("num_stages")) {
+      return;
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (IsSharedScope(op->buffer.scope())) {
+      const BufferLoadNode *load = PeelBufferLoad(op->value);
+      if (load != nullptr && IsGlobalScope(load->buffer)) {
         needs_injection = true;
       }
     }

@@ -152,7 +152,8 @@ std::vector<int> BuildEpilogueGldFenceValues(const std::vector<int>& wait_counts
 class InsertAsyncGldFenceMutator : public StmtMutator {
  public:
   explicit InsertAsyncGldFenceMutator(const Stmt& root)
-      : epilogue_gld_fence_values_(BuildEpilogueGldFenceValues(CollectEpilogueWaitCounts(root))) {}
+      : has_main_loop_(!CollectDCUMainLoops(root).empty()),
+        epilogue_gld_fence_values_(BuildEpilogueGldFenceValues(CollectEpilogueWaitCounts(root))) {}
 
   Stmt VisitStmt_(const ForNode* op) override {
     if (IsDCUMainLoop(op)) {
@@ -166,6 +167,18 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
   }
 
   Stmt VisitStmt_(const AttrStmtNode* op) override {
+    const bool is_wait_scope = op->attr_key == tir::attr::async_wait_queue_scope ||
+                               op->attr_key == "async_wait_queue_scope" ||
+                               op->attr_key == tir::attr::async_wait_inflight_count ||
+                               op->attr_key == "async_wait_inflight_count";
+    // Fully unrolled K has no main loop; the first wait is still prologue and
+    // must be kept. Later waits are converted like the main-loop body.
+    if (!has_main_loop_ && is_wait_scope && phase_ == PipelinePhase::kBeforeMainLoop) {
+      Stmt kept = StmtMutator::VisitStmt_(op);
+      phase_ = PipelinePhase::kInMainLoop;
+      return kept;
+    }
+
     if (!ShouldTransform(phase_)) {
       return StmtMutator::VisitStmt_(op);
     }
@@ -229,6 +242,14 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
       return;
     }
 
+    // CX4 uses async_gld_sld_fence(0) and has no async_gld_fence partner.
+    if (GetAsyncGldSldFenceValue(result[n - 2]) == 0) {
+      if (!pending_wait_counts_.empty()) {
+        pending_wait_counts_.pop_front();
+      }
+      return;
+    }
+
     int wait_count = pending_wait_counts_.front();
     pending_wait_counts_.pop_front();
     Stmt barrier = result[n - 1];
@@ -259,6 +280,7 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
   }
 
   PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
+  bool has_main_loop_{true};
   std::deque<int> pending_wait_counts_;
   const std::vector<int> epilogue_gld_fence_values_;
   int epilogue_gld_insert_idx_{0};

@@ -287,6 +287,17 @@ PrefetchBarrierPlan ComputePrefetchBarrierPlan(const Stmt& root) {
     return plan;
 }
 
+bool IsAsyncWaitScopeStmt(const Stmt& stmt) {
+    const auto* op = stmt.as<AttrStmtNode>();
+    if (!op) {
+        return false;
+    }
+    return op->attr_key == tir::attr::async_wait_queue_scope ||
+           op->attr_key == "async_wait_queue_scope" ||
+           op->attr_key == tir::attr::async_wait_inflight_count ||
+           op->attr_key == "async_wait_inflight_count";
+}
+
 bool StmtContainsMMA(const Stmt& stmt) {
     bool found = false;
     PostOrderVisit(stmt, [&found](const ObjectRef& node) {
@@ -601,7 +612,15 @@ public:
             } else {
                 LoadCounter counter;
                 counter(stmt);
-                pending_load_count += counter.total_loads;
+                // A wait-scope starts a new shared-load cluster (one A/B stage).
+                // Without a main k-loop, multiple clusters sit in the same SeqStmt
+                // and must not be summed into one fence (e.g. 4+4 + 4+4 = 16
+                // instead of the latest A+B = 8).
+                if (IsAsyncWaitScopeStmt(stmt) && counter.total_loads > 0) {
+                    pending_load_count = counter.total_loads;
+                } else {
+                    pending_load_count += counter.total_loads;
+                }
                 new_seq.push_back(this->VisitStmt(stmt));
                 prev_stmt_is_dcu_async_copy = false;
             }

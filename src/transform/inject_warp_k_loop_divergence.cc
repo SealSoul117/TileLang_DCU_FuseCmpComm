@@ -329,12 +329,22 @@ std::optional<int> ComputeWarpHalf(const PrimExpr& thread_extent) {
 }
 
 PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
-  if (!HasUseWarpDivergenceAttr(func)) {
+  InfoCollector collector;
+  collector(func->body);
+
+  // Besides the explicit tl.use_warp_divergence annotation, auto-enable the
+  // pass when the block launches at least 512 threads (threadIdx.x extent).
+  // Otherwise the default remains disabled.
+  bool enabled = HasUseWarpDivergenceAttr(func);
+  if (!enabled) {
+    if (auto extent = GetConstIntValue(collector.thread_extent)) {
+      enabled = *extent >= 512;
+    }
+  }
+  if (!enabled) {
     return func;
   }
 
-  InfoCollector collector;
-  collector(func->body);
   if (!collector.found_k_loop || !collector.warp_idx_var.defined() ||
       !collector.thread_extent.defined()) {
     return func;

@@ -7,7 +7,7 @@ tilelang.disable_cache()
 
 def evaluate_correctness(src_bf16, ref_bf16, ref_fp32, K,
                          eps_dtype=2 ** -8, atol_scale=3.0, rtol_const=0.05,
-                         top_k=100):
+                         top_k=100, grid_size=16):
     """评估 GEMM kernel 的正确性。
 
     Args:
@@ -19,9 +19,10 @@ def evaluate_correctness(src_bf16, ref_bf16, ref_fp32, K,
         atol_scale: 绝对误差地板 scale 系数 (atol = sqrt(K) * eps * scale)
         rtol_const: 相对误差天花板 (默认 0.05 = bf16 量化裕度)
         top_k: 取 top-K 最坏元素求平均
+        grid_size: 错误位置空间网格每维最大分区数 (默认 16×16)
 
     Returns:
-        dict, 包含全局指标和边界指标
+        dict, 包含全局指标、边界指标和错误位置统计
     """
     assert src_bf16.shape == ref_bf16.shape == ref_fp32.shape, "shape mismatch"
     H, W = src_bf16.shape
@@ -70,6 +71,67 @@ def evaluate_correctness(src_bf16, ref_bf16, ref_fp32, K,
     bad_rows = torch.where(row_bad_ratio > 0.5)[0]
     bad_cols = torch.where(col_bad_ratio > 0.5)[0]
 
+    # ---------- 错误位置统计 ----------
+    bad_idx_1d = torch.nonzero(bad_mask_1d).flatten()
+    bad_count = int(bad_idx_1d.numel())
+
+    # 全局最坏点: excess = diff / allowed 最大处 (无论是否判定为坏点)
+    worst_flat = int(excess.argmax().item())
+    worst_point = {
+        "row": worst_flat // W,
+        "col": worst_flat % W,
+        "src": src_v[worst_flat].item(),
+        "ref": ref_v[worst_flat].item(),
+        "diff": diff[worst_flat].item(),
+        "allowed": allowed[worst_flat].item(),
+        "excess": excess[worst_flat].item(),
+    }
+
+    # 粗粒度网格: 把 H×W 分成 grid_r×grid_c 个区域, 统计每格坏点数与密度
+    grid_r = min(grid_size, H)
+    grid_c = min(grid_size, W)
+    bin_r = (H + grid_r - 1) // grid_r
+    bin_c = (W + grid_c - 1) // grid_c
+    dev = bad_mask_2d.device
+    grid_hist = torch.zeros(grid_r, grid_c, dtype=torch.long, device=dev)
+    grid_density = torch.zeros(grid_r, grid_c, device=dev)
+
+    top_bad_rows = []
+    top_bad_cols = []
+    worst_bad_points = []
+    if bad_count > 0:
+        # 最坏坏点坐标 (仅统计 excess > 1 的坏点, 按 excess 降序)
+        excess_bad = excess[bad_idx_1d]
+        n_worst = min(top_k, bad_count)
+        topv, topi = excess_bad.topk(n_worst)
+        worst_rows = bad_idx_1d[topi] // W
+        worst_cols = bad_idx_1d[topi] % W
+        worst_bad_points = [
+            (int(r), int(c), float(e))
+            for r, c, e in zip(worst_rows.tolist(), worst_cols.tolist(), topv.tolist())
+        ]
+
+        # 行/列坏点数直方图 top-10 (坏点最多的行列)
+        row_counts = bad_mask_2d.sum(dim=1)
+        col_counts = bad_mask_2d.sum(dim=0)
+        top_bad_rows = sorted(
+            ((int(r), int(row_counts[r].item())) for r in
+             torch.nonzero(row_counts).flatten().tolist()),
+            key=lambda x: x[1], reverse=True)[:10]
+        top_bad_cols = sorted(
+            ((int(c), int(col_counts[c].item())) for c in
+             torch.nonzero(col_counts).flatten().tolist()),
+            key=lambda x: x[1], reverse=True)[:10]
+
+        # 网格直方图 (边缘格面积可能偏小, 用实际元素数归一化密度)
+        bin_idx = ((torch.arange(H, device=dev).unsqueeze(1).expand(H, W) // bin_r)
+                   * grid_c + (torch.arange(W, device=dev).unsqueeze(0).expand(H, W)
+                               // bin_c)).reshape(-1)
+        grid_area = torch.bincount(bin_idx, minlength=grid_r * grid_c).float().clamp(min=1)
+        grid_hist = torch.bincount(bin_idx[bad_mask_1d],
+                                   minlength=grid_r * grid_c).reshape(grid_r, grid_c)
+        grid_density = grid_hist.float() / grid_area.reshape(grid_r, grid_c)
+
     return {
         # 全局
         "cos_src_vs_fp32": cos_src.item(),
@@ -96,6 +158,20 @@ def evaluate_correctness(src_bf16, ref_bf16, ref_fp32, K,
         "bad_col_ratio_max": col_bad_ratio.max().item(),
         "bad_row_count": int(bad_rows.numel()),
         "bad_col_count": int(bad_cols.numel()),
+        # 错误位置统计
+        "H": H,
+        "W": W,
+        "bad_count": bad_count,
+        "worst_point": worst_point,
+        "worst_bad_points": worst_bad_points,
+        "top_bad_rows": top_bad_rows,
+        "top_bad_cols": top_bad_cols,
+        "grid_r": grid_r,
+        "grid_c": grid_c,
+        "bin_r": bin_r,
+        "bin_c": bin_c,
+        "grid_hist": grid_hist.tolist(),
+        "grid_density": grid_density.tolist(),
     }
 
 
@@ -156,6 +232,49 @@ def print_correctness_report(m, name="kernel"):
     print(f"    列坏点率最大: {m['bad_col_ratio_max']*100:.2f}%")
     print(f"    >50% 坏点行数: {m['bad_row_count']}, 前 20 个索引: {m['bad_row_indices']}")
     print(f"    >50% 坏点列数: {m['bad_col_count']}, 前 20 个索引: {m['bad_col_indices']}")
+
+    print(sep_thin)
+    print("  [错误位置统计 - 坏点具体在哪些行列]")
+    print(sep_thin)
+
+    print("  全局最坏点       (excess = diff/(atol+rtol×|ref|) 最大处, 无论是否判定为坏点)")
+    wp = m["worst_point"]
+    print(f"    row = {wp['row']}, col = {wp['col']}")
+    print(f"    src = {wp['src']:.6f}, ref = {wp['ref']:.6f}, "
+          f"diff = {wp['diff']:.6f}, allowed = {wp['allowed']:.6f}, excess = {wp['excess']:.3f}")
+    print()
+
+    if m["bad_count"] == 0:
+        print("  坏点总数: 0, 无位置统计输出")
+    else:
+        print(f"  坏点总数: {m['bad_count']} ({m['bad_pixel_ratio']*100:.4f}%)")
+        print()
+
+        print(f"  top-{len(m['worst_bad_points'])} 最坏坏点坐标 (按 excess 降序):")
+        for r, c, e in m["worst_bad_points"]:
+            print(f"    row = {r}, col = {c}   excess = {e:.3f}")
+        print()
+
+        print("  坏点最多行 top-10 (row, count):", m["top_bad_rows"])
+        print("  坏点最多列 top-10 (col, count):", m["top_bad_cols"])
+        print()
+
+        # ASCII 密度网格: 单色渐变, 越深的字符表示该区域坏点越多 (sequential 编码)
+        ramp = " .:oO#@"
+        hist = m["grid_hist"]
+        gmax = max((max(r) for r in hist), default=0)
+        print(f"  坏点空间分布网格 ({m['grid_r']}×{m['grid_c']}, "
+              f"每格约 {m['bin_r']}×{m['bin_c']} 元素):")
+        for row_hist in hist:
+            chars = []
+            for v in row_hist:
+                if v == 0:
+                    chars.append(ramp[0])
+                else:
+                    idx = 1 + int(round((v / gmax) * (len(ramp) - 2)))
+                    chars.append(ramp[min(idx, len(ramp) - 1)])
+            print("    |" + "".join(chars) + "|")
+        print(f"    图例: '{ramp[0]}' = 0 坏点, '{ramp[1]}'..'{ramp[-1]}' = 0..{gmax} 坏点/格")
     print(sep_thick)
 
 
@@ -231,14 +350,15 @@ def print_verdict(passed, failures):
 
 
 @tilelang.jit(out_idx=[-1])
-def matmul(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
     def gemm(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
+            # T.use_warp_divergence(True)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -254,13 +374,13 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.f
 
 
 def main():
-    M = 4437
-    N = 2048
-    K = 6144
-    kernel = matmul(M, N, K, 256, 256, 16)
+    M = 128
+    N = 128
+    K = 128
+    kernel = matmul(M, N, K, 128, 128, 16)
 
-    a = torch.randn(M, K).cuda().bfloat16()
-    b = torch.randn(N, K).cuda().bfloat16()
+    a = torch.randn(M, K).cuda().half()
+    b = torch.randn(N, K).cuda().half()
 
     c = kernel(a, b)
     # c = (a.cpu() @ b.cpu().T).cuda()
@@ -270,7 +390,7 @@ def main():
     latency = profiler.do_bench()
     print(f"tilelang Latency: {latency}ms")
     print(f"GEMM TFLops: {2 * M * N * K / (latency * 1e9)}")
-    print()
+    print(kernel.get_kernel_source())
 
     ref_fp32 = (a.float() @ b.float().T)
     metrics = evaluate_correctness(c, ref_c, ref_fp32, K=K)

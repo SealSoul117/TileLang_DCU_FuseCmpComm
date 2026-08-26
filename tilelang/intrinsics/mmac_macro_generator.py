@@ -43,6 +43,7 @@ from .mmac_layout import (
     SharedToLocalKDim32LayoutB,
     shared_to_local_layout_A,
     shared_to_local_layout_B,
+    shared_to_local_layout_B_simple,
     LayoutConfig
 )
 
@@ -94,6 +95,7 @@ class MatrixCoreIntrinEmitter:
         is_m_first: bool | None = False,
         b_preshuffle: bool | None = False,
         thread_var: Var | None = None,
+        enable_fast_lds: bool | None = False,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -107,6 +109,9 @@ class MatrixCoreIntrinEmitter:
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
         self.block_K = block_K
+        self.enable_fast_lds = enable_fast_lds
+        print("self.enable_fast_lds_init:", self.enable_fast_lds)
+        
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
@@ -350,9 +355,11 @@ class MatrixCoreIntrinEmitter:
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
         if not is_transposed:
-            layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
+            if self.enable_fast_lds:
+                layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
         else:
             layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols, self.b_dtype)
+        print("self.enable_fast_lds:", self.enable_fast_lds)
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
         B_buf = B_region.buffer
@@ -374,11 +381,16 @@ class MatrixCoreIntrinEmitter:
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col + ki * micro_size_k]
 
             else:
-                for j in T.serial(warp_cols // 2):
-                    for local_id in T.vectorized(2 * local_size_b):
-                        row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
-                        B_local_buf[ki * warp_cols * local_size_b + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
-
+                if self.enable_fast_lds:
+                    for j in T.serial(warp_cols // 2):
+                        for local_id in T.vectorized(2 * local_size_b):
+                            row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
+                            B_local_buf[ki * warp_cols * local_size_b + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
+                else:
+                    for j in T.serial(warp_cols):
+                        for local_id in T.vectorized(k_pack * local_size_b):
+                            row, col = shared_to_local_layout_B_simple(tx, local_id)
+                            B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
     def mmac(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):

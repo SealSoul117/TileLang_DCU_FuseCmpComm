@@ -305,7 +305,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-
+    print(mod)
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.InjectDCUAsyncScope()(mod)
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
@@ -314,6 +314,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         # Device kernels are split out before this point; re-annotate ensures attrs exist on them.
         mod = tilelang.transform.AnnotateDCUGemmTranspose()(mod)
+
         mod = tilelang.transform.InjectDSRead()(mod)
 
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
@@ -322,7 +323,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectWarpIdx()(mod)
         # Shadow offset follows T.copy major order (row/col) on A_shared/B_shared.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
-        # mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
+        mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
         mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)

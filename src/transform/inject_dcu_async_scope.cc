@@ -4,15 +4,13 @@
  *        AttrStmt so that LowerSharedGlobalCopy can rewrite them into
  *        tl.dcu_async_copy calls (which codegen lowers to tl::cp_async_gs<...>).
  *
- *        This pass enables async g→s copies when the user writes a plain
- *        ``for k in range(...)`` body without a software pipeline annotation
- *        (i.e. ``num_stages == 0`` in TileLang's Pipelined). When a For loop
- *        already carries a ``num_stages`` annotation, pipeline_planning /
- *        InjectSoftwarePipeline / LowerSharedGlobalCopy already produce the
- *        necessary async_scope wrapping, so this pass is a no-op for those
- *        loops. Functions that already contain an ``attr::async_scope``
- *        AttrStmt (e.g. coming from a previous pipeline injection) are also
- *        skipped to avoid double wrapping.
+ *        When a For loop already carries a ``num_stages`` annotation,
+ *        pipeline_planning / InjectSoftwarePipeline already wrap those
+ *        in-loop g2s stores in async_scope, so this pass leaves them
+ *        alone. Prologue copies that sit *outside* such a loop (e.g. Q
+ *        loaded once before a pipelined K loop) are still wrapped: the
+ *        presence of an existing async_scope on the K copies must not
+ *        skip the whole function.
  *
  *        The scan covers the whole function body, not just For bodies: with
  *        num_stages == 0 an extent-1 pipelined loop is collapsed by earlier
@@ -75,7 +73,8 @@ const BufferLoadNode *PeelBufferLoad(const PrimExpr &value) {
  *
  *        Stores inside For loops annotated with num_stages are skipped: those
  *        belong to the software-pipeline path, which already emits its own
- *        async_scope wrappers and must not be wrapped twice.
+ *        async_scope wrappers and must not be wrapped twice. Stores already
+ *        nested under attr::async_scope are likewise skipped.
  *
  *        Note that g2s stores may appear outside any For loop entirely: with
  *        num_stages == 0 the pipelined loop is bypassed and, when its extent
@@ -89,6 +88,18 @@ class GlobalToSharedStoreCollector : public StmtExprVisitor {
   std::vector<const BufferStoreNode *> stores;
 
  private:
+  int async_scope_depth_{0};
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tir::attr::async_scope || op->attr_key == "async_scope") {
+      ++async_scope_depth_;
+      StmtExprVisitor::VisitStmt_(op);
+      --async_scope_depth_;
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const ForNode *op) final {
     if (op->annotations.count("num_stages")) {
       return;
@@ -97,9 +108,12 @@ class GlobalToSharedStoreCollector : public StmtExprVisitor {
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (IsSharedScope(op->buffer.scope())) {
+    if (async_scope_depth_ == 0 && IsSharedScope(op->buffer.scope())) {
       const BufferLoadNode *load = PeelBufferLoad(op->value);
-      if (load != nullptr && IsGlobalScope(load->buffer)) {
+      // Only wrap vectorized 16-byte g2s; scalar copies must not become
+      // tl.dcu_async_copy / cp_async_gs<16>.
+      if (load != nullptr && IsGlobalScope(load->buffer) &&
+          IsDCUCpAsyncVectorCopy(op, load)) {
         stores.push_back(op);
       }
     }
@@ -109,20 +123,21 @@ class GlobalToSharedStoreCollector : public StmtExprVisitor {
 
 /*!
  * \brief Cheap outer scan: returns true iff the function body contains at
- *        least one global→shared BufferStore outside of a num_stages-annotated
- *        For loop. If the function already has an attr::async_scope AttrStmt,
- *        we skip it to avoid double wrapping (pipelines already take care of
- *        it).
+ *        least one global→shared BufferStore that is neither inside a
+ *        num_stages-annotated For nor already wrapped in async_scope.
  */
 class NeedsInjectionScanner : public StmtVisitor {
  public:
   bool needs_injection{false};
-  bool already_async{false};
 
  private:
+  int async_scope_depth_{0};
+
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::async_scope) {
-      already_async = true;
+    if (op->attr_key == tir::attr::async_scope || op->attr_key == "async_scope") {
+      ++async_scope_depth_;
+      StmtVisitor::VisitStmt_(op);
+      --async_scope_depth_;
       return;
     }
     StmtVisitor::VisitStmt_(op);
@@ -136,9 +151,10 @@ class NeedsInjectionScanner : public StmtVisitor {
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (IsSharedScope(op->buffer.scope())) {
+    if (async_scope_depth_ == 0 && IsSharedScope(op->buffer.scope())) {
       const BufferLoadNode *load = PeelBufferLoad(op->value);
-      if (load != nullptr && IsGlobalScope(load->buffer)) {
+      if (load != nullptr && IsGlobalScope(load->buffer) &&
+          IsDCUCpAsyncVectorCopy(op, load)) {
         needs_injection = true;
       }
     }
@@ -202,7 +218,7 @@ class AsyncScopeInjector : public StmtExprMutator {
 PrimFunc InjectDCUAsyncScopeToFunc(PrimFunc func) {
   NeedsInjectionScanner scanner;
   scanner(func->body);
-  if (!scanner.needs_injection || scanner.already_async) {
+  if (!scanner.needs_injection) {
     return func;
   }
 

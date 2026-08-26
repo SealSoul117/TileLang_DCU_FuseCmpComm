@@ -32,14 +32,49 @@ def mma0_kernel(
         block_M=256,
         block_N=256,
         num_stages=4,
-        threads=512):
+        threads=256):
     q_shape = [batch, heads, seq_q, dim]
     k_shape = [batch, heads, seq_kv, dim]
     out_shape = [batch, heads, seq_q, seq_kv]
 
     dtype = T.float16
     accum_dtype = T.float32
+    scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
+    @T.macro
+    def Softmax(
+        acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
+        acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
+        scores_max: T.FragmentBuffer([block_M], accum_dtype),
+        scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
+        scores_scale: T.FragmentBuffer([block_M], accum_dtype),
+        scores_sum: T.FragmentBuffer([block_M], accum_dtype),
+        logsum: T.FragmentBuffer([block_M], accum_dtype),
+    ):
+        T.copy(scores_max, scores_max_prev)
+        T.fill(scores_max, -T.infinity(accum_dtype))
+        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
 
+        for i in T.Parallel(block_M):
+            scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+
+        # To do causal softmax, we need to set the scores_max to 0 if it is -inf
+        # This process is called Check_inf in FlashAttention3 code, and it only need to be done
+        # in the first ceil_div(kBlockM, kBlockN) steps.
+        # for i in T.Parallel(block_M):
+        #     scores_max[i] = T.if_then_else(scores_max[i] == -T.infinity(accum_dtype), 0, scores_max[i])
+        for i in T.Parallel(block_M):
+            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+
+        for i, j in T.Parallel(block_M, block_N):
+            # Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
+            # max * log_2(e)) This allows the compiler to use the ffma
+            # instruction instead of fadd and fmul separately.
+            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+        T.reduce_sum(acc_s, scores_sum, dim=1)
+        for i in T.Parallel(block_M):
+            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+        T.copy(acc_s, acc_s_cast)
+        
     @T.macro
     def MMA0(
         K: T.Tensor(k_shape, dtype),
@@ -68,7 +103,7 @@ def mma0_kernel(
         #
         # -----------------------
         # T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
-        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, k_pack=(dim//16), policy=T.GemmWarpPolicy.FullRow)
+        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, k_pack=(dim//16))
 
         # -----------------------
         # causal mask
@@ -93,16 +128,26 @@ def mma0_kernel(
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
-
+            acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
+            # acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
+            #scores_max = T.alloc_fragment([block_M], accum_dtype)
+            #scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
+            #scores_scale = T.alloc_fragment([block_M], accum_dtype)
+            #scores_sum = T.alloc_fragment([block_M], accum_dtype)
+            #logsum = T.alloc_fragment([block_M], accum_dtype)
             # load Q
             T.copy(Q[bz, by, bx*block_M:(bx+1)*block_M, :], Q_shared, major="row_major")
+            # T.fill(acc_o, 0)
+            #T.fill(logsum, 0)
+            #T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = T.ceildiv(seq_kv, block_N)
 
             for k in T.Pipelined(loop_range, num_stages=0):
                 MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
+                # Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
 
-                # store S block
+            # store S block
                 T.copy(acc_s, Output[bz, by, bx*block_M:(bx+1)*block_M, k*block_N:(k+1)*block_N])
 
     return main
@@ -111,11 +156,13 @@ def mma0_kernel(
 def ref_program(Q, K, is_causal):
     # FP32 accumulate
     # scores = torch.matmul(Q.float(), K.float().transpose(-1, -2))
+    dim = Q.size(-1)
     scores = torch.einsum(
         "bhqd,bhkd->bhqk",
         Q.float(),
         K.float()
     )
+    # scores = scores / torch.sqrt(torch.tensor(dim, dtype=scores.dtype))
 
     if is_causal:
         seq_q = Q.size(2)
@@ -138,7 +185,7 @@ def main(
     Q = torch.randn(batch, heads, seq_q, dim, device="cuda", dtype=torch.float16)
     K = torch.randn(batch, heads, seq_kv, dim, device="cuda", dtype=torch.float16)
     
-    kernel = mma0_kernel(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=256, block_N=256, num_stages=4, threads=512)
+    kernel = mma0_kernel(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=128, block_N=128, num_stages=4, threads=256)
     
     print(kernel.get_kernel_source())
 
@@ -165,8 +212,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1, help="batch size")
     parser.add_argument("--heads", type=int, default=1, help="heads")
-    parser.add_argument("--seq_q", type=int, default=256, help="query sequence length")
-    parser.add_argument("--seq_kv", type=int, default=256, help="key/value sequence length")
+    parser.add_argument("--seq_q", type=int, default=128, help="query sequence length")
+    parser.add_argument("--seq_kv", type=int, default=128, help="key/value sequence length")
     parser.add_argument("--dim", type=int, default=16, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     args = parser.parse_args()

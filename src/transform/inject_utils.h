@@ -143,6 +143,16 @@ bool NeedsDCUAsyncCopyIdxenA(const DCUGemmTransposeFlags& flags);
  */
 bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags);
 
+/*!
+ * \brief Whether a global→shared BufferStore is a consecutive vector copy of
+ *        exactly 16 element-bytes (the width of tl::cp_async_gs<16>).
+ *
+ * Scalar or non-unit-stride loads must stay as ordinary BufferStore; rewriting
+ * them to dcu_async_copy would over-read (e.g. 1 half → dwordx4).
+ */
+bool IsDCUCpAsyncVectorCopy(const tir::BufferStoreNode* store,
+                            const tir::BufferLoadNode* load);
+
 }  // namespace tl
 }  // namespace tvm
 

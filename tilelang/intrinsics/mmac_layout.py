@@ -282,6 +282,12 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
     row = row - layout_config.row_per_slab * cond
     return row, new_col
 
+def shared_to_local_layout_B_simple(tx, local_id):
+    # base
+    row = local_id + (tx // 16) * 4
+    col = tx % 16
+    return row, col
+
     
 @dataclass(frozen=True)
 class SharedToLocalLayoutB:

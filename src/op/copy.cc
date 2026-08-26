@@ -423,6 +423,47 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
   return Downcast<For>(body);
 }
 
+For CopyNode::MakeDCUSIMTLoop(arith::Analyzer *analyzer,
+                              const DCUAsyncCopyParams &params) const {
+  // Default / "fast" path: no bank remapping — same 1:1 index mapping as
+  // MakeSIMTLoop. params is unused for indexing but kept for API parity with
+  // MakeDCURowAsyncSIMTLoop / MakeDCUColAsyncSIMTLoop.
+  (void)params;
+
+  Array<IterVar> loop_vars = MakeIterVars();
+  bool is_scalar = loop_vars.empty();
+
+  for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+
+  ICHECK(loop_vars.size() <= src_range.size())
+      << "loop_vars.size() = " << loop_vars.size()
+      << ", src_range.size() = " << src_range.size() << ", src = " << src->name
+      << ", dst = " << dst->name;
+  ICHECK(loop_vars.size() <= dst_range.size())
+      << "loop_vars.size() = " << loop_vars.size()
+      << ", dst_range.size() = " << dst_range.size() << ", src = " << src->name
+      << ", dst = " << dst->name;
+
+  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
+  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
+
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
+
+  Stmt body = BufferStore(dst, value, dst_indices);
+  if (is_scalar) {
+    return For(Var("i"), 0, 1, ForKind::kSerial, body);
+  }
+  for (int i = loop_vars.size() - 1; i >= 0; i--) {
+    Map<String, ObjectRef> annotations = {};
+    if (coalesced_width.defined()) {
+      annotations.Set("coalesced_width", coalesced_width);
+    }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kParallel, body, std::nullopt, annotations);
+  }
+  return Downcast<For>(body);
+}
 
 For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
                                       const DCUAsyncCopyParams &params) const {
@@ -449,25 +490,6 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
   PrimExpr part3 = floordiv(floormod(i_raw, row_per_slab), 4) * 16 * slab4_num;
   PrimExpr part4 = floordiv(floormod(i_raw, 4 * row_per_slab), row_per_slab) * row_per_bank;
   PrimExpr part5 = floordiv(i_raw, 4 * row_per_slab) * 16;
-
-  // PrimExpr part2 = floordiv(floormod(i_raw, 4 * row_per_bank), row_per_bank) * row_per_slab;
-  // PrimExpr part3 = floordiv(floormod(i_raw, 16), 4 * row_per_bank) * 2;
-  // PrimExpr part4 = floordiv(floormod(i_raw, slab4_num * 16), 16) * 4 * row_per_slab;
-  // PrimExpr part5 = floordiv(i_raw, slab4_num * 16) * 4;
-
-  // int pattern_thread_num = 4;
-
-  // 假设第一个维度 loop_vars[0] 是我们要变换的 i
-
-  // DataType dtype = i_raw.dtype();
-  // // 计算映射后的 i (i_mapped)
-  // PrimExpr p_t_num_expr = make_const(i_raw.dtype(), pattern_thread_num);
-
-  // // 使用 floordiv 和 floormod 代替运算符
-  // // 公式: [(i // (P * L)) % warp_m] * warp_size + [i // (P * L * warp_m)] * pattern_thread_num + [i // L % P]
-  // PrimExpr part1 = floormod(floordiv(i_raw, p_t_num_expr), params.warp_m) * p_t_num_expr * params.warp_m;
-  // PrimExpr part2 = floordiv(i_raw, p_t_num_expr * params.warp_m) * p_t_num_expr;
-  // PrimExpr part3 = floormod(i_raw, pattern_thread_num);
 
   PrimExpr i_mapped = part1 + part2 + part3 + part4 + part5;
   i_mapped = analyzer->Simplify(i_mapped);
@@ -541,25 +563,6 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
     i_mapped = analyzer->Simplify(i_mapped);
   }
   
-  // if (dim0 == 16){
-  //   PrimExpr part1 = floormod(i_raw, n) * r;
-  //   PrimExpr part2 = floordiv(floormod(i_raw, rn), n);
-  //   PrimExpr part3 = floordiv(i_raw, rn) * rn;
-
-  //   i_mapped = part1 + part2 + part3;
-  // } 
-  //else{
-    
-  //   int half_dim0 = dim0 / 2;
-  //   PrimExpr part1 = floormod(floordiv(i_raw, 4), 2);
-  //   PrimExpr part2 = floormod(i_raw, 2) * 2;
-  //   PrimExpr part3 = floordiv(i_raw, half_dim0) * 4;
-  //   PrimExpr part4 = floormod(floordiv(i_raw, 2), 2) * 8;
-  //   PrimExpr part5 = floormod(floordiv(i_raw, 8), 2) * half_dim0;
-  //   i_mapped = part1 + part2 + part3 + part4 + part5;
-  // }
-                                      
-
   // 构造特殊的 src_indices
   Array<PrimExpr> src_indices;
   // 我们手动替换第一个非 unit 维度的变量
@@ -1297,23 +1300,44 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
 
   // 直接生成针对 DCU 优化的 SIMT 循环
   Stmt simt_loop;
+  LOG(INFO) << "warp_m: " << warp_m << ", warp_num: " << warp_num;
+  LOG(INFO) << "dst shape: " << dst->shape;
   if (dst->shape.size() == 2)
   {
+      LOG(INFO) << "copy_major: " << copy_major;
       DCUAsyncCopyParams copy_params;
       copy_params.dim0 = dst->shape[0];
       copy_params.dim1 = dst->shape[1];
       copy_params.dtype = dst->dtype;
       copy_params.warp_m = warp_m;
       copy_params.warp_num = warp_num;
+      LOG(INFO) << "dim0: " << copy_params.dim0 << ", dim1: " << copy_params.dim1;
 
-      if (copy_major == 1) {
-        simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
+      PrimExpr tile_elems =
+          analyzer->Simplify(copy_params.dim0 * copy_params.dim1);
+      PrimExpr warp_capacity =
+          analyzer->Simplify(copy_params.warp_num * 64);
+      ICHECK(is_const_int(tile_elems) && is_const_int(warp_capacity))
+          << "DCU async copy path selection requires constant tile/warp sizes, "
+          << "got tile_elems=" << tile_elems
+          << ", warp_capacity=" << warp_capacity;
+      if (*as_const_int(tile_elems) <= *as_const_int(warp_capacity)) {
+        LOG(INFO) << "Choose fast copy.";
+        simt_loop = MakeDCUSIMTLoop(analyzer, copy_params);
       } else {
-        ICHECK(copy_major == 0)
-            << "Invalid copy_major value: " << copy_major
-            << ", expected 0 (row_major) or 1 (col_major).";
-        simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
+        if (copy_major == 1) {
+          LOG(INFO) << "Choose col_major copy.";
+          simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
+        } else {
+          ICHECK(copy_major == 0)
+              << "Invalid copy_major value: " << copy_major
+              << ", expected 0 (row_major) or 1 (col_major).";
+          LOG(INFO) << "Choose row_major copy.";
+          simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
+        }
       }
+
+
   }
   else {
     LOG(FATAL) << "DCU async copy lowering error: Currently only 2D copies are supported. "

@@ -302,5 +302,39 @@ bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags) {
   return flags.defined && flags.trans_b;
 }
 
+namespace {
+
+bool IsConsecutiveRamp(const PrimExpr& index, int expected_lanes) {
+  const auto* ramp = index.as<RampNode>();
+  if (!ramp) {
+    return false;
+  }
+  return is_const_int(ramp->stride, 1) && is_const_int(ramp->lanes, expected_lanes);
+}
+
+}  // namespace
+
+bool IsDCUCpAsyncVectorCopy(const BufferStoreNode* store, const BufferLoadNode* load) {
+  if (store == nullptr || load == nullptr) {
+    return false;
+  }
+  if (store->indices.size() != 1 || load->indices.size() != 1) {
+    return false;
+  }
+
+  DataType dtype = store->buffer->dtype;
+  if (dtype.lanes() > 1) {
+    dtype = dtype.element_of();
+  }
+  const int elem_bytes = dtype.bytes();
+  // codegen always emits tl::cp_async_gs<16> (16 bytes / thread).
+  if (elem_bytes <= 0 || 16 % elem_bytes != 0) {
+    return false;
+  }
+  const int expected_lanes = 16 / elem_bytes;
+  return IsConsecutiveRamp(store->indices[0], expected_lanes) &&
+         IsConsecutiveRamp(load->indices[0], expected_lanes);
+}
+
 }  // namespace tl
 }  // namespace tvm

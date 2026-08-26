@@ -245,6 +245,16 @@ protected:
    */
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
 
+  /*!
+   * \brief Default DCU SIMT copy: identity (sequential) index mapping.
+   *
+   * Used when the tile is small enough that bank-conflict remapping is not
+   * needed. Post-processing (cast / BufferStore / parallel For nesting)
+   * matches MakeDCURowAsyncSIMTLoop / MakeDCUColAsyncSIMTLoop.
+   */
+  For MakeDCUSIMTLoop(arith::Analyzer *analyzer,
+                      const DCUAsyncCopyParams &params) const;
+
   For MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
                               const DCUAsyncCopyParams &params) const;
 

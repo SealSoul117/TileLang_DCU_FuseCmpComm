@@ -40,6 +40,25 @@ namespace tl {
 
 using namespace tir;
 
+namespace {
+
+// ds_read_m32x16_b16 / ds_read_m32x32_b8 write a float32x4 (16 bytes) per thread.
+// Only consecutive vector BufferLoad/Store of that width can be rewritten.
+bool TryGetConsecutiveVectorOffset(const PrimExpr& index, int expected_lanes,
+                                   PrimExpr* offset) {
+  const auto* ramp = index.as<RampNode>();
+  if (!ramp) {
+    return false;
+  }
+  if (!is_const_int(ramp->stride, 1) || !is_const_int(ramp->lanes, expected_lanes)) {
+    return false;
+  }
+  *offset = ramp->base;
+  return true;
+}
+
+}  // namespace
+
 class DSReadInjector : public StmtExprMutator {
  public:
   explicit DSReadInjector(const DCUGemmTransposeFlags& flags) : flags_(flags) {}
@@ -54,54 +73,32 @@ class DSReadInjector : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-  const BufferLoadNode* load = op->value.as<BufferLoadNode>();
-  if (!load) {
-    return StmtExprMutator::VisitStmt_(op);
-  }
+    const BufferLoadNode* load = op->value.as<BufferLoadNode>();
+    if (!load) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
 
-  // local offset
-  ICHECK(op->indices.size() == 1);
-  PrimExpr local_index = op->indices[0];
-  PrimExpr local_offset;
+    const int elem_bytes = buffer->dtype.bytes();
+    if (elem_bytes != 1 && elem_bytes != 2) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+    // Per-thread destination is float32x4 = 16 bytes.
+    const int expected_lanes = 16 / elem_bytes;
 
-  if (const RampNode* ramp = local_index.as<RampNode>()) {
-      local_offset = ramp->base;
-  } else {
-      local_offset = local_index;
-  }
+    ICHECK(op->indices.size() == 1);
+    ICHECK(load->indices.size() == 1);
 
-  // lds offset
-  ICHECK(load->indices.size() == 1);
-  PrimExpr lds_index = load->indices[0];
-  PrimExpr lds_offset ;
+    PrimExpr local_offset;
+    PrimExpr lds_offset;
+    if (!TryGetConsecutiveVectorOffset(op->indices[0], expected_lanes, &local_offset) ||
+        !TryGetConsecutiveVectorOffset(load->indices[0], expected_lanes, &lds_offset)) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
 
-  if (const RampNode* ramp = lds_index.as<RampNode>()) {
-    lds_offset = ramp->base;
-  } else {
-    lds_offset = lds_index;
-  }
-
-  // buffer pointer
-  PrimExpr buffer_ptr = buffer->data;
-
-  Array<PrimExpr> args = {
-      buffer_ptr,
-      local_offset,
-      lds_offset
-  };
-
-  const Op& ds_op = buffer->dtype.bytes() == 1 ? ds_read_m32x32_b8() : ds_read_m32x16_b16();
-  ICHECK(buffer->dtype.bytes() == 1 || buffer->dtype.bytes() == 2)
-      << "InjectDSRead only supports 1-byte and 2-byte element types, got "
-      << buffer->dtype;
-
-  Call call = Call(
-      DataType::Handle(),
-      ds_op,
-      args
-  );
-
-  return Evaluate(call);
+    Array<PrimExpr> args = {buffer->data, local_offset, lds_offset};
+    const Op& ds_op = elem_bytes == 1 ? ds_read_m32x32_b8() : ds_read_m32x16_b16();
+    Call call = Call(DataType::Handle(), ds_op, args);
+    return Evaluate(call);
   }
 };
 

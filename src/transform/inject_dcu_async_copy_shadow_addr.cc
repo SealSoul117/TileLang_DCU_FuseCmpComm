@@ -11,6 +11,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <cctype>
 #include <functional>
 #include <optional>
 #include <string>
@@ -35,6 +36,62 @@ const Op& MakeDCUResourceOp() { return Op::Get("tl.make_dcu_resource"); }
 bool IsABufferName(const std::string& name) { return name == "A" || name == "A_1"; }
 
 bool IsBBufferName(const std::string& name) { return name == "B" || name == "B_1"; }
+
+bool IsALocalBufferName(const std::string& name) {
+  return name.find("A_local") != std::string::npos;
+}
+
+bool IsBLocalBufferName(const std::string& name) {
+  return name.find("B_local") != std::string::npos;
+}
+
+const BufferLoadNode* PeelBufferLoad(const PrimExpr& value) {
+  if (const auto* load = value.as<BufferLoadNode>()) {
+    return load;
+  }
+  if (const auto* cast = value.as<CastNode>()) {
+    return PeelBufferLoad(cast->value);
+  }
+  return nullptr;
+}
+
+bool IsSharedScopeName(const Buffer& buf) {
+  const std::string scope = buf.scope();
+  const std::string& name = buf->name;
+  return scope == "shared" || scope == "shared.dyn" ||
+         name.find("shared") != std::string::npos || name.find("shmem") != std::string::npos;
+}
+
+// Q -> Q_shared, K -> K_shared, A / A_1 -> A_shared.
+bool SharedNameMatchesGlobal(const std::string& shared_name, const std::string& global_name) {
+  if (shared_name.empty() || global_name.empty()) {
+    return false;
+  }
+  if (shared_name == global_name || shared_name == global_name + "_shared") {
+    return true;
+  }
+  auto strip_numeric_suffix = [](std::string name) {
+    while (!name.empty() && std::isdigit(static_cast<unsigned char>(name.back()))) {
+      name.pop_back();
+    }
+    if (!name.empty() && name.back() == '_') {
+      name.pop_back();
+    }
+    return name;
+  };
+  auto prefix_match = [&](const std::string& prefix) {
+    if (prefix.empty() || shared_name.rfind(prefix, 0) != 0) {
+      return false;
+    }
+    const std::string rest = shared_name.substr(prefix.size());
+    return rest.empty() || rest[0] == '_' || rest.find("shared") != std::string::npos;
+  };
+  if (prefix_match(global_name)) {
+    return true;
+  }
+  const std::string base = strip_numeric_suffix(global_name);
+  return base != global_name && prefix_match(base);
+}
 
 int GetElementBytes(DataType dtype) {
   if (dtype.lanes() > 1) {
@@ -168,6 +225,32 @@ class InfoCollector : public StmtExprVisitor {
   std::unordered_set<const VarNode*> a_dcu_res_vars;
   std::unordered_set<const VarNode*> b_dcu_res_vars;
   std::optional<int> b_elem_bytes;
+  std::unordered_set<std::string> a_shared_names;
+  std::unordered_set<std::string> b_shared_names;
+  std::vector<std::pair<const VarNode*, std::string>> pending_dcu_res;
+
+  void ClassifyPendingResources() {
+    for (const auto& item : pending_dcu_res) {
+      const VarNode* var = item.first;
+      const std::string& global_name = item.second;
+      if (a_dcu_res_vars.count(var) > 0 || b_dcu_res_vars.count(var) > 0) {
+        continue;
+      }
+      bool match_a = false;
+      bool match_b = false;
+      for (const std::string& shared_name : a_shared_names) {
+        match_a = match_a || SharedNameMatchesGlobal(shared_name, global_name);
+      }
+      for (const std::string& shared_name : b_shared_names) {
+        match_b = match_b || SharedNameMatchesGlobal(shared_name, global_name);
+      }
+      if (match_a && !match_b) {
+        a_dcu_res_vars.insert(var);
+      } else if (match_b && !match_a) {
+        b_dcu_res_vars.insert(var);
+      }
+    }
+  }
 
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -201,8 +284,28 @@ class InfoCollector : public StmtExprVisitor {
     if (op->buffer.scope() == "shared.dyn" && !buf_dyn_shmem.defined()) {
       buf_dyn_shmem = op->buffer->data;
     }
-    if (IsBBufferName(op->buffer->name)) {
+    if (IsBBufferName(op->buffer->name) || b_shared_names.count(op->buffer->name) > 0) {
       b_elem_bytes = GetBElemBytesFromDType(op->buffer->dtype);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode* op) final {
+    const bool is_a_local = IsALocalBufferName(op->buffer->name);
+    const bool is_b_local = IsBLocalBufferName(op->buffer->name);
+    if (is_a_local || is_b_local) {
+      if (const BufferLoadNode* load = PeelBufferLoad(op->value)) {
+        if (IsSharedScopeName(load->buffer)) {
+          if (is_a_local) {
+            a_shared_names.insert(load->buffer->name);
+          } else {
+            b_shared_names.insert(load->buffer->name);
+            if (!b_elem_bytes.has_value()) {
+              b_elem_bytes = GetBElemBytesFromDType(load->buffer->dtype);
+            }
+          }
+        }
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -211,7 +314,8 @@ class InfoCollector : public StmtExprVisitor {
     if (const auto* call = op->value.as<CallNode>()) {
       if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
         const std::string global_name = GetGlobalBufferName(call->args[0]);
-        if (global_name == "A" || global_name == "A_1") {
+        pending_dcu_res.emplace_back(op->var.get(), global_name);
+        if (IsABufferName(global_name)) {
           a_dcu_res_vars.insert(op->var.get());
         } else if (IsBBufferName(global_name)) {
           b_dcu_res_vars.insert(op->var.get());
@@ -537,6 +641,7 @@ int ResolveBElemBytes(const PrimFunc& func, const InfoCollector& collector) {
 PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
   InfoCollector collector;
   collector(func->body);
+  collector.ClassifyPendingResources();
 
   if (!collector.buf_dyn_shmem.defined() || !collector.thread_extent.defined()) {
     return func;

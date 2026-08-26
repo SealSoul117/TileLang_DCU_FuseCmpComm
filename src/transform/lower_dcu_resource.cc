@@ -232,6 +232,12 @@ CollectResult CollectResources(const Stmt& body) {
             if (!IsGlobalScope(src)) {
                 return false;
             }
+            // cp_async_gs<16> always transfers 16 consecutive bytes; skip scalar /
+            // non-vectorized g2s (e.g. B_shared[tid] = B[...]) so they stay as
+            // ordinary BufferStore.
+            if (!IsDCUCpAsyncVectorCopy(op, load)) {
+                return false;
+            }
 
             VariableKeeper keeper(loop_vars_);
             tvm::arith::Analyzer analyzer;

@@ -140,7 +140,19 @@ class RegisterPipelinePlanner : public StmtExprMutator {
         num_register_stages = imm->value;
       }
     }
-    if (num_register_stages <= 1) {
+    int num_shared_stages = 0;
+    if (auto num_stages_anno = op->annotations.Get("num_stages")) {
+      if (const auto* imm = num_stages_anno->as<IntImmNode>()) {
+        num_shared_stages = imm->value;
+      }
+    }
+    // Register pipeline reorders shared→register before global→shared so MMA
+    // can overlap with the next tile's copy. That is only valid when the copy
+    // is a later-iteration prefetch (num_stages >= 2). With num_stages == 1
+    // they are the same iteration, and injecting would fail validation:
+    //   "two statements with buffer access dependency in the same stage
+    //    cannot be reordered"
+    if (num_register_stages <= 1 || num_shared_stages <= 1) {
       return for_node;
     }
 
@@ -226,6 +238,9 @@ class RegisterPipelinePlanner : public StmtExprMutator {
       }
     }
     int register_stage = std::max(0, compute_stage - 1);
+    if (register_stage <= 0) {
+      return for_node;
+    }
 
     std::vector<Integer> orders(n, Integer(-1));
     std::vector<Integer> stages(n, Integer(compute_stage));

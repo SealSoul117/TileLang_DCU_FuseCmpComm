@@ -95,12 +95,114 @@ Stmt MakeWaveBarrierStmt() {
     return Evaluate(barrier_call);
 }
 
+bool IsWaveBarrierStmt(const Stmt& stmt) {
+    if (const auto* eval = stmt.as<EvaluateNode>()) {
+        if (const auto* call = eval->value.as<CallNode>()) {
+            if (const auto* op = call->op.as<OpNode>()) {
+                return op->name == "tl.wave_barrier";
+            }
+        }
+    }
+    return false;
+}
+
+bool IsCpAsyncWaitStmt(const Stmt& stmt) {
+    if (const auto* eval = stmt.as<EvaluateNode>()) {
+        if (const auto* call = eval->value.as<CallNode>()) {
+            if (const auto* op = call->op.as<OpNode>()) {
+                return op->name == "tl.cp_async_wait";
+            }
+        }
+    }
+    return false;
+}
+
+bool IsStorageSyncStmt(const Stmt& stmt) {
+    if (const auto* eval = stmt.as<EvaluateNode>()) {
+        if (const auto* call = eval->value.as<CallNode>()) {
+            return call->op.same_as(builtin::tvm_storage_sync());
+        }
+    }
+    return false;
+}
+
+bool IsFenceGlueStmt(const Stmt& stmt) {
+    return IsWaveBarrierStmt(stmt) || IsCpAsyncWaitStmt(stmt) || IsStorageSyncStmt(stmt);
+}
+
+bool IsSharedScope(const Buffer& buf) {
+    auto s = buf.scope();
+    return s == "shared" || s == "shared.dyn";
+}
+
+bool IsGlobalScope(const Buffer& buf) {
+    auto s = buf.scope();
+    return s == "global" || s == "";
+}
+
+const BufferLoadNode* PeelBufferLoad(const PrimExpr& value) {
+    if (const auto* load = value.as<BufferLoadNode>()) {
+        return load;
+    }
+    if (const auto* cast = value.as<CastNode>()) {
+        return cast->value.as<BufferLoadNode>();
+    }
+    if (const auto* call = value.as<CallNode>()) {
+        if (call->op.same_as(builtin::if_then_else()) && call->args.size() >= 2) {
+            return PeelBufferLoad(call->args[1]);
+        }
+    }
+    return nullptr;
+}
+
+bool IsSyncGlobalToSharedStore(const BufferStoreNode* op) {
+    if (op == nullptr || !IsSharedScope(op->buffer)) {
+        return false;
+    }
+    const BufferLoadNode* load = PeelBufferLoad(op->value);
+    return load != nullptr && IsGlobalScope(load->buffer);
+}
+
+bool StmtIsSyncG2SRoot(const Stmt& stmt) {
+    if (const auto* store = stmt.as<BufferStoreNode>()) {
+        return IsSyncGlobalToSharedStore(store);
+    }
+    if (const auto* for_op = stmt.as<ForNode>()) {
+        return StmtIsSyncG2SRoot(for_op->body);
+    }
+    if (const auto* attr = stmt.as<AttrStmtNode>()) {
+        return StmtIsSyncG2SRoot(attr->body);
+    }
+    if (const auto* let = stmt.as<LetStmtNode>()) {
+        return StmtIsSyncG2SRoot(let->body);
+    }
+    return false;
+}
+
 size_t CountConsecutiveDCUAsyncCopyRun(const Array<Stmt>& seq, size_t start) {
     size_t len = 0;
     while (start + len < seq.size() && StmtIsDCUAsyncCopyRoot(seq[start + len])) {
         ++len;
     }
     return len;
+}
+
+size_t CountConsecutiveSyncG2SRun(const Array<Stmt>& seq, size_t start) {
+    size_t len = 0;
+    while (start + len < seq.size() && StmtIsSyncG2SRoot(seq[start + len])) {
+        ++len;
+    }
+    return len;
+}
+
+bool RemainingHasSyncG2S(const Array<Stmt>& seq, size_t start) {
+    for (size_t i = start; i < seq.size(); ++i) {
+        if (IsFenceGlueStmt(seq[i])) {
+            continue;
+        }
+        return StmtIsSyncG2SRoot(seq[i]);
+    }
+    return false;
 }
 
 std::optional<PrimExpr> GetFirstDCUAsyncCopyResource(const Stmt& stmt) {
@@ -535,14 +637,35 @@ public:
     }
 
     Stmt VisitStmt_(const SeqStmtNode* op) override {
+        // InjectDCUAsyncScope wraps each async g2s as
+        // SeqStmt({copy, wait, barrier}); flatten so the following
+        // scalar g2s is a sibling we can see when placing barriers.
+        Stmt flattened = SeqStmt::Flatten(ffi::GetRef<Stmt>(op));
+        const auto* seq_op = flattened.as<SeqStmtNode>();
+        if (seq_op == nullptr) {
+            return VisitStmt(flattened);
+        }
+
         Array<Stmt> new_seq;
         int pending_load_count = 0;
         bool prev_stmt_is_dcu_async_copy = false;
+        bool pending_g2s_barrier = false;
 
-        for (size_t i = 0; i < op->seq.size(); ++i) {
-            const auto& stmt = op->seq[i];
-            
+        auto emit_pending_g2s_barrier = [&]() {
+            if (!pending_g2s_barrier) {
+                return;
+            }
+            if (new_seq.empty() || !IsWaveBarrierStmt(new_seq.back())) {
+                new_seq.push_back(MakeWaveBarrierStmt());
+            }
+            pending_g2s_barrier = false;
+        };
+
+        for (size_t i = 0; i < seq_op->seq.size(); ++i) {
+            const auto& stmt = seq_op->seq[i];
+
             if (ContainsMMA(stmt)) {
+                emit_pending_g2s_barrier();
                 if (pending_load_count > 0) {
                     int fence_val = pending_load_count;
                     if (phase_ == PipelinePhase::kAfterMainLoop) {
@@ -575,17 +698,22 @@ public:
                 new_seq.push_back(this->VisitStmt(stmt));
                 prev_stmt_is_dcu_async_copy = false;
             } else if (StmtIsDCUAsyncCopyRoot(stmt)) {
-                size_t run_len = CountConsecutiveDCUAsyncCopyRun(op->seq, i);
+                size_t run_len = CountConsecutiveDCUAsyncCopyRun(seq_op->seq, i);
+                const bool delay_after = RemainingHasSyncG2S(seq_op->seq, i + run_len);
                 if (phase_ == PipelinePhase::kBeforeMainLoop && inside_k_loop_depth_ == 0) {
                     for (size_t j = 0; j < run_len; ++j) {
-                        const Stmt& copy_stmt = op->seq[i + j];
+                        const Stmt& copy_stmt = seq_op->seq[i + j];
                         Array<Stmt> wrapped;
                         if (prefetch_barrier_plan_.before.count(copy_stmt.get())) {
                             wrapped.push_back(MakeWaveBarrierStmt());
                         }
                         wrapped.push_back(this->VisitStmt(copy_stmt));
                         if (prefetch_barrier_plan_.after.count(copy_stmt.get())) {
-                            wrapped.push_back(MakeWaveBarrierStmt());
+                            if (delay_after) {
+                                pending_g2s_barrier = true;
+                            } else {
+                                wrapped.push_back(MakeWaveBarrierStmt());
+                            }
                         }
                         if (wrapped.size() > 1) {
                             new_seq.push_back(SeqStmt::Flatten(wrapped));
@@ -595,20 +723,40 @@ public:
                     }
                 } else if (inside_k_loop_depth_ > 0) {
                     for (size_t j = 0; j < run_len; ++j) {
-                        new_seq.push_back(this->VisitStmt(op->seq[i + j]));
+                        new_seq.push_back(this->VisitStmt(seq_op->seq[i + j]));
                         // When more than 2 consecutive async copies, insert a wave_barrier
                         // after every pair.
                         if (run_len > 2 && (j + 1) % 2 == 0) {
-                            new_seq.push_back(MakeWaveBarrierStmt());
+                            if (j + 1 == run_len && delay_after) {
+                                pending_g2s_barrier = true;
+                            } else {
+                                new_seq.push_back(MakeWaveBarrierStmt());
+                            }
                         }
                     }
                 } else {
                     for (size_t j = 0; j < run_len; ++j) {
-                        new_seq.push_back(this->VisitStmt(op->seq[i + j]));
+                        new_seq.push_back(this->VisitStmt(seq_op->seq[i + j]));
+                    }
+                    if (delay_after) {
+                        pending_g2s_barrier = true;
                     }
                 }
                 i += run_len - 1;
                 prev_stmt_is_dcu_async_copy = true;
+            } else if (IsWaveBarrierStmt(stmt) && RemainingHasSyncG2S(seq_op->seq, i + 1)) {
+                // InjectDCUAsyncScope / prefetch after-barrier currently fire right
+                // after the last *async* copy. A following scalar global→shared
+                // store is not async, so move the barrier until that store finishes.
+                pending_g2s_barrier = true;
+            } else if (StmtIsSyncG2SRoot(stmt)) {
+                size_t run_len = CountConsecutiveSyncG2SRun(seq_op->seq, i);
+                for (size_t j = 0; j < run_len; ++j) {
+                    new_seq.push_back(this->VisitStmt(seq_op->seq[i + j]));
+                }
+                i += run_len - 1;
+                emit_pending_g2s_barrier();
+                prev_stmt_is_dcu_async_copy = false;
             } else {
                 LoadCounter counter;
                 counter(stmt);
@@ -625,6 +773,7 @@ public:
                 prev_stmt_is_dcu_async_copy = false;
             }
         }
+        emit_pending_g2s_barrier();
         return SeqStmt(new_seq);
     }
 

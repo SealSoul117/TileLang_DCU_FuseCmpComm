@@ -97,6 +97,8 @@ public:
   // only will be enabled under cdna mfma instructions
   int kPack_ = 1;
   int wgWait_ = 0;
+  // True: tvm_mmac(B, A) => CT; False: tvm_mmac(A, B) => C
+  bool transC_ = true;
   BufferRegion mbarRegion_;
   std::optional<tir::Buffer> mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
@@ -124,6 +126,7 @@ public:
         .def_ro("clearAccum", &GemmNode::clearAccum_)
         .def_ro("kPack", &GemmNode::kPack_)
         .def_ro("wgWait", &GemmNode::wgWait_)
+        .def_ro("transC", &GemmNode::transC_)
         .def_ro("policy", &GemmNode::policy_);
   }
 

@@ -31,7 +31,9 @@
 #include <tvm/tir/stmt.h>
 
 #include <functional>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace tvm {
@@ -104,51 +106,48 @@ struct DCUGemmTransposeFlags {
 DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const tir::PrimFunc& func);
 
 /*!
- * \brief Copy major order collected from T.copy(..., major=...) lowering.
+ * \brief Per-shared-buffer DCU copy annotations recorded by LowerDCUAsyncCopy.
  *
- * copy_major values: 0 = row_major, 1 = col_major.
+ * Keys are destination buffer names (Q_shared, A_shared, ...), not hard-coded A/B.
  */
-struct DCUCopyMajorFlags {
-  int copy_major_a{0};
-  int copy_major_b{0};
-  bool a_defined{false};
-  bool b_defined{false};
+struct DCUCopyBufferMaps {
+  std::unordered_map<std::string, int> copy_major;
+  std::unordered_map<std::string, bool> need_layout;
+  std::unordered_map<std::string, int> gemm_operand;
 };
 
-/*!
- * \brief Read DCU async-copy major flags from PrimFunc attrs.
- */
-DCUCopyMajorFlags GetDCUCopyMajorFlags(const tir::PrimFunc& func);
+bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps);
 
-/*!
- * \brief Whether InjectBLocalLayoutTransform / InjectDSRead should rewrite this local buffer.
- *
- * Layout-transform + ds_read_m32x16 applies when A is transposed (A_local) or B is not
- * transposed (B_local).
- */
-bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags, const std::string& buffer_name);
+DCUCopyBufferMaps GetDCUCopyBufferMaps(const tir::PrimFunc& func);
 
+bool SharedNameMatchesGlobal(const std::string& shared_name, const std::string& global_name);
 
-/*!
- * \brief Whether InjectDCUAsyncCopyIdxen should rewrite A-matrix async copies.
- *
- * Applies when A is not transposed.
- */
-bool NeedsDCUAsyncCopyIdxenA(const DCUGemmTransposeFlags& flags);
+std::optional<std::string> MatchDCUCopyBufferKey(const DCUCopyBufferMaps& maps,
+                                                 const std::string& name);
 
-/*!
- * \brief Whether InjectDCUAsyncCopyIdxen should rewrite B-matrix async copies.
- *
- * Applies when B is transposed.
- */
-bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags);
+bool LookupDCUNeedLayout(const DCUCopyBufferMaps& maps, const std::string& name,
+                         bool default_value = true);
+
+bool LookupDCUNeedLayoutForOperand(const DCUCopyBufferMaps& maps, int gemm_operand,
+                                   bool default_value = true);
+
+int LookupDCUCopyMajor(const DCUCopyBufferMaps& maps, const std::string& name,
+                       int default_value = 0);
+
+std::optional<int> LookupDCUGemmOperand(const DCUCopyBufferMaps& maps,
+                                        const std::string& name);
+
+bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
+                               const DCUCopyBufferMaps& maps,
+                               const std::string& local_name,
+                               const std::string& shared_name);
+
+bool NeedsDCUAsyncCopyIdxenForOperand(const DCUGemmTransposeFlags& flags, int gemm_operand,
+                                      bool need_layout);
 
 /*!
  * \brief Whether a global→shared BufferStore is a consecutive vector copy of
  *        exactly 16 element-bytes (the width of tl::cp_async_gs<16>).
- *
- * Scalar or non-unit-stride loads must stay as ordinary BufferStore; rewriting
- * them to dcu_async_copy would over-read (e.g. 1 half → dwordx4).
  */
 bool IsDCUCpAsyncVectorCopy(const tir::BufferStoreNode* store,
                             const tir::BufferLoadNode* load);

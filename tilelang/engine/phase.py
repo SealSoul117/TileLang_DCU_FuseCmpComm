@@ -148,7 +148,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-
+    print(mod)
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
         mod = tilelang.transform.LetInline()(mod)
@@ -194,7 +194,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
-
     pass_ctx = tilelang.transform.get_pass_context()
     # Lower the barrier.arrive into specific initialization slot
     mod = tilelang.transform.LowerSharedBarrier()(mod)
@@ -305,7 +304,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-    print(mod)
+
     if dcu_async_copy_supported(target):
         mod = tilelang.transform.InjectDCUAsyncScope()(mod)
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
@@ -321,7 +320,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InsertAsyncGldFence()(mod)
         
         mod = tilelang.transform.InjectWarpIdx()(mod)
-        # Shadow offset follows T.copy major order (row/col) on A_shared/B_shared.
+        # Shadow offset follows per-buffer T.copy major / need_layout maps.
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 

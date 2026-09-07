@@ -22,6 +22,7 @@
 #include "../target/utils.h"
 #include "builtin.h"
 #include "gemm.h"
+#include <optional>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
@@ -470,40 +471,76 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
   Array<IterVar> loop_vars = MakeIterVars();
   for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
   PrimExpr i_raw = loop_vars[0]->var;
+  PrimExpr j_raw = loop_vars[1]->var;
 
   // 从 params 中提取出编译期常量
   int dim0 = params.dim0.as<IntImmNode>()->value;
   int dim1 = params.dim1.as<IntImmNode>()->value;
   int elem_bytes = params.dtype.bytes();
+  int mn_dim = params.mn_dim;
+  int k_dim = params.k_dim;
+  int k_pack = params.k_pack;
+  int micro_k = 16;
 
-  // 参数定义
-  int slab_size = 1024;
-  int bank_size = 128;
-  int k_dim = dim1 >= 32 ? 32 : dim1;
-  int row_per_slab = slab_size / elem_bytes / k_dim;
-  int row_per_bank = bank_size / elem_bytes / k_dim;
-  int slab4_num = dim0 / (4 * row_per_slab);
-  
+  PrimExpr i_mapped;
+  PrimExpr j_mapped = j_raw;
 
-  PrimExpr part1 = floormod(i_raw, row_per_bank);
-  PrimExpr part2 = floordiv(floormod(i_raw, 4), row_per_bank) * 8;
-  PrimExpr part3 = floordiv(floormod(i_raw, row_per_slab), 4) * 16 * slab4_num;
-  PrimExpr part4 = floordiv(floormod(i_raw, 4 * row_per_slab), row_per_slab) * row_per_bank;
-  PrimExpr part5 = floordiv(i_raw, 4 * row_per_slab) * 16;
+  auto map_row_like_else = [&](PrimExpr row_raw, int tile_k, int row_extent) {
+    int slab_size = 1024;
+    int bank_size = 128;
+    int row_per_slab = slab_size / elem_bytes / tile_k;
+    int row_per_bank = bank_size / elem_bytes / tile_k;
+    ICHECK_GT(row_per_bank, 0) << "row_per_bank must be positive, tile_k=" << tile_k
+                               << ", elem_bytes=" << elem_bytes;
+    ICHECK_GT(row_per_slab, 0);
+    int slab4_num = row_extent / (4 * row_per_slab);
+    PrimExpr part1 = floormod(row_raw, row_per_bank);
+    PrimExpr part2 = floordiv(floormod(row_raw, 4), row_per_bank) * 8;
+    PrimExpr part3 = floordiv(floormod(row_raw, row_per_slab), 4) * 16 * slab4_num;
+    PrimExpr part4 = floordiv(floormod(row_raw, 4 * row_per_slab), row_per_slab) * row_per_bank;
+    PrimExpr part5 = floordiv(row_raw, 4 * row_per_slab) * 16;
+    return part1 + part2 + part3 + part4 + part5;
+  };
 
-  PrimExpr i_mapped = part1 + part2 + part3 + part4 + part5;
+  if (k_dim > micro_k * k_pack) {
+    const int tile_k = micro_k * k_pack;
+    ICHECK_GT(tile_k, 0);
+    ICHECK_EQ(k_dim % tile_k, 0)
+        << "k_dim=" << k_dim << " must be divisible by micro_k*k_pack=" << tile_k;
+    const int k_tiles = k_dim / tile_k;
+    const int row_extent = mn_dim > 0 ? mn_dim : dim0;
+
+    // dst stays identity (sequential store). src is gathered as k_tiles of
+    // (row_extent x tile_k), each with the same row swizzle as the else path.
+    // Dest (i_raw, j_raw) is walked in (dim0, dim1) order; decode that linear
+    // stream into (k_tile, row, col) of a 128x16 tile, then swizzle the row.
+    PrimExpr linear = i_raw * make_const(i_raw.dtype(), dim1) + j_raw;
+    PrimExpr tile_elems = make_const(i_raw.dtype(), row_extent * tile_k);
+    PrimExpr k_tile = floordiv(linear, tile_elems);
+    PrimExpr off = floormod(linear, tile_elems);
+    PrimExpr row_in_tile = floordiv(off, tile_k);
+    PrimExpr col_in_tile = floormod(off, tile_k);
+    i_mapped = map_row_like_else(row_in_tile, tile_k, row_extent);
+    j_mapped = k_tile * make_const(i_raw.dtype(), tile_k) + col_in_tile;
+    LOG(INFO) << "Large BK src layout: k_tiles=" << k_tiles << ", tile_k=" << tile_k
+              << ", row_extent=" << row_extent;
+  } else {
+    i_mapped = map_row_like_else(i_raw, k_dim, dim0);
+  }
+
   i_mapped = analyzer->Simplify(i_mapped);
-  // 构造特殊的 src_indices
+  j_mapped = analyzer->Simplify(j_mapped);
+  // 只改 src：dst 保持一一映射顺着写。
   Array<PrimExpr> src_indices;
-  // 我们手动替换第一个非 unit 维度的变量
   size_t idx_in_vars = 0;
   for (size_t i = 0; i < src_range.size(); ++i) {
     if (is_one(src_range[i]->extent)) {
       src_indices.push_back(src_range[i]->min);
     } else {
       if (idx_in_vars == 0) {
-        // 对第一个主维度应用变换
         src_indices.push_back(src_range[i]->min + i_mapped);
+      } else if (idx_in_vars == 1) {
+        src_indices.push_back(src_range[i]->min + j_mapped);
       } else {
         src_indices.push_back(src_range[i]->min + loop_vars[idx_in_vars]->var);
       }
@@ -511,7 +548,6 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
     }
   }
 
-  // dst_indices 保持正常的一一映射
   Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
   PrimExpr value = BufferLoad(src, src_indices);
@@ -1117,10 +1153,21 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else if (copy_inst == CopyInst::kDCUAsyncCopy){
     return LowerDCUAsyncCopy(T, analyzer);
   } else if (copy_inst == CopyInst::kNormal) {
+    if (TargetIsDCU(T.target) && src.scope() == "local.fragment" &&
+        dst.scope() == "local.fragment" && src->shape.size() == 2 &&
+        dst->shape.size() == 2 && T.layout_map.count(src) &&
+        T.layout_map.count(dst)) {
+      auto src_frag = T.layout_map[src].as<Fragment>();
+      auto dst_frag = T.layout_map[dst].as<Fragment>();
+      if (src_frag && dst_frag &&
+          !(*src_frag)->IsEqual((*dst_frag).get())) {
+        return LowerDCUFragmentPermuteCopy(T, analyzer);
+      }
+    }
     return LowerNormalCopy(T, analyzer);
-  } else {
-    LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+  LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
+  return Stmt();
 }
 
 /**
@@ -1154,6 +1201,8 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
   For vectorized_thread_loop;
   auto par_op = ParallelOp(transformed_loop);
 
+  LOG(INFO) <<dst->name << " " << src->name;
+
   if (is_cpu_target || dst.scope() == "local" || src.scope() == "local") {
     if (src.scope() == "local" && dst.scope() != "local") {
       LOG(WARNING) << "Copy from local buffer `" << src->name << "` to "
@@ -1179,6 +1228,7 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
     auto thread_loop =
         PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer, loop_layout);
     vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+    LOG(INFO) <<vectorized_thread_loop;
   }
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
@@ -1187,91 +1237,246 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
   return vectorized_thread_loop;
 }
 
+static Array<PrimExpr> DCUFragmentInvCoords(const Layout &inv, PrimExpr local,
+                                            PrimExpr thread, size_t out_dim) {
+  Array<PrimExpr> ins;
+  const auto in_shape = inv->InputShape();
+  if (in_shape.size() >= 2) {
+    ins.push_back(local);
+    ins.push_back(thread);
+  } else if (in_shape.size() == 1) {
+    ins.push_back(local);
+  }
+  while (ins.size() < in_shape.size()) {
+    ins.push_back(Integer(0));
+  }
+  Array<PrimExpr> out = inv->Forward(ins);
+  while (out.size() > out_dim) {
+    out.pop_back();
+  }
+  return out;
+}
+
+Stmt CopyNode::LowerDCUFragmentPermuteCopy(const LowerArgs &T,
+                                             arith::Analyzer *analyzer) const {
+  auto src_frag = T.layout_map[src].as<Fragment>().value();
+  auto dst_frag = T.layout_map[dst].as<Fragment>().value();
+  Layout src_inv = src_frag->Inverse();
+  Layout dst_inv = dst_frag->Inverse();
+
+  int64_t src_elems = 1;
+  for (const auto &e : src->shape) {
+    ICHECK(as_const_int(e)) << "DCU fragment permute expects static src shape";
+    src_elems *= *as_const_int(e);
+  }
+  int nthreads = 256;
+  if (T.thread_bounds.defined()) {
+    if (const auto *n = as_const_int(T.thread_bounds->extent)) {
+      nthreads = *n;
+    }
+  }
+  ICHECK(nthreads > 0 && src_elems % nthreads == 0);
+  const int nreg = static_cast<int>(src_elems / nthreads);
+  ICHECK(nreg % 4 == 0 && nreg > 0)
+      << "DCU C->A permute expects 4 regs per 16x16 tile, got nreg=" << nreg;
+  const int ntiles = nreg / 4;
+
+  LOG(INFO) << "DCU fragment permute " << src->name << " -> " << dst->name
+            << " ntiles=" << ntiles
+            << " (16x16 CT->A mmac_ct_to_a_16x16 + mapped loop)";
+
+  PrimExpr thread = T.thread_var;
+  if (T.thread_bounds.defined()) {
+    thread = thread - T.thread_bounds->min;
+  }
+  ICHECK_EQ(src->shape.size(), 2);
+  ICHECK_EQ(dst->shape.size(), 2);
+
+  Var tile("tile", DataType::Int(32));
+  auto src_coords = DCUFragmentInvCoords(src_inv, tile * 4, thread,
+                                         src->shape.size());
+  auto s0 = src_coords;
+  ICHECK_GE(s0.size(), 2);
+  PrimExpr i0 = FloorDiv(s0[0], Integer(16)) * 16;
+  PrimExpr j0 = FloorDiv(s0[1], Integer(16)) * 16;
+  PrimExpr lane = FloorMod(thread, Integer(64));
+  PrimExpr i_a = i0 + FloorMod(lane, Integer(16));
+  PrimExpr j_a = j0 + FloorDiv(lane, Integer(16)) * 4;
+  Array<PrimExpr> dst_local = dst_frag->Forward({i_a, j_a});
+  ICHECK(!dst_local.empty());
+  auto dst_coords = DCUFragmentInvCoords(dst_inv, dst_local[0], thread,
+                                         dst->shape.size());
+
+  Stmt body = Evaluate(Call(
+      DataType::Handle(), builtin::call_extern(),
+      {StringImm("tl::mmac_ct_to_a_16x16"),
+       Call(DataType::Handle(), builtin::address_of(),
+            {BufferLoad(dst, dst_coords)}),
+       Call(DataType::Handle(), builtin::address_of(),
+            {BufferLoad(src, src_coords)})}));
+  return For(tile, 0, ntiles, ForKind::kSerial, body);
+}
+
 /*!
- * \brief Search the original function body for a T.gemm call whose A or B
- * buffer matches \p shared_buffer, then compute the warp partition to
- * determine the number of warps along the relevant dimension.
+ * \brief Search the original function body starting from this copy for the
+ * nearest T.gemm that consumes \p shared_dst as A or B.
  *
- * During DCU GEMM lowering, copies from global to shared.dyn happen before
- * the gemm itself.  This helper inspects the (still-unlowered) function body
- * to find the nearest T.gemm that consumes \p shared_buffer and returns the
- * warp count along the dimension that this buffer is partitioned across:
- *   - A matrix (M×K): returns m_warp
- *   - B matrix (K×N): returns n_warp
+ * Copies from global to shared.dyn are lowered before gemm.  This helper
+ * walks the (still-unlowered) function body in program order, locates a
+ * T.copy whose dst (and src, if present) matches this copy, then continues
+ * downward until a T.gemm whose A or B operand is that dst.  From that gemm
+ * it returns:
+ *   - warp count along the partitioned dimension (A → m_warp, B → n_warp)
+ *   - k_pack (args[14], default 1)
  *
- * \param func_body  The original function body, saved before any tile-op
- *                   lowering started.
- * \param shared_buffer  The shared.dyn destination buffer of the copy.
- * \param thread_bounds  The thread extent range.
- * \param target         The compilation target.
- * \return The warp count (m_warp or n_warp), or \p NullOpt if no matching
- *         T.gemm is found.
+ * \return warp count, or \p NullOpt if no matching gemm is found.  \p k_pack
+ *         is always written (1 when missing).
  */
-static Optional<int> ComputeWarpNForDCUAsyncCopy(
+struct DCUAsyncCopyGemmInfo {
+  Optional<int> warp_count;
+  int k_pack{1};
+  // 0 = T.gemm left operand, 1 = right operand.
+  std::optional<int> gemm_operand;
+  // BK from the shared tile on the gemm reduce axis.
+  Optional<PrimExpr> k_dim;
+  int k_axis{1};
+};
+
+static bool SameDCUBuffer(const Buffer &a, const Buffer &b) {
+  if (!a.defined() || !b.defined()) return false;
+  if (a->data.same_as(b->data)) return true;
+  return a->name == b->name;
+}
+
+static DCUAsyncCopyGemmInfo ComputeWarpNForDCUAsyncCopy(
     const Stmt &func_body,
-    const Buffer &shared_buffer,
+    const Buffer &shared_src,
+    const Buffer &shared_dst,
     const Range &thread_bounds,
     const Target &target) {
-  if (!func_body.defined()) return Optional<int>();
+  DCUAsyncCopyGemmInfo result;
+  if (!func_body.defined()) return result;
 
-  // Collect all gemm calls from the original (unlowered) function body
-  struct GemmCollector : public StmtExprVisitor {
-    struct Info {
-      Buffer a_buffer;
-      Buffer b_buffer;
-      int M{0};
-      int N{0};
-      int policy_type{0};
-    };
-    std::vector<Info> infos;
+  struct Event {
+    enum Kind { kCopy, kGemm } kind;
+    Buffer src;
+    Buffer dst;       // copy dst, unused for gemm
+    Buffer a_buffer;
+    Buffer b_buffer;
+    int M{0};
+    int N{0};
+    int policy_type{0};
+    int k_pack{1};
+    bool trans_a{false};
+    bool trans_b{false};
+  };
+
+  struct Collector : public StmtExprVisitor {
+    std::vector<Event> events;
 
    private:
     void VisitExpr_(const CallNode *op) final {
+      static const Op &copy_op = Op::Get("tl.tileop.copy");
       static const Op &gemm_op = Op::Get("tl.tileop.gemm");
       static const Op &gemm_py_op = Op::Get("tl.tileop.gemm_py");
-      if ((op->op.same_as(gemm_op) || op->op.same_as(gemm_py_op)) && op->args.size() >= 9) {
-        Info info;
-        info.a_buffer = NormalizeToBufferRegion(op->args[0])->buffer;
-        info.b_buffer = NormalizeToBufferRegion(op->args[1])->buffer;
-        info.M = op->args[5].as<IntImmNode>()->value;
-        info.N = op->args[6].as<IntImmNode>()->value;
-        info.policy_type = op->args[8].as<IntImmNode>()->value;
-        infos.push_back(info);
+
+      if (op->op.same_as(copy_op) && op->args.size() >= 2) {
+        Event ev;
+        ev.kind = Event::kCopy;
+        ev.src = NormalizeToBufferRegion(op->args[0])->buffer;
+        ev.dst = NormalizeToBufferRegion(op->args[1])->buffer;
+        events.push_back(ev);
+      } else if ((op->op.same_as(gemm_op) || op->op.same_as(gemm_py_op)) &&
+                 op->args.size() >= 9) {
+        Event ev;
+        ev.kind = Event::kGemm;
+        ev.a_buffer = NormalizeToBufferRegion(op->args[0])->buffer;
+        ev.b_buffer = NormalizeToBufferRegion(op->args[1])->buffer;
+        ev.M = op->args[5].as<IntImmNode>()->value;
+        ev.N = op->args[6].as<IntImmNode>()->value;
+        ev.policy_type = op->args[8].as<IntImmNode>()->value;
+        if (op->args.size() > 4) {
+          if (const auto *imm = op->args[3].as<IntImmNode>()) {
+            ev.trans_a = imm->value != 0;
+          }
+          if (const auto *imm = op->args[4].as<IntImmNode>()) {
+            ev.trans_b = imm->value != 0;
+          }
+        }
+        if (op->args.size() > 14) {
+          if (const auto *imm = op->args[14].as<IntImmNode>()) {
+            ev.k_pack = static_cast<int>(imm->value);
+          }
+        }
+        events.push_back(ev);
       }
       StmtExprVisitor::VisitExpr_(op);
     }
   };
 
-  GemmCollector collector;
+  Collector collector;
   collector(func_body);
 
+  auto gemm_uses_dst = [&](const Event &ev) {
+    return SameDCUBuffer(shared_dst, ev.a_buffer) ||
+           SameDCUBuffer(shared_dst, ev.b_buffer);
+  };
 
-  for (const auto &info : collector.infos) {
-    // Exact match by buffer data variable
-    bool is_a = shared_buffer->data.same_as(info.a_buffer->data);
-    bool is_b = shared_buffer->data.same_as(info.b_buffer->data);
-    // Fallback: match by buffer name (handles double-buffering / remap)
-    if (!is_a && !is_b) {
-      is_a = (shared_buffer->name == info.a_buffer->name);
-      is_b = (shared_buffer->name == info.b_buffer->name);
-    }
-
-    if (is_a || is_b) {
-      int block_size = 0;
-      if (auto *imm = thread_bounds->extent.as<IntImmNode>()) {
-        block_size = imm->value;
+  bool after_this_copy = false;
+  std::optional<Event> matched_gemm;
+  for (const auto &ev : collector.events) {
+    if (ev.kind == Event::kCopy) {
+      bool dst_match = SameDCUBuffer(shared_dst, ev.dst);
+      bool src_match = !shared_src.defined() || SameDCUBuffer(shared_src, ev.src);
+      if (dst_match && src_match) {
+        after_this_copy = true;
       }
-      if (block_size == 0) return Optional<int>();
-
-      GemmWarpPolicy policy(info.policy_type);
-      auto [m_warp, n_warp] = policy->computeWarpPartition(
-          info.M, info.N, block_size, target, GemmInst::KMMAC);
-
-      return is_a ? m_warp : n_warp;
+      continue;
+    }
+    if (!gemm_uses_dst(ev)) {
+      continue;
+    }
+    // Prefer the first gemm after this copy.  If the copy itself was not
+    // found, fall back to the first gemm that consumes dst.
+    if (after_this_copy) {
+      matched_gemm = ev;
+      break;
+    }
+    if (!matched_gemm.has_value()) {
+      matched_gemm = ev;
     }
   }
 
-  return Optional<int>();
+  if (!matched_gemm.has_value()) {
+    return result;
+  }
+
+  const Event &gemm = matched_gemm.value();
+  result.k_pack = gemm.k_pack;
+
+  int block_size = 0;
+  if (auto *imm = thread_bounds->extent.as<IntImmNode>()) {
+    block_size = imm->value;
+  }
+  if (block_size == 0) {
+    return result;
+  }
+
+  bool is_a = SameDCUBuffer(shared_dst, gemm.a_buffer);
+  result.gemm_operand = is_a ? 0 : 1;
+  const bool transposed = is_a ? gemm.trans_a : gemm.trans_b;
+  // A NT: BM x BK -> dim1; A T: BK x BM -> dim0;
+  // B NT: BK x BN -> dim0; B T: BN x BK -> dim1.
+  const int k_axis = (transposed == is_a) ? 0 : 1;
+  if (shared_dst->shape.size() > static_cast<size_t>(k_axis)) {
+    result.k_dim = shared_dst->shape[k_axis];
+    result.k_axis = k_axis;
+  }
+  GemmWarpPolicy policy(gemm.policy_type);
+  auto [m_warp, n_warp] = policy->computeWarpPartition(
+      gemm.M, gemm.N, block_size, target, GemmInst::KMMAC);
+  result.warp_count = is_a ? m_warp : n_warp;
+  return result;
 }
 
 Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
@@ -1283,15 +1488,27 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   // original (unlowered) function body.  For A-matrix shared buffers this
   // is m_warp; for B-matrix it is n_warp.  Falls back to total_threads/64
   // when no matching gemm can be found.
+  // Compute warp_m and k_pack from the nearest T.gemm that consumes this
+  // copy's dst as A or B (search downward from this T.copy in func_body).
   PrimExpr warp_m;
+  int k_pack = 1;
+  std::optional<int> gemm_operand;
+  Optional<PrimExpr> gemm_k_dim;
+  int gemm_k_axis = 1;
   if (T.func_body.defined()) {
-    auto computed = ComputeWarpNForDCUAsyncCopy(
-        T.func_body.value(), dst, T.thread_bounds, T.target);
-    if (computed.has_value()) {
-      warp_m = make_const(total_threads.dtype(), computed.value());
+    auto gemm_info = ComputeWarpNForDCUAsyncCopy(
+        T.func_body.value(), src, dst, T.thread_bounds, T.target);
+    k_pack = gemm_info.k_pack;
+    gemm_operand = gemm_info.gemm_operand;
+    gemm_k_dim = gemm_info.k_dim;
+    gemm_k_axis = gemm_info.k_axis;
+    if (gemm_info.warp_count.has_value()) {
+      warp_m = make_const(total_threads.dtype(), gemm_info.warp_count.value());
     } else {
       warp_m = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
     }
+  } else {
+    warp_m = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
   }
 
  PrimExpr warp_num = analyzer->Simplify(floordiv(total_threads, warp_size_expr));
@@ -1300,7 +1517,9 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
 
   // 直接生成针对 DCU 优化的 SIMT 循环
   Stmt simt_loop;
-  LOG(INFO) << "warp_m: " << warp_m << ", warp_num: " << warp_num;
+  bool need_layout = true;
+  LOG(INFO) << "warp_m: " << warp_m << ", warp_num: " << warp_num
+            << ", k_pack: " << k_pack;
   LOG(INFO) << "dst shape: " << dst->shape;
   if (dst->shape.size() == 2)
   {
@@ -1311,10 +1530,30 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
       copy_params.dtype = dst->dtype;
       copy_params.warp_m = warp_m;
       copy_params.warp_num = warp_num;
-      LOG(INFO) << "dim0: " << copy_params.dim0 << ", dim1: " << copy_params.dim1;
+      copy_params.k_pack = k_pack;
+      copy_params.k_axis = gemm_k_axis;
+      if (gemm_k_dim.defined()) {
+        const auto* k_imm = gemm_k_dim.value().as<IntImmNode>();
+        ICHECK(k_imm) << "k_dim must be a constant for DCU async copy mapping";
+        copy_params.k_dim = static_cast<int>(k_imm->value);
+      }
+      const int dim0_i = dst->shape[0].as<IntImmNode>()->value;
+      const int dim1_i = dst->shape[1].as<IntImmNode>()->value;
+      copy_params.mn_dim = (copy_params.k_axis == 0) ? dim1_i : dim0_i;
+      if (copy_params.k_dim == 0) {
+        copy_params.k_dim = (copy_params.k_axis == 0) ? dim0_i : dim1_i;
+      }
+      
+      LOG(INFO) << "dim0: " << copy_params.dim0 << ", dim1: " << copy_params.dim1
+                << ", k_pack: " << copy_params.k_pack
+                << ", k_dim: " << copy_params.k_dim
+                << ", mn_dim: " << copy_params.mn_dim
+                << ", k_axis: " << copy_params.k_axis;
 
       PrimExpr tile_elems =
-          analyzer->Simplify(copy_params.dim0 * copy_params.dim1);
+          analyzer->Simplify(make_const(DataType::Int(32), copy_params.mn_dim) *
+                             copy_params.k_pack * 16);
+      LOG(INFO) << "tile_elems: " << tile_elems;
       PrimExpr warp_capacity =
           analyzer->Simplify(copy_params.warp_num * 64);
       ICHECK(is_const_int(tile_elems) && is_const_int(warp_capacity))
@@ -1323,16 +1562,18 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
           << ", warp_capacity=" << warp_capacity;
       if (*as_const_int(tile_elems) <= *as_const_int(warp_capacity)) {
         LOG(INFO) << "Choose fast copy.";
+        need_layout = false;
         simt_loop = MakeDCUSIMTLoop(analyzer, copy_params);
       } else {
-        if (copy_major == 1) {
-          LOG(INFO) << "Choose col_major copy.";
+        // Layout path follows where K lives on the shared tile, not T.copy major.
+        if (copy_params.k_axis == 0) {
+          LOG(INFO) << "Choose col layout (K on dim0). copy_major=" << copy_major;
           simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
         } else {
-          ICHECK(copy_major == 0)
-              << "Invalid copy_major value: " << copy_major
-              << ", expected 0 (row_major) or 1 (col_major).";
-          LOG(INFO) << "Choose row_major copy.";
+          ICHECK_EQ(copy_params.k_axis, 1)
+              << "k_axis must be 0 (K on dim0 / col) or 1 (K on dim1 / row), got "
+              << copy_params.k_axis;
+          LOG(INFO) << "Choose row layout (K on dim1). copy_major=" << copy_major;
           simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
         }
       }
@@ -1378,13 +1619,13 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
     result = vectorized_thread_loop;
   }
 
-  const std::string& dst_name = dst->name;
-  if (dst_name.find("A_shared") != std::string::npos) {
-    result = AttrStmt(IntImm(DataType::Int(32), 0), kDCUCopyMajorAStmt,
-                      IntImm(DataType::Int(32), copy_major), result);
-  } else if (dst_name.find("B_shared") != std::string::npos) {
-    result = AttrStmt(IntImm(DataType::Int(32), 0), kDCUCopyMajorBStmt,
-                      IntImm(DataType::Int(32), copy_major), result);
+  const StringImm dst_name_node = StringImm(dst->name);
+  result = AttrStmt(dst_name_node, kDCUNeedLayoutStmt, Bool(need_layout), result);
+  result = AttrStmt(dst_name_node, kDCUCopyMajorStmt,
+                    IntImm(DataType::Int(32), copy_major), result);
+  if (gemm_operand.has_value()) {
+    result = AttrStmt(dst_name_node, kDCUGemmOperandStmt,
+                      IntImm(DataType::Int(32), gemm_operand.value()), result);
   }
   return result;
 }

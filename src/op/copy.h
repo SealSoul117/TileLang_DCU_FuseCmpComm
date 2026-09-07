@@ -90,6 +90,10 @@ struct DCUAsyncCopyParams {
   DataType dtype;      // element data type
   PrimExpr warp_m;     // number of warps along the partitioned dimension
   PrimExpr warp_num;   // total number of warps
+  int k_pack{1};
+  int k_dim{0};        // BK of this shared tile
+  int mn_dim{0};       // the non-K shared extent (BM or BN)
+  int k_axis{1};       // 0 if K is dst shape[0], 1 if K is dst shape[1]
 };
 
 /*!
@@ -238,6 +242,8 @@ protected:
    */
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
+  Stmt LowerDCUFragmentPermuteCopy(const LowerArgs &T,
+                                    arith::Analyzer *analyzer) const;
 
   Stmt LowerDCUAsyncCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
   /*!

@@ -29,6 +29,7 @@ def _gemm_impl(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
+    transpose_C: bool = True,
 ):
     """Shared GEMM implementation.
 
@@ -122,6 +123,7 @@ def _gemm_impl(
         mbar,
         C_coords[0],
         C_coords[1],
+        transpose_C,
     )
 
 
@@ -137,6 +139,7 @@ def gemm_v1(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
+    transpose_C: bool = True,
 ):
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
@@ -151,6 +154,7 @@ def gemm_v1(
         k_pack,
         wg_wait,
         mbar,
+        transpose_C,
     )
 
 
@@ -166,6 +170,7 @@ def gemm_v2(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
+    transpose_C: bool = True,
 ):
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
@@ -180,6 +185,7 @@ def gemm_v2(
         k_pack,
         wg_wait,
         mbar,
+        transpose_C,
     )
 
 

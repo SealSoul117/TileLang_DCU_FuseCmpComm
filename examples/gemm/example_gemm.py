@@ -19,17 +19,18 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
                 T.copy(B[k * block_K, bx * block_N], B_shared, major="col_major")
-                T.gemm(A_shared, B_shared, C_local, k_pack=block_K//16)
+                T.gemm(A_shared, B_shared, C_local, k_pack=block_K//16, transpose_C=False)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return gemm
 
-
+import torch
+torch.cuda.set_device(6)
 def main():
-    M = 8192
-    N = 8192
-    K = 8192
+    M = 19200
+    N = 5120
+    K = 5120
     kernel = matmul(M, N, K, 256, 256, 16)
 
     import torch

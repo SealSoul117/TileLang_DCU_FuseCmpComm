@@ -61,20 +61,23 @@ bool TryGetConsecutiveVectorOffset(const PrimExpr& index, int expected_lanes,
 
 class DSReadInjector : public StmtExprMutator {
  public:
-  explicit DSReadInjector(const DCUGemmTransposeFlags& flags) : flags_(flags) {}
+  DSReadInjector(const DCUGemmTransposeFlags& flags, const DCUCopyBufferMaps& maps)
+      : flags_(flags), maps_(maps) {}
 
  private:
   DCUGemmTransposeFlags flags_;
+  DCUCopyBufferMaps maps_;
 
   Stmt VisitStmt_(const BufferStoreNode* op) final {
     Buffer buffer = op->buffer;
 
-    if (!NeedsDCULocalLayoutDSRead(flags_, buffer->name)) {
+    const BufferLoadNode* load = op->value.as<BufferLoadNode>();
+    if (!load) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    const BufferLoadNode* load = op->value.as<BufferLoadNode>();
-    if (!load) {
+    if (!NeedsDCULocalLayoutDSRead(flags_, maps_, std::string(buffer->name),
+                                   std::string(load->buffer->name))) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
@@ -115,8 +118,10 @@ tvm::transform::Pass InjectDSRead() {
       return f;
     }
 
+    DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(f);
+
     auto *n = f.CopyOnWrite();
-    n->body = DSReadInjector(flags)(n->body);
+    n->body = DSReadInjector(flags, maps)(n->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectDSRead", {});

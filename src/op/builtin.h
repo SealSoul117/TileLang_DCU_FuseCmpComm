@@ -69,11 +69,17 @@ static constexpr const char *kDCUGemmTransB = "tl.dcu_gemm_trans_b";
 // Temporary AttrStmt keys emitted during gemm lowering (merged by AnnotateDCUGemmTranspose).
 static constexpr const char *kDCUGemmTransAStmt = "tl.dcu_gemm_trans_a_stmt";
 static constexpr const char *kDCUGemmTransBStmt = "tl.dcu_gemm_trans_b_stmt";
-// DCU async-copy major order (0: row_major, 1: col_major) from T.copy(..., major=...).
-static constexpr const char *kDCUCopyMajorA = "tl.dcu_copy_major_a";
-static constexpr const char *kDCUCopyMajorB = "tl.dcu_copy_major_b";
-static constexpr const char *kDCUCopyMajorAStmt = "tl.dcu_copy_major_a_stmt";
-static constexpr const char *kDCUCopyMajorBStmt = "tl.dcu_copy_major_b_stmt";
+// Per-buffer DCU copy annotations (PrimFunc Map<String, Integer>, key = shared buffer name).
+// copy_major: 0 = row_major, 1 = col_major.
+// need_layout: 0 = fast sequential SIMT (no shadow / ds_read remap), 1 = remapped.
+// gemm_operand: 0 = left (A-side) of T.gemm, 1 = right (B-side).
+static constexpr const char *kDCUCopyMajorMap = "tl.dcu_copy_major";
+static constexpr const char *kDCUNeedLayoutMap = "tl.dcu_need_layout";
+static constexpr const char *kDCUGemmOperandMap = "tl.dcu_gemm_operand";
+// Temporary AttrStmt keys; node is StringImm(dst buffer name).
+static constexpr const char *kDCUCopyMajorStmt = "tl.dcu_copy_major_stmt";
+static constexpr const char *kDCUNeedLayoutStmt = "tl.dcu_need_layout_stmt";
+static constexpr const char *kDCUGemmOperandStmt = "tl.dcu_gemm_operand_stmt";
 
 /*!
  * \brief Whether to disable thread storage synchronization

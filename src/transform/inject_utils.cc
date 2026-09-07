@@ -28,7 +28,9 @@
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include <cctype>
 #include <string>
+#include <unordered_map>
 
 namespace tvm {
 namespace tl {
@@ -260,46 +262,191 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const PrimFunc& func) {
   return flags;
 }
 
-DCUCopyMajorFlags GetDCUCopyMajorFlags(const PrimFunc& func) {
-  DCUCopyMajorFlags flags;
+bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps) {
+  return maps.copy_major.empty() && maps.need_layout.empty() && maps.gemm_operand.empty();
+}
+
+namespace {
+
+void LoadIntegerMapAttr(const PrimFunc& func, const char* key,
+                        std::unordered_map<std::string, int>* out) {
   if (!func->attrs.defined()) {
-    return flags;
+    return;
   }
-  if (auto copy_major_a = func->attrs.GetAttr<Integer>(kDCUCopyMajorA)) {
-    flags.copy_major_a = copy_major_a.value()->value;
-    flags.a_defined = true;
+  if (auto m = func->attrs.GetAttr<Map<String, Integer>>(key)) {
+    for (const auto& kv : m.value()) {
+      (*out)[std::string(kv.first)] = static_cast<int>(kv.second->value);
+    }
   }
-  if (auto copy_major_b = func->attrs.GetAttr<Integer>(kDCUCopyMajorB)) {
-    flags.copy_major_b = copy_major_b.value()->value;
-    flags.b_defined = true;
+}
+
+}  // namespace
+
+DCUCopyBufferMaps GetDCUCopyBufferMaps(const PrimFunc& func) {
+  DCUCopyBufferMaps maps;
+  LoadIntegerMapAttr(func, kDCUCopyMajorMap, &maps.copy_major);
+  LoadIntegerMapAttr(func, kDCUGemmOperandMap, &maps.gemm_operand);
+  if (func->attrs.defined()) {
+    if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedLayoutMap)) {
+      for (const auto& kv : m.value()) {
+        maps.need_layout[std::string(kv.first)] = kv.second->value != 0;
+      }
+    }
   }
-  return flags;
+  return maps;
+}
+
+bool SharedNameMatchesGlobal(const std::string& shared_name, const std::string& global_name) {
+  if (shared_name.empty() || global_name.empty()) {
+    return false;
+  }
+  if (shared_name == global_name || shared_name == global_name + "_shared") {
+    return true;
+  }
+  auto strip_numeric_suffix = [](std::string name) {
+    while (!name.empty() && std::isdigit(static_cast<unsigned char>(name.back()))) {
+      name.pop_back();
+    }
+    if (!name.empty() && name.back() == '_') {
+      name.pop_back();
+    }
+    return name;
+  };
+  auto prefix_match = [&](const std::string& prefix) {
+    if (prefix.empty() || shared_name.rfind(prefix, 0) != 0) {
+      return false;
+    }
+    const std::string rest = shared_name.substr(prefix.size());
+    return rest.empty() || rest[0] == '_' || rest.find("shared") != std::string::npos;
+  };
+  if (prefix_match(global_name)) {
+    return true;
+  }
+  const std::string base = strip_numeric_suffix(global_name);
+  return base != global_name && prefix_match(base);
+}
+
+static bool NamesRelated(const std::string& a, const std::string& b) {
+  return a == b || SharedNameMatchesGlobal(a, b) || SharedNameMatchesGlobal(b, a);
+}
+
+std::optional<std::string> MatchDCUCopyBufferKey(const DCUCopyBufferMaps& maps,
+                                                 const std::string& name) {
+  if (name.empty()) {
+    return std::nullopt;
+  }
+  auto find_in = [&](const auto& m) -> std::optional<std::string> {
+    auto it = m.find(name);
+    if (it != m.end()) {
+      return it->first;
+    }
+    for (const auto& kv : m) {
+      if (NamesRelated(kv.first, name)) {
+        return kv.first;
+      }
+    }
+    return std::nullopt;
+  };
+  if (auto key = find_in(maps.need_layout)) {
+    return key;
+  }
+  if (auto key = find_in(maps.copy_major)) {
+    return key;
+  }
+  return find_in(maps.gemm_operand);
+}
+
+bool LookupDCUNeedLayout(const DCUCopyBufferMaps& maps, const std::string& name,
+                         bool default_value) {
+  auto key = MatchDCUCopyBufferKey(maps, name);
+  if (!key.has_value()) {
+    return default_value;
+  }
+  auto it = maps.need_layout.find(*key);
+  if (it == maps.need_layout.end()) {
+    return default_value;
+  }
+  return it->second;
+}
+
+bool LookupDCUNeedLayoutForOperand(const DCUCopyBufferMaps& maps, int gemm_operand,
+                                   bool default_value) {
+  for (const auto& kv : maps.gemm_operand) {
+    if (kv.second == gemm_operand) {
+      return LookupDCUNeedLayout(maps, kv.first, default_value);
+    }
+  }
+  return default_value;
+}
+
+int LookupDCUCopyMajor(const DCUCopyBufferMaps& maps, const std::string& name,
+                       int default_value) {
+  auto key = MatchDCUCopyBufferKey(maps, name);
+  if (!key.has_value()) {
+    return default_value;
+  }
+  auto it = maps.copy_major.find(*key);
+  if (it == maps.copy_major.end()) {
+    return default_value;
+  }
+  return it->second;
+}
+
+std::optional<int> LookupDCUGemmOperand(const DCUCopyBufferMaps& maps,
+                                        const std::string& name) {
+  auto key = MatchDCUCopyBufferKey(maps, name);
+  if (!key.has_value()) {
+    return std::nullopt;
+  }
+  auto it = maps.gemm_operand.find(*key);
+  if (it == maps.gemm_operand.end()) {
+    return std::nullopt;
+  }
+  return it->second;
 }
 
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
-                               const std::string& buffer_name) {
+                               const DCUCopyBufferMaps& maps,
+                               const std::string& local_name,
+                               const std::string& shared_name) {
   if (!flags.defined) {
     return false;
   }
-  if (flags.trans_a && buffer_name.find("A_local") != std::string::npos) {
-    return true;
+  const std::string lookup = !shared_name.empty() ? shared_name : local_name;
+  const bool need_layout = LookupDCUNeedLayout(maps, lookup, /*default_value=*/true);
+  if (auto operand = LookupDCUGemmOperand(maps, lookup)) {
+    if (*operand == 0) {
+      return flags.trans_a && need_layout;
+    }
+    if (*operand == 1) {
+      return !flags.trans_b && need_layout;
+    }
   }
-  if (!flags.trans_b && buffer_name.find("B_local") != std::string::npos) {
-    return true;
+  if (local_name.find("A_local") != std::string::npos) {
+    return flags.trans_a && need_layout;
+  }
+  if (local_name.find("B_local") != std::string::npos) {
+    return !flags.trans_b && need_layout;
+  }
+  return false;
+}
+
+bool NeedsDCUAsyncCopyIdxenForOperand(const DCUGemmTransposeFlags& flags, int gemm_operand,
+                                      bool need_layout) {
+  if (!flags.defined || !need_layout) {
+    return false;
+  }
+  if (gemm_operand == 0) {
+    return !flags.trans_a;
+  }
+  if (gemm_operand == 1) {
+    return flags.trans_b;
   }
   return false;
 }
 
 bool NeedsDCUADSRead(const DCUGemmTransposeFlags& flags) {
   return flags.defined && !flags.trans_a;
-}
-
-bool NeedsDCUAsyncCopyIdxenA(const DCUGemmTransposeFlags& flags) {
-  return flags.defined && !flags.trans_a;
-}
-
-bool NeedsDCUAsyncCopyIdxenB(const DCUGemmTransposeFlags& flags) {
-  return flags.defined && flags.trans_b;
 }
 
 namespace {

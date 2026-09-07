@@ -156,7 +156,7 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
     # permute
     row = (row // 8) * layout_config.permute_offset + ((row % 8) % layout_config.permute_offset) + ((row % 8) // layout_config.permute_offset) * layout_config.row_per_warp
     row = (row % layout_config.row_per_warp)+ (row // layout_config.row_per_warp) * layout_config.row_per_slab
-    
+    print("dsdasrow: %d\n", layout_config.row_per_warp)
     # warp
     row = row + warp_m * layout_config.row_per_warp
     
@@ -180,6 +180,13 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
     cond = select_thread & (warp_m == (layout_config.warp_num - 1)) & ((idx % layout_config.intra_iter_num) == (layout_config.intra_iter_num - 1))
     row = row - layout_config.row_per_slab * cond
     return row, new_col
+
+def ki_shared_cvt(row, col, stride, new_stride):
+    index = row * stride + col
+    new_row = index // new_stride
+    new_col = index - new_row * new_stride
+    return new_row, new_col
+    
 
 @dataclass(frozen=True)
 class SharedToLocalLayoutA:

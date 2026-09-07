@@ -111,6 +111,10 @@ class GemmPy(Node, Scriptable):
         return self.transB
 
     @property
+    def trans_C(self):
+        return getattr(self, "transC", True)
+
+    @property
     def stride_A(self):
         return self.strideA
 

@@ -89,6 +89,10 @@ GemmPy::GemmPy(Array<PrimExpr> args) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  node->transC_ = true;
+  if (args.size() > 19) {
+    node->transC_ = args[19].as<Bool>().value();
+  }
   data_ = std::move(node);
 }
 

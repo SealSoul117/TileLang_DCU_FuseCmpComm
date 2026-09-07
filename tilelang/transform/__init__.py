@@ -377,7 +377,13 @@ def InjectDCUAsyncCopyShadowAddr():
     high shadow bits onto ``buf_dyn_shmem``, then replaces the first argument of
     ``tl.dcu_async_copy`` with the corresponding shadow address.
 
-    Shadow offset style follows T.copy ``major`` (via ``AnnotateDCUGemmTranspose``):
+    Tiles whose ``tl.dcu_need_layout`` map entry is 0 (fast sequential SIMT copy)
+    use a separately declared ``plain_shared_addr`` that aliases the same LDS
+    allocation but without Q/K shadow bits. Mixed kernels (e.g. K with fast LDS
+    and V without) must not reuse ``B_shared_addr`` for the V copy.
+
+    Shadow offset style follows that buffer's T.copy ``major``
+    (via ``AnnotateDCUGemmTranspose``):
     - row_major (half_t): ``(warp_idx & 3) << 16``
     - col_major (half_t): ``(warp_idx & 1) << 18``
 

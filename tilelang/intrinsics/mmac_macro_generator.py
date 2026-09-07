@@ -5,9 +5,6 @@ from typing import Literal, Callable
 from tvm import DataType
 from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion, BufferLoad
 from tvm.runtime import convert
-from .utils import (
-    mmac_store_index_map,
-)
 from tilelang.utils import is_fragment
 from .mfma_layout import (
     shared_16x4_to_local_64x1_layout_A,
@@ -31,6 +28,8 @@ from .mfma_layout import (
 from .mmac_layout import (
     shared_16x16_to_local_64x4_layout_A,
     thread_id_shared_access_64x4_to_16x16_layout_A,
+    thread_id_shared_access_64x4_to_16x16_layout_C_m_n,
+    thread_id_shared_access_64x4_to_16x16_layout_C_n_m,
     shared_to_local_layout_A_padding,
     shared_to_local_layout_A_wrap,
     shared_32x16_to_local_64x8_layout_B,
@@ -44,6 +43,7 @@ from .mmac_layout import (
     shared_to_local_layout_A,
     shared_to_local_layout_B,
     shared_to_local_layout_B_simple,
+    ki_shared_cvt,
     LayoutConfig
 )
 
@@ -88,7 +88,6 @@ class MatrixCoreIntrinEmitter:
         warp_row_tiles: int = 8,
         warp_col_tiles: int = 8,
         chunk: int = 16,
-        block_K: int = 16,
         reduce_k: int = 1,
         num_elems_per_byte: int = 1,
         k_pack: int | None = None,
@@ -96,21 +95,23 @@ class MatrixCoreIntrinEmitter:
         b_preshuffle: bool | None = False,
         thread_var: Var | None = None,
         enable_fast_lds: bool | None = False,
+        transpose_C: bool = True,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
         self.accum_dtype = accum_dtype
         self.a_transposed = a_transposed
         self.b_transposed = b_transposed
+        # True: tvm_mmac(B, A) => BT * AT = CT (default, cheaper store).
+        # False: tvm_mmac(A, B) => A * B = C. Load layouts are unchanged.
+        self.transpose_C = transpose_C
         # Hint Information
         self.block_row_warps = block_row_warps
         self.block_col_warps = block_col_warps
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
-        self.block_K = block_K
         self.enable_fast_lds = enable_fast_lds
-        print("self.enable_fast_lds_init:", self.enable_fast_lds)
         
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
@@ -227,9 +228,16 @@ class MatrixCoreIntrinEmitter:
 
         return index_map, reverse_index_map
 
+    def _mmac_store_index_map_fn(self):
+        # 16x16 C fragment: CT (default) uses m-major; C uses n-major.
+        # Warp tiling offsets in make_mmac_store_layout stay unchanged.
+        if self.transpose_C:
+            return thread_id_shared_access_64x4_to_16x16_layout_C_m_n
+        return thread_id_shared_access_64x4_to_16x16_layout_C_n_m
+
     def get_store_index_map(self, inverse: bool = False) -> IndexMap:
         warp_size, local_size_c = self.WARP_SIZE, self.local_size_out
-        index_map = IndexMap.from_func(mmac_store_index_map, index_dtype=T.int32)
+        index_map = IndexMap.from_func(self._mmac_store_index_map_fn(), index_dtype=T.int32)
         if not inverse:
             return index_map
         inverse_index_map = index_map.inverse([warp_size, local_size_c])
@@ -282,6 +290,7 @@ class MatrixCoreIntrinEmitter:
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
         local_size_a = self.local_size_a
+        m_dim = self.block_row_warps * self.warp_row_tiles      
         k_pack = self.k_pack
         is_transposed = self.a_transposed
         thread_binding = self.get_thread_binding()
@@ -293,6 +302,11 @@ class MatrixCoreIntrinEmitter:
         A_buf = A_region.buffer
         A_base0 = A_region.region[-2].min
         A_base1 = A_region.region[-1].min
+        if is_transposed:
+            new_stride = A_region.buffer.shape[0]
+        else:
+            new_stride = A_region.buffer.shape[1]
+        stride = micro_size_k * k_pack
 
         @T.macro
         def _warp_ldmatrix_a(
@@ -328,6 +342,7 @@ class MatrixCoreIntrinEmitter:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
+                        row, col = ki_shared_cvt(row, col + ki * m_dim * self.k_pack* micro_size_k, stride, new_stride)
                         # row, col = layoutInfer.base(tx, local_id)
                         # slab padding
                         # row, col = layoutInfer.slab(row, col)
@@ -338,7 +353,7 @@ class MatrixCoreIntrinEmitter:
                         
                         # rewind offset
                         # row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col + ki * micro_size_k]
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
 
@@ -354,6 +369,9 @@ class MatrixCoreIntrinEmitter:
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+        print("k_pack:", k_pack)
+        print("warp_cols:", warp_cols)
+        print("warp_col_tiles:", self.block_col_warps)
         if not is_transposed:
             if self.enable_fast_lds:
                 layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
@@ -393,7 +411,14 @@ class MatrixCoreIntrinEmitter:
                             B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
-    def mmac(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
+    def mmac(
+        self,
+        A_local_buf: Buffer,
+        B_local_buf: Buffer,
+        C_local_buf: Buffer,
+        k_inner: PrimExpr | None = 0,
+        transpose_C: bool | None = None,
+    ):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
@@ -405,49 +430,82 @@ class MatrixCoreIntrinEmitter:
         compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
         compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
         compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+        transpose_c = self.transpose_C if transpose_C is None else transpose_C
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)
+        # gemm_ss keeps the original packed-K-then-M indexing (A is ss local).
+        # gemm_rs A-fragment matches store/load K-major: 4-reg groups walk K
+        # tiles first, then M, so float16x4 index is ki + i * n_k_tiles.
+        a_is_rs_fragment = a_is_fragment and (not b_is_fragment)
+        n_k_tiles = self.chunk // (self.micro_size_k * k_pack)
         a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
         b_local_stride: PrimExpr = k_inner * warp_cols * k_pack * local_size_b if b_is_fragment else 0
 
-        @T.macro
-        def _warp_mmac(A_local_buf, B_local_buf, C_local_buf):
-            for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
-                if self.b_transposed: 
-                    T.tvm_mmac(
-                                mmac_suffix,
-                                "row",
-                                "row",
-                                compute_a_dtype,
-                                compute_b_dtype,
-                                compute_out_dtype,
-                                B_local_buf.data,
-                                (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
-                                A_local_buf.data,
-                                (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
-                                C_local_buf.data,
-                                (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
-                                dtype=compute_out_dtype,
-                            )
-                else:
-                    T.tvm_mmac(
-                        mmac_suffix,
-                        "row",
-                        "row",
-                        compute_a_dtype,
-                        compute_b_dtype,
-                        compute_out_dtype,
-                        B_local_buf.data,
-                        (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b,
-                        A_local_buf.data,
-                        (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
-                        C_local_buf.data,
-                        (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
-                        dtype=compute_out_dtype,
-                    )
+        # Hardware slot 0 is matrixcore-A, slot 1 is matrixcore-B.
+        # A/B keep their own load layouts; only the mmac argument order changes.
+        # True  (default): mmac(B, A) => BT * AT = CT (store-friendly).
+        # False:           mmac(A, B) => A  * B  = C.
 
-        return _warp_mmac(A_local_buf, B_local_buf, C_local_buf)
+        @T.macro
+        def _warp_mmac_ct(A_local_buf, B_local_buf, C_local_buf):
+            for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
+                if a_is_rs_fragment:
+                    a_idx = k_inner * k_pack + kp + i * n_k_tiles
+                else:
+                    a_idx = (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a
+                c_idx = (i * warp_cols * local_size_out + j * local_size_out) // local_size_out
+                if self.b_transposed:
+                    b_idx = (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b
+                else:
+                    b_idx = (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b
+                T.tvm_mmac(
+                    mmac_suffix,
+                    "row",
+                    "row",
+                    compute_b_dtype,
+                    compute_a_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    b_idx,
+                    A_local_buf.data,
+                    a_idx,
+                    C_local_buf.data,
+                    c_idx,
+                    dtype=compute_out_dtype,
+                )
+
+        @T.macro
+        def _warp_mmac_c(A_local_buf, B_local_buf, C_local_buf):
+            for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
+                if a_is_rs_fragment:
+                    a_idx = k_inner * k_pack + kp + i * n_k_tiles
+                else:
+                    a_idx = (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a
+                c_idx = (i * warp_cols * local_size_out + j * local_size_out) // local_size_out
+                if self.b_transposed:
+                    b_idx = (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b
+                else:
+                    b_idx = (b_local_stride + j * local_size_b + kp * warp_cols * local_size_b) // local_size_b
+                T.tvm_mmac(
+                    mmac_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    A_local_buf.data,
+                    a_idx,
+                    B_local_buf.data,
+                    b_idx,
+                    C_local_buf.data,
+                    c_idx,
+                    dtype=compute_out_dtype,
+                )
+
+        if transpose_c:
+            return _warp_mmac_ct(A_local_buf, B_local_buf, C_local_buf)
+        return _warp_mmac_c(A_local_buf, B_local_buf, C_local_buf)
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps
@@ -472,7 +530,7 @@ class MatrixCoreIntrinEmitter:
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mmac_store_index_map(tx, local_id))
+                    row, col = T.meta_var(self._mmac_store_index_map_fn()(tx, local_id))
                     if C_buf_dims == 2:
                         C_buf[(warp_m * warp_rows + i) * M_DIM + row, (warp_n * warp_cols + j) * N_DIM + col] = C_local_buf[
                             j * (warp_rows * local_size_out) + i * local_size_out + local_id
@@ -487,7 +545,7 @@ class MatrixCoreIntrinEmitter:
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mmac_store_index_map(tx, local_id))
+                    row, col = T.meta_var(self._mmac_store_index_map_fn()(tx, local_id))
                     C_buf[
                         (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row, (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM + col
                     ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out + local_id]
@@ -566,29 +624,106 @@ class MatrixCoreIntrinEmitter:
 
         assert is_fragment(local_buf), f"local_buf must be a fragment, but got {local_buf.scope()}"
 
-        if matrix_is_a:
-            micro_size_s, micro_size_r = self.micro_size_x, self.micro_size_k
-        else:
-            micro_size_r, micro_size_s = self.micro_size_k, self.micro_size_y
+        inverse_mmac_load_layout = IndexMap.from_func(transform_func, index_dtype=T.int32)
 
+        # Register A: 16x16 inner uses A-load layout (after mmac_ct_to_a_16x16).
+        # Warp / iter tiling outside 16x16 copies make_mmac_store_layout, with
+        # the second axis taken from K (chunk) so every warp holds full K.
+        if matrix_is_a:
+            shape = local_buf.shape
+            micro_size_x, micro_size_k = self.micro_size_x, self.micro_size_k
+            local_size_a = self.local_size_a
+            block_row_warps = self.block_row_warps
+            warp_rows = self.warp_rows
+            warp_size = self.WARP_SIZE
+            is_m_first = self.is_m_first
+            data_byte = DataType(self.a_dtype).bits // 8
+            slab4_num = self.block_row_warps * self.warp_row_tiles * self.micro_size_k * self.k_pack // (
+                1024 // data_byte * 4)
+            micro_size_dcu_x = slab4_num * 16
+            # K plays the role of store's N: one warp owns the full K extent.
+            block_col_warps_k = 1
+            warp_col_tiles_k = self.chunk
+            warp_cols_k = warp_col_tiles_k // micro_size_k
+            micro_size_dcu_k = 32
+            slab4_num_k = block_col_warps_k * warp_col_tiles_k * self.micro_size_k * self.k_pack // (
+                1024 // data_byte * 4)
+            if self.b_transposed:
+                micro_size_dcu_k = slab4_num_k * 16
+
+            def forward_thread_a(i: int, j: int) -> int:
+                warp_cols_dcu = warp_cols_k // (micro_size_dcu_k // micro_size_k)
+                block_i = (i // micro_size_dcu_x) % block_row_warps
+                block_j = (j // micro_size_dcu_k) % block_col_warps_k
+                mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
+                lane_id, _ = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
+                if is_m_first:
+                    return block_i * (block_col_warps_k * warp_cols_dcu) + block_j * warp_size + lane_id
+                return block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
+
+            def forward_index_a(i: int, j: int) -> int:
+                warp_i = (i // micro_size_dcu_x) // block_row_warps
+                warp_j = j // micro_size_dcu_k // block_col_warps_k
+                warp_i_in_32_16 = (i // 16) % slab4_num
+                warp_j_in_32_16 = (j // 16) % 2
+                mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
+                _, local_id = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
+                return (
+                    warp_j * ((micro_size_dcu_k // micro_size_k) * local_size_a)
+                    + warp_j_in_32_16 * local_size_a
+                    + local_id
+                    + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x))
+                    * (warp_cols_k * local_size_a)
+                )
+
+            def forward_thread_a_nt(i: int, j: int) -> int:
+                warp_cols_dcu = warp_cols_k // (micro_size_dcu_k // micro_size_k)
+                block_i = (i // micro_size_dcu_x) % block_row_warps
+                block_j = (j // micro_size_dcu_k) % block_col_warps_k
+                mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
+                lane_id, _ = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
+                if is_m_first:
+                    return block_i * (block_col_warps_k * warp_cols_dcu) + block_j * warp_size + lane_id
+                return block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
+
+            def forward_index_a_nt(i: int, j: int) -> int:
+                warp_i = (i // micro_size_dcu_x) // block_row_warps
+                warp_j = j // micro_size_dcu_k // block_col_warps_k
+                warp_i_in_32_16 = (i // 16) % slab4_num
+                warp_j_in_32_16 = (j // 16) % slab4_num_k
+                mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
+                _, local_id = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
+                return (
+                    (warp_j + warp_j_in_32_16 * warp_cols_k // (micro_size_dcu_k // micro_size_k))
+                    * local_size_a
+                    + local_id
+                    + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x))
+                    * (warp_cols_k * local_size_a)
+                )
+
+            if not self.b_transposed and not self.a_transposed:
+                return T.Fragment(
+                    shape,
+                    forward_thread_fn=forward_thread_a,
+                    forward_index_fn=forward_index_a,
+                )
+            return T.Fragment(
+                shape,
+                forward_thread_fn=forward_thread_a_nt,
+                forward_index_fn=forward_index_a_nt,
+            )
+
+        micro_size_r, micro_size_s = self.micro_size_k, self.micro_size_y
         block_row_warps, block_col_warps = (
             self.block_row_warps,
             self.block_col_warps,
         )
 
-        inverse_mmac_load_layout = IndexMap.from_func(transform_func, index_dtype=T.int32)
-
         def forward_thread(i: int, j: int) -> int:
-            """
-            Given the row index `i` and column index `j` in the fragment,
-            """
             lane_id, _ = inverse_mmac_load_layout.map_indices([i, j])
             return lane_id
 
         def forward_index(i: int, j: int) -> int:
-            """
-            Given the row index `i` and column index `j` in the fragment,
-            """
             _, local_id = inverse_mmac_load_layout.map_indices([i, j])
             return local_id
 
@@ -600,30 +735,18 @@ class MatrixCoreIntrinEmitter:
 
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         chunk = self.chunk
-
-        warp_s = warp_rows if matrix_is_a else warp_cols
+        warp_s = warp_cols
         warp_r = chunk // (micro_size_r * self.k_pack)
-        block_s = block_row_warps if matrix_is_a else block_col_warps
-        replicate = block_col_warps if matrix_is_a else block_row_warps
+        block_s = block_col_warps
+        replicate = block_row_warps
 
         if is_sr_axis_order:
             warp_fragment = base_fragment.repeat([warp_s, warp_r], repeat_on_thread=False, lower_dim_first=False)
-            if matrix_is_a:
-                block_fragment = warp_fragment.repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
-            elif matrix_is_b:
-                block_fragment = warp_fragment.replicate(replicate).repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True)
-            else:
-                raise ValueError(f"Unsupported matrix type {matrix}")
-        else:
-            warp_fragment = base_fragment.repeat([warp_r, warp_s], repeat_on_thread=False, lower_dim_first=True)
-            if matrix_is_a:
-                block_fragment = warp_fragment.repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
-            elif matrix_is_b:
-                block_fragment = warp_fragment.replicate(replicate).repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True)
-            else:
-                raise ValueError(f"Unsupported matrix type {matrix}")
-
-        return block_fragment
+            return warp_fragment.replicate(replicate).repeat(
+                [block_s, 1], repeat_on_thread=True, lower_dim_first=True)
+        warp_fragment = base_fragment.repeat([warp_r, warp_s], repeat_on_thread=False, lower_dim_first=True)
+        return warp_fragment.replicate(replicate).repeat(
+            [1, block_s], repeat_on_thread=True, lower_dim_first=True)
     
     
     def make_mmac_store_layout(self, local_buf: Buffer) -> T.Fragment:
@@ -641,6 +764,7 @@ class MatrixCoreIntrinEmitter:
             A fragment object describing the thread and index layout for MMAC.
         """
         from tilelang.utils import is_fragment
+        print("enter make_mmac_store_layout")
 
         shape = local_buf.shape
         inverse_mmac_store_layout = self.get_store_index_map(inverse=True)
@@ -653,11 +777,11 @@ class MatrixCoreIntrinEmitter:
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
         data_byte = DataType(self.a_dtype).bits // 8
-        slab4_num = self.block_row_warps * self.warp_row_tiles * self.block_K // (1024 // data_byte * 4)
+        slab4_num = self.block_row_warps * self.warp_row_tiles * self.micro_size_k * self.k_pack // (1024 // data_byte * 4)
         micro_size_dcu_x = slab4_num * 16
         micro_size_dcu_y = 32
         if self.b_transposed:
-            slab4_num_b = self.block_col_warps * self.warp_col_tiles * self.block_K // (1024 // data_byte * 4)
+            slab4_num_b = self.block_col_warps * self.warp_col_tiles * self.micro_size_k * self.k_pack // (1024 // data_byte * 4)
             micro_size_dcu_y = slab4_num_b * 16
         def forward_thread(i: int, j: int) -> int:
             """

@@ -428,8 +428,11 @@ bool HasAsyncCopyForVars(const Stmt& body, const std::unordered_set<const VarNod
 
 PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
   DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(func);
-  const bool enable_a = NeedsDCUAsyncCopyIdxenA(flags);
-  const bool enable_b = NeedsDCUAsyncCopyIdxenB(flags);
+  DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(func);
+  const bool enable_a = NeedsDCUAsyncCopyIdxenForOperand(
+      flags, 0, LookupDCUNeedLayoutForOperand(maps, 0, true));
+  const bool enable_b = NeedsDCUAsyncCopyIdxenForOperand(
+      flags, 1, LookupDCUNeedLayoutForOperand(maps, 1, true));
   if (!enable_a && !enable_b) {
     return func;
   }

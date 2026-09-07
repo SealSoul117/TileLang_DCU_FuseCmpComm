@@ -234,6 +234,65 @@
     }
   }
 
+  // HIP __shfl_xor has no _Float16 / half overload; shuffle the bit pattern.
+  template <typename T>
+  TL_DEVICE T shfl_xor64(T var, int lane_mask) {
+    if constexpr (sizeof(T) == 2) {
+      union {
+        T v;
+        unsigned short u;
+      } in, out;
+      in.v = var;
+      out.u = __shfl_xor(in.u, lane_mask, 64);
+      return out.v;
+    } else {
+      return __shfl_xor(var, lane_mask, 64);
+    }
+  }
 
+  // In-place 4x4 transpose of one 16x16 CT fragment among lanes {t, t^16, t^32, t^48}.
+  // CT store: thread p*16+j holds R[k] = CT[k*4+p, j] = C[j, k*4+p].
+  // After transpose: thread p*16+j holds C[j, p*4 + 0..3], which is A-load layout
+  // (thread i+16*g holds row i, cols 4g..4g+3) with i=j, g=p.
+  template <typename T>
+  TL_DEVICE void transpose_4x4_registers_branchless(T R[4]) {
+    int p = (threadIdx.x >> 4) & 3; // 0, 1, 2, 3
+    int b0 = p & 1;
+    int b1 = (p >> 1) & 1;
+
+    // Step 1: xor 16. Transpose 2x2 blocks (p, p^1) x (R0,R1) and (R2,R3).
+    int send_idx_a = b0 ? 0 : 1;
+    int send_idx_b = b0 ? 2 : 3;
+    T send_a = R[send_idx_a];
+    T send_b = R[send_idx_b];
+    T recv_a = shfl_xor64(send_a, 16);
+    T recv_b = shfl_xor64(send_b, 16);
+    R[send_idx_a] = recv_a;
+    R[send_idx_b] = recv_b;
+
+    // Step 2: xor 32. Transpose the two 2x4 halves (p, p^2).
+    int send_idx_c = b1 ? 0 : 2;
+    int send_idx_d = b1 ? 1 : 3;
+    T send_c = R[send_idx_c];
+    T send_d = R[send_idx_d];
+    T recv_c = shfl_xor64(send_c, 32);
+    T recv_d = shfl_xor64(send_d, 32);
+    R[send_idx_c] = recv_c;
+    R[send_idx_d] = recv_d;
+  }
+
+  template <typename Src, typename Dst>
+  TL_DEVICE void mmac_ct_to_a_16x16(Dst *dst, const Src *src) {
+    Dst R[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      R[i] = static_cast<Dst>(src[i]);
+    }
+    transpose_4x4_registers_branchless(R);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      dst[i] = R[i];
+    }
+  }
 
   } // namespace tl

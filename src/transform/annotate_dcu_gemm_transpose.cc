@@ -19,7 +19,7 @@
 
 /*!
  * \file annotate_dcu_gemm_transpose.cc
- * \brief Collect T.gemm transpose flags from lowered GEMM bodies into PrimFunc attrs.
+ * \brief Collect T.gemm / T.copy annotations from lowered bodies into PrimFunc attrs.
  */
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
@@ -37,15 +37,26 @@ using namespace tir::transform;
 
 namespace {
 
+std::string AttrStmtBufferName(const AttrStmtNode* op) {
+  if (const auto* s = op->node.as<StringImmNode>()) {
+    return s->value;
+  }
+  return "";
+}
+
+int AttrStmtIntValue(const PrimExpr& value) {
+  if (const auto* imm = value.as<IntImmNode>()) {
+    return static_cast<int>(imm->value);
+  }
+  return 0;
+}
+
 class DCUGemmTransposeCollector : public StmtExprVisitor {
  public:
   bool trans_a{false};
   bool trans_b{false};
   bool found{false};
-  int copy_major_a{0};
-  int copy_major_b{0};
-  bool copy_major_a_found{false};
-  bool copy_major_b_found{false};
+  DCUCopyBufferMaps copy_maps;
 
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -55,12 +66,21 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
     } else if (op->attr_key == kDCUGemmTransBStmt) {
       trans_b |= Downcast<Bool>(op->value)->value;
       found = true;
-    } else if (op->attr_key == kDCUCopyMajorAStmt) {
-      copy_major_a = Downcast<IntImm>(op->value)->value;
-      copy_major_a_found = true;
-    } else if (op->attr_key == kDCUCopyMajorBStmt) {
-      copy_major_b = Downcast<IntImm>(op->value)->value;
-      copy_major_b_found = true;
+    } else if (op->attr_key == kDCUCopyMajorStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.copy_major[name] = AttrStmtIntValue(op->value);
+      }
+    } else if (op->attr_key == kDCUNeedLayoutStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.need_layout[name] = AttrStmtIntValue(op->value) != 0;
+      }
+    } else if (op->attr_key == kDCUGemmOperandStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.gemm_operand[name] = AttrStmtIntValue(op->value);
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -70,12 +90,41 @@ class DCUGemmTransposeStmtRemover : public StmtMutator {
  private:
   Stmt VisitStmt_(const AttrStmtNode* op) final {
     if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt ||
-        op->attr_key == kDCUCopyMajorAStmt || op->attr_key == kDCUCopyMajorBStmt) {
+        op->attr_key == kDCUCopyMajorStmt || op->attr_key == kDCUNeedLayoutStmt ||
+        op->attr_key == kDCUGemmOperandStmt) {
       return VisitStmt(op->body);
     }
     return StmtMutator::VisitStmt_(op);
   }
 };
+
+Map<String, Integer> ToIntegerMap(const std::unordered_map<std::string, int>& src) {
+  Map<String, Integer> out;
+  for (const auto& kv : src) {
+    out.Set(String(kv.first), Integer(kv.second));
+  }
+  return out;
+}
+
+Map<String, Integer> NeedLayoutToIntegerMap(const std::unordered_map<std::string, bool>& src) {
+  Map<String, Integer> out;
+  for (const auto& kv : src) {
+    out.Set(String(kv.first), Integer(kv.second ? 1 : 0));
+  }
+  return out;
+}
+
+void MergeCopyMaps(DCUCopyBufferMaps* dst, const DCUCopyBufferMaps& src) {
+  for (const auto& kv : src.copy_major) {
+    dst->copy_major[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.need_layout) {
+    dst->need_layout[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.gemm_operand) {
+    dst->gemm_operand[kv.first] = kv.second;
+  }
+}
 
 }  // namespace
 
@@ -96,19 +145,10 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
       trans_b |= collector.trans_b;
     }
 
-    DCUCopyMajorFlags existing_major = GetDCUCopyMajorFlags(f);
-    int copy_major_a = existing_major.a_defined ? existing_major.copy_major_a : 0;
-    int copy_major_b = existing_major.b_defined ? existing_major.copy_major_b : 0;
-    bool copy_major_found = collector.copy_major_a_found || collector.copy_major_b_found ||
-                            existing_major.a_defined || existing_major.b_defined;
-    if (collector.copy_major_a_found) {
-      copy_major_a = collector.copy_major_a;
-    }
-    if (collector.copy_major_b_found) {
-      copy_major_b = collector.copy_major_b;
-    }
+    DCUCopyBufferMaps copy_maps = GetDCUCopyBufferMaps(f);
+    MergeCopyMaps(&copy_maps, collector.copy_maps);
 
-    if (!collector.found && !existing.defined && !copy_major_found) {
+    if (!collector.found && !existing.defined && DCUCopyBufferMapsEmpty(copy_maps)) {
       return f;
     }
 
@@ -118,9 +158,14 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
       f = WithAttr(std::move(f), kDCUGemmTransA, Bool(trans_a));
       f = WithAttr(std::move(f), kDCUGemmTransB, Bool(trans_b));
     }
-    if (copy_major_found) {
-      f = WithAttr(std::move(f), kDCUCopyMajorA, Integer(copy_major_a));
-      f = WithAttr(std::move(f), kDCUCopyMajorB, Integer(copy_major_b));
+    if (!copy_maps.copy_major.empty()) {
+      f = WithAttr(std::move(f), kDCUCopyMajorMap, ToIntegerMap(copy_maps.copy_major));
+    }
+    if (!copy_maps.need_layout.empty()) {
+      f = WithAttr(std::move(f), kDCUNeedLayoutMap, NeedLayoutToIntegerMap(copy_maps.need_layout));
+    }
+    if (!copy_maps.gemm_operand.empty()) {
+      f = WithAttr(std::move(f), kDCUGemmOperandMap, ToIntegerMap(copy_maps.gemm_operand));
     }
     return f;
   };

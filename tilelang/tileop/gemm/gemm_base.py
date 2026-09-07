@@ -113,6 +113,13 @@ class GemmBase:
         return getattr(self.gemm_node, "kPack", None)
 
     @property
+    def trans_C(self) -> bool:
+        value = getattr(self.gemm_node, "transC", True)
+        if value is None:
+            return True
+        return bool(value)
+
+    @property
     def wg_wait(self) -> int:
         return getattr(self.gemm_node, "wgWait", 0)
 

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import tilelang
 import tilelang.language as T
 
@@ -17,7 +18,7 @@ def get_configs():
 
 @autotune(configs=get_configs(), warmup=10, rep=10)
 @tilelang.jit(
-    out_idx=[2],
+    out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
@@ -35,7 +36,7 @@ def mma0_kernel(
         threads=256):
     q_shape = [batch, heads, seq_q, dim]
     k_shape = [batch, heads, seq_kv, dim]
-    out_shape = [batch, heads, seq_q, seq_kv]
+    out_shape = [batch, heads, seq_q, dim]
 
     dtype = T.float16
     accum_dtype = T.float32
@@ -112,7 +113,7 @@ def mma0_kernel(
         #
         # -----------------------
         # T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
-        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, k_pack=(dim//16))
+        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, k_pack=(dim//16), policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
 
         # -----------------------
         # causal mask
@@ -137,14 +138,14 @@ def mma0_kernel(
         bz: T.int32,
     ):
         T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
-        T.gemm(acc_s_cast, V_shared, acc_o)
+        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
         
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),
         K: T.Tensor(k_shape, dtype),
         V: T.Tensor(kv_shape, dtype),
-        Output: T.Tensor(out_shape, accum_dtype)
+        Output: T.Tensor(out_shape, dtype)
     ):
         with T.Kernel(T.ceildiv(seq_q, block_M), heads, batch, threads=threads) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], dtype)
@@ -169,7 +170,7 @@ def mma0_kernel(
             for k in T.Pipelined(loop_range, num_stages=0):
                 MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
                 Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
-                Rescale(acc_o, scores_scale)
+                # Rescale(acc_o, scores_scale)
                 MMA1(V, V_shared, acc_s_cast, acc_o, k, by, bz)
             # store S block
             for i, j in T.Parallel(block_M, dim):
@@ -205,7 +206,8 @@ def main(
 ):
     Q = torch.randn(batch, heads, seq_q, dim, device="cuda", dtype=torch.float16)
     K = torch.randn(batch, heads, seq_kv, dim, device="cuda", dtype=torch.float16)
-    
+    flops_per_matmul = 2.0 * batch * heads * seq_q * seq_kv * dim
+    total_flops = 2 * flops_per_matmul
     kernel = mma0_kernel(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=128, block_N=128, num_stages=4, threads=256)
     
     print(kernel.get_kernel_source())
@@ -218,15 +220,14 @@ def main(
     profiler.assert_allclose(ref, rtol=1e-2, atol=1e-2)
     
 
-    print("MMA0 check pass!")
+    print("All checks pass.")
+    ref_latency = profiler.do_bench(ref, warmup=500)
+    print("Ref: {:.2f} ms".format(ref_latency))
+    print("Ref: {:.2f} TFlops".format(total_flops / ref_latency * 1e-9))
 
     latency = profiler.do_bench(warmup=500)
-
-    flops = 2.0 * batch * heads * seq_q * seq_kv * dim
-
-    print("Latency %.4f ms" % latency)
-
-    print("TFLOPS %.3f" % (flops / latency * 1e-9))
+    print("Tile-lang: {:.2f} ms".format(latency))
+    print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
 
 
 if __name__ == "__main__":

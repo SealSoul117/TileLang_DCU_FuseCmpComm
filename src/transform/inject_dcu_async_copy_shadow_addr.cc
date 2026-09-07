@@ -57,7 +57,7 @@ const BufferLoadNode* PeelBufferLoad(const PrimExpr& value) {
 
 bool IsSharedScopeName(const Buffer& buf) {
   const std::string scope = buf.scope();
-  const std::string& name = buf->name;
+  const std::string name(buf->name);
   return scope == "shared" || scope == "shared.dyn" ||
          name.find("shared") != std::string::npos || name.find("shmem") != std::string::npos;
 }
@@ -367,26 +367,34 @@ class ShadowAddrInjector : public StmtExprMutator {
  public:
   ShadowAddrInjector(Var buf_dyn_shmem,
                      std::unordered_set<const VarNode*> a_dcu_res_vars,
-                     std::unordered_set<const VarNode*> b_dcu_res_vars, int a_copy_major,
-                     int b_copy_major, int a_elem_bytes, int b_elem_bytes, int warp_num)
+                     std::unordered_set<const VarNode*> b_dcu_res_vars,
+                     std::unordered_set<const VarNode*> noshadow_dcu_res_vars, int a_copy_major,
+                     int b_copy_major, int a_elem_bytes, int b_elem_bytes, int warp_num,
+                     bool a_need_layout, bool b_need_layout)
       : buf_dyn_shmem_(std::move(buf_dyn_shmem)),
         a_dcu_res_vars_(std::move(a_dcu_res_vars)),
         b_dcu_res_vars_(std::move(b_dcu_res_vars)),
+        noshadow_dcu_res_vars_(std::move(noshadow_dcu_res_vars)),
         a_copy_major_(a_copy_major),
         b_copy_major_(b_copy_major),
         a_elem_bytes_(a_elem_bytes),
         b_elem_bytes_(b_elem_bytes),
         warp_num_(warp_num),
-        a_split_factor_(ComputeSplitFactor(a_copy_major, warp_num)),
-        b_split_factor_(ComputeSplitFactor(b_copy_major, warp_num)) {}
+        a_need_layout_(a_need_layout),
+        b_need_layout_(b_need_layout),
+        a_split_factor_(a_need_layout ? ComputeSplitFactor(a_copy_major, warp_num) : 1),
+        b_split_factor_(b_need_layout ? ComputeSplitFactor(b_copy_major, warp_num) : 1) {}
 
   static PrimFunc Substitute(PrimFunc func, const InfoCollector& info, int a_copy_major,
-                             int b_copy_major, int a_elem_bytes, int b_elem_bytes) {
+                             int b_copy_major, int a_elem_bytes, int b_elem_bytes,
+                             bool a_need_layout, bool b_need_layout,
+                             std::unordered_set<const VarNode*> noshadow_dcu_res_vars) {
     const int64_t thread_extent = GetConstInt(info.thread_extent).value_or(0);
     ICHECK_GT(thread_extent, 0) << "thread_extent must be positive for shadow addr injection";
     const int warp_num = std::max(1, static_cast<int>(thread_extent / kDCUWarpSize));
     ShadowAddrInjector mutator(info.buf_dyn_shmem, info.a_dcu_res_vars, info.b_dcu_res_vars,
-                               a_copy_major, b_copy_major, a_elem_bytes, b_elem_bytes, warp_num);
+                               std::move(noshadow_dcu_res_vars), a_copy_major, b_copy_major,
+                               a_elem_bytes, b_elem_bytes, warp_num, a_need_layout, b_need_layout);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -416,6 +424,13 @@ class ShadowAddrInjector : public StmtExprMutator {
   bool IsBDcuRes(const PrimExpr& expr) const {
     if (const auto* var = expr.as<VarNode>()) {
       return b_dcu_res_vars_.count(var) > 0;
+    }
+    return false;
+  }
+
+  bool IsNoShadowDcuRes(const PrimExpr& expr) const {
+    if (const auto* var = expr.as<VarNode>()) {
+      return noshadow_dcu_res_vars_.count(var) > 0;
     }
     return false;
   }
@@ -482,12 +497,23 @@ class ShadowAddrInjector : public StmtExprMutator {
     const DataType ptr_type = buf_dyn_shmem_->dtype;
     const DataType u32 = DataType::UInt(32);
     shmem_base_var_ = Var("shmem_base", ptr_type);
-    // Outermost lets run first: bind shmem_base, then offsets, then shadow-tagged addrs.
-    InjectSplitBufferAddrs(body, ptr_type, u32, a_split_factor_, true, "a", "A",
-                           &a_shared_addr_vars_);
-    InjectSplitBufferAddrs(body, ptr_type, u32, b_split_factor_, false, "b", "B",
-                           &b_shared_addr_vars_);
-    body = LetStmt(shmem_base_var_, buf_dyn_shmem_, body);
+    if (a_need_layout_) {
+      InjectSplitBufferAddrs(body, ptr_type, u32, a_split_factor_, true, "a", "A",
+                             &a_shared_addr_vars_);
+    }
+    if (b_need_layout_) {
+      InjectSplitBufferAddrs(body, ptr_type, u32, b_split_factor_, false, "b", "B",
+                             &b_shared_addr_vars_);
+    }
+    // Fast-copy tiles (need_layout=0) reuse the same LDS allocation but must
+    // not inherit Q/K shadow bits. Declare a second pointer at the raw base.
+    if (!noshadow_dcu_res_vars_.empty() && (a_need_layout_ || b_need_layout_)) {
+      plain_shared_addr_var_ = Var("plain_shared_addr", ptr_type);
+      body = LetStmt(plain_shared_addr_var_, shmem_base_var_, body);
+    }
+    if (a_need_layout_ || b_need_layout_) {
+      body = LetStmt(shmem_base_var_, buf_dyn_shmem_, body);
+    }
     shadow_injected_ = true;
     return body;
   }
@@ -496,11 +522,14 @@ class ShadowAddrInjector : public StmtExprMutator {
     if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp())) {
       return SplitBufferKind::kNone;
     }
+    if (IsNoShadowDcuRes(call->args[2])) {
+      return SplitBufferKind::kNone;
+    }
     if (IsADcuRes(call->args[2])) {
-      return a_split_factor_ > 1 ? SplitBufferKind::kA : SplitBufferKind::kNone;
+      return a_need_layout_ && a_split_factor_ > 1 ? SplitBufferKind::kA : SplitBufferKind::kNone;
     }
     if (IsBDcuRes(call->args[2])) {
-      return b_split_factor_ > 1 ? SplitBufferKind::kB : SplitBufferKind::kNone;
+      return b_need_layout_ && b_split_factor_ > 1 ? SplitBufferKind::kB : SplitBufferKind::kNone;
     }
     return SplitBufferKind::kNone;
   }
@@ -540,11 +569,20 @@ class ShadowAddrInjector : public StmtExprMutator {
       return GetRef<PrimExpr>(op);
     }
     PrimExpr new_base = op->args[0];
-    if (IsADcuRes(op->args[2])) {
-      ICHECK(!a_shared_addr_vars_.empty());
+    if (IsNoShadowDcuRes(op->args[2])) {
+      if (!plain_shared_addr_var_.defined()) {
+        return GetRef<PrimExpr>(op);
+      }
+      new_base = plain_shared_addr_var_;
+    } else if (IsADcuRes(op->args[2])) {
+      if (!a_need_layout_ || a_shared_addr_vars_.empty()) {
+        return GetRef<PrimExpr>(op);
+      }
       new_base = a_shared_addr_vars_[0];
     } else if (IsBDcuRes(op->args[2])) {
-      ICHECK(!b_shared_addr_vars_.empty());
+      if (!b_need_layout_ || b_shared_addr_vars_.empty()) {
+        return GetRef<PrimExpr>(op);
+      }
       new_base = b_shared_addr_vars_[0];
     } else {
       return GetRef<PrimExpr>(op);
@@ -598,15 +636,19 @@ class ShadowAddrInjector : public StmtExprMutator {
   Var buf_dyn_shmem_;
   std::unordered_set<const VarNode*> a_dcu_res_vars_;
   std::unordered_set<const VarNode*> b_dcu_res_vars_;
+  std::unordered_set<const VarNode*> noshadow_dcu_res_vars_;
   int a_copy_major_{0};
   int b_copy_major_{0};
   int a_elem_bytes_;
   int b_elem_bytes_;
   int warp_num_{1};
+  bool a_need_layout_{true};
+  bool b_need_layout_{true};
   int a_split_factor_{1};
   int b_split_factor_{1};
   Var warp_idx_var_;
   Var shmem_base_var_;
+  Var plain_shared_addr_var_;
   std::vector<Var> a_shared_addr_vars_;
   std::vector<Var> b_shared_addr_vars_;
   bool shadow_injected_{false};
@@ -671,12 +713,55 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
   const int a_elem_bytes = ResolveAElemBytes(func, collector);
   const int b_elem_bytes = ResolveBElemBytes(func, collector);
 
-  DCUCopyMajorFlags major_flags = GetDCUCopyMajorFlags(func);
-  const int a_copy_major = major_flags.a_defined ? major_flags.copy_major_a : 0;
-  const int b_copy_major = major_flags.b_defined ? major_flags.copy_major_b : 0;
+  DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(func);
+  auto copy_major_for = [&](int operand, const std::string& fallback) {
+    std::string first;
+    for (const auto& kv : maps.gemm_operand) {
+      if (kv.second != operand) {
+        continue;
+      }
+      if (first.empty()) {
+        first = kv.first;
+      }
+      if (LookupDCUNeedLayout(maps, kv.first, true)) {
+        return LookupDCUCopyMajor(maps, kv.first, 0);
+      }
+    }
+    if (!first.empty()) {
+      return LookupDCUCopyMajor(maps, first, 0);
+    }
+    return LookupDCUCopyMajor(maps, fallback, 0);
+  };
+  auto any_operand_needs_layout = [&](int operand) {
+    bool found = false;
+    bool any = false;
+    for (const auto& kv : maps.gemm_operand) {
+      if (kv.second != operand) {
+        continue;
+      }
+      found = true;
+      any = any || LookupDCUNeedLayout(maps, kv.first, true);
+    }
+    return found ? any : true;
+  };
+  const int a_copy_major = copy_major_for(0, "A_shared");
+  const int b_copy_major = copy_major_for(1, "B_shared");
+  const bool a_need_layout = any_operand_needs_layout(0);
+  const bool b_need_layout = any_operand_needs_layout(1);
+  if (!a_need_layout && !b_need_layout) {
+    return func;
+  }
+
+  std::unordered_set<const VarNode*> noshadow_dcu_res_vars;
+  for (const auto& item : collector.pending_dcu_res) {
+    if (!LookupDCUNeedLayout(maps, item.second, true)) {
+      noshadow_dcu_res_vars.insert(item.first);
+    }
+  }
 
   return ShadowAddrInjector::Substitute(func, collector, a_copy_major, b_copy_major, a_elem_bytes,
-                                        b_elem_bytes);
+                                        b_elem_bytes, a_need_layout, b_need_layout,
+                                        std::move(noshadow_dcu_res_vars));
 }
 
 namespace transform {

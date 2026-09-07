@@ -306,6 +306,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.PersistThreadblock()(mod)
 
     if dcu_async_copy_supported(target):
+        print(mod)
         mod = tilelang.transform.InjectDCUAsyncScope()(mod)
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)

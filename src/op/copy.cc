@@ -522,8 +522,6 @@ For CopyNode::MakeDCURowAsyncSIMTLoop(arith::Analyzer *analyzer,
     PrimExpr col_in_tile = floormod(off, tile_k);
     i_mapped = map_row_like_else(row_in_tile, tile_k, row_extent);
     j_mapped = k_tile * make_const(i_raw.dtype(), tile_k) + col_in_tile;
-    LOG(INFO) << "Large BK src layout: k_tiles=" << k_tiles << ", tile_k=" << tile_k
-              << ", row_extent=" << row_extent;
   } else {
     i_mapped = map_row_like_else(i_raw, k_dim, dim0);
   }
@@ -1201,8 +1199,6 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
   For vectorized_thread_loop;
   auto par_op = ParallelOp(transformed_loop);
 
-  LOG(INFO) <<dst->name << " " << src->name;
-
   if (is_cpu_target || dst.scope() == "local" || src.scope() == "local") {
     if (src.scope() == "local" && dst.scope() != "local") {
       LOG(WARNING) << "Copy from local buffer `" << src->name << "` to "
@@ -1228,7 +1224,6 @@ Stmt CopyNode::LowerNormalCopy(const LowerArgs &T,
     auto thread_loop =
         PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer, loop_layout);
     vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
-    LOG(INFO) <<vectorized_thread_loop;
   }
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
@@ -1280,10 +1275,6 @@ Stmt CopyNode::LowerDCUFragmentPermuteCopy(const LowerArgs &T,
   ICHECK(nreg % 4 == 0 && nreg > 0)
       << "DCU C->A permute expects 4 regs per 16x16 tile, got nreg=" << nreg;
   const int ntiles = nreg / 4;
-
-  LOG(INFO) << "DCU fragment permute " << src->name << " -> " << dst->name
-            << " ntiles=" << ntiles
-            << " (16x16 CT->A mmac_ct_to_a_16x16 + mapped loop)";
 
   PrimExpr thread = T.thread_var;
   if (T.thread_bounds.defined()) {
@@ -1518,12 +1509,8 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   // 直接生成针对 DCU 优化的 SIMT 循环
   Stmt simt_loop;
   bool need_layout = true;
-  LOG(INFO) << "warp_m: " << warp_m << ", warp_num: " << warp_num
-            << ", k_pack: " << k_pack;
-  LOG(INFO) << "dst shape: " << dst->shape;
   if (dst->shape.size() == 2)
   {
-      LOG(INFO) << "copy_major: " << copy_major;
       DCUAsyncCopyParams copy_params;
       copy_params.dim0 = dst->shape[0];
       copy_params.dim1 = dst->shape[1];
@@ -1544,16 +1531,9 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
         copy_params.k_dim = (copy_params.k_axis == 0) ? dim0_i : dim1_i;
       }
       
-      LOG(INFO) << "dim0: " << copy_params.dim0 << ", dim1: " << copy_params.dim1
-                << ", k_pack: " << copy_params.k_pack
-                << ", k_dim: " << copy_params.k_dim
-                << ", mn_dim: " << copy_params.mn_dim
-                << ", k_axis: " << copy_params.k_axis;
-
       PrimExpr tile_elems =
           analyzer->Simplify(make_const(DataType::Int(32), copy_params.mn_dim) *
                              copy_params.k_pack * 16);
-      LOG(INFO) << "tile_elems: " << tile_elems;
       PrimExpr warp_capacity =
           analyzer->Simplify(copy_params.warp_num * 64);
       ICHECK(is_const_int(tile_elems) && is_const_int(warp_capacity))
@@ -1561,19 +1541,16 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
           << "got tile_elems=" << tile_elems
           << ", warp_capacity=" << warp_capacity;
       if (*as_const_int(tile_elems) <= *as_const_int(warp_capacity)) {
-        LOG(INFO) << "Choose fast copy.";
         need_layout = false;
         simt_loop = MakeDCUSIMTLoop(analyzer, copy_params);
       } else {
         // Layout path follows where K lives on the shared tile, not T.copy major.
         if (copy_params.k_axis == 0) {
-          LOG(INFO) << "Choose col layout (K on dim0). copy_major=" << copy_major;
           simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
         } else {
           ICHECK_EQ(copy_params.k_axis, 1)
               << "k_axis must be 0 (K on dim0 / col) or 1 (K on dim1 / row), got "
               << copy_params.k_axis;
-          LOG(INFO) << "Choose row layout (K on dim1). copy_major=" << copy_major;
           simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
         }
       }

@@ -88,7 +88,6 @@ def mma0_mma1_no_div_kernel(
             K_shared,
             acc_s,
             transpose_B=True,
-            k_pack=(dim // 16),
             policy=T.GemmWarpPolicy.FullRow,
             transpose_C=False)
 
@@ -210,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=1, help="heads")
     parser.add_argument("--seq_q", type=int, default=128, help="query sequence length")
     parser.add_argument("--seq_kv", type=int, default=128, help="key/value sequence length")
-    parser.add_argument("--dim", type=int, default=16, help="dim")
+    parser.add_argument("--dim", type=int, default=64, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal)

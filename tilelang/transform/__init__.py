@@ -373,14 +373,15 @@ def InjectWarpIdx():
 def InjectDCUAsyncCopyShadowAddr():
     """Inject warp-dependent shadow shared-memory base addresses for DCU async copy.
 
-    After ``InjectWarpIdx``, declares ``A_shared_addr`` and ``B_shared_addr`` by OR-ing
-    high shadow bits onto ``buf_dyn_shmem``, then replaces the first argument of
-    ``tl.dcu_async_copy`` with the corresponding shadow address.
+    After ``InjectWarpIdx``, declares one shadow pointer per async-copy resource
+    (``A_shared_addr`` / ``B_shared_addr`` / ``V_shared_addr``, ...) by OR-ing
+    that resource's high shadow bits onto ``buf_dyn_shmem``. Physical LDS may be
+    reused across GEMMs; the shadow pointer and offset must not.
 
     Tiles whose ``tl.dcu_need_layout`` map entry is 0 (fast sequential SIMT copy)
     use a separately declared ``plain_shared_addr`` that aliases the same LDS
-    allocation but without Q/K shadow bits. Mixed kernels (e.g. K with fast LDS
-    and V without) must not reuse ``B_shared_addr`` for the V copy.
+    allocation but without shadow bits. Mixed kernels must not reuse another
+    GEMM's ``*_shared_addr`` (e.g. K's ``B_shared_addr`` for a V copy).
 
     Shadow offset style follows that buffer's T.copy ``major``
     (via ``AnnotateDCUGemmTranspose``):

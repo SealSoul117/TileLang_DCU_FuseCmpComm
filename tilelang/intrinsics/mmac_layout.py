@@ -156,7 +156,6 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
     # permute
     row = (row // 8) * layout_config.permute_offset + ((row % 8) % layout_config.permute_offset) + ((row % 8) // layout_config.permute_offset) * layout_config.row_per_warp
     row = (row % layout_config.row_per_warp)+ (row // layout_config.row_per_warp) * layout_config.row_per_slab
-    print("dsdasrow: %d\n", layout_config.row_per_warp)
     # warp
     row = row + warp_m * layout_config.row_per_warp
     
@@ -542,82 +541,3 @@ shared_16x16_to_local_64x4_layout_m_n = shared_16x16_to_local_64x4_layout_A
 shared_16x16_to_local_64x4_layout_n_k = shared_16x16_to_local_64x4_layout_A
 shared_32x16_to_local_64x8_layout_n_m = shared_32x16_to_local_64x8_layout_B
 shared_32x16_to_local_64x8_layout_k_n = shared_32x16_to_local_64x8_layout_B
-
-
-if __name__ == "__main__":
-    idx = 1
-    warp_cols = 1
-    block_col_warps = 1
-    row = 16
-    col = 32
-    tx_f = 0
-    # print("   ",end=" ")
-    # for i in range(col):
-    #     print("{:^8}".format(i),end=" ")
-    # print()
-    # for i in range(row):
-    #     print("{:^2}".format(i),end=" ")
-    #     for j in range(col):
-    #        thread_id,local_id = shared_32x16_to_local_64x8_layout_B(i,j)
-    #        print("T{:^2} V{:^2} ".format(thread_id,local_id),end=" ")
-    #     print()
-    
-    # print("   ",end=" ")
-    # for i in range(col):
-    #     print("{:^8}".format(i),end=" ")
-    # print()
-    # for j in range(row):
-    #     local_idx = j % 4
-    #     print("{:^2}".format(j),end=" ")
-    #     for i in range(col):
-    #         tx = (j // 4) * 16 + (i % 16)
-    #         local_id = (i // 16) * 4 + local_idx
-    #         row_idx,col_idx = thread_id_shared_access_64x8_to_32x16_layout_B(tx, local_id)
-    #         print("T{:^2} V{:^2} ".format(tx,local_id),end=" ")
-    #     print()
-
-    # print("   ",end=" ")
-    # for i in range(col):
-    #     print("{:^8}".format(i),end=" ")
-    # print()
-    tx = 16
-    # row_ = 4
-    col_ = 16
-    group = 4
-    results = []
-    for k in range(group):
-        for j in range(col_):
-            tx = j + k * 16
-            for i in range(k * 4,(k+1) * 4):
-                new_row,new_col = shared_to_local_layout_B_padding(i,j,idx,warp_cols,block_col_warps,tx)
-                results.append((new_row,new_col,(tx,i-k*4)))
-                # print("({:^2},{:^2}) {:^2}".format(new_row,new_col,tx))
-            for i in range(k * 4,(k+1) * 4):
-                new_row,new_col = shared_to_local_layout_B_padding(i,j+16,idx,warp_cols,block_col_warps,tx)
-                results.append((new_row,new_col,(tx,i-k*4+4)))
-                # print("({:^2},{:^2}) {:^2}".format(new_row,new_col,tx))
-    # 转换为嵌套字典
-    grid = {}
-    for r, c, t in results:
-        if r not in grid:
-            grid[r] = {}
-        grid[r][c] = t
-    
-    print("layout B padding ...")
-    print("   ",end=" ")
-    col = 32
-    for i in range(col):
-        print("{:^8}".format(i),end=" ")
-    print()
-    # 确定行遍历范围
-    rows = sorted(grid.keys())
-    # 按照 行范围 -> 列范围 遍历
-    for r in rows:
-        print("{:^2}".format(r),end=" ")
-        #获取当前行下列号并排序
-        cols = sorted(grid[r].keys())
-        for c in cols:
-            tx,id = grid[r][c]
-            print("T{:^2} V{:^2} ".format(tx,id),end=" ")
-        print()
-        

@@ -17,12 +17,6 @@ class GemmMMAC(GemmBase):
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         enable_fast_lds = ((self.N * self.k_pack * 16) // 64) > 4
-        print(f"enable_fast_lds: {enable_fast_lds}")
-        print(f"block_M: {self.M}")
-        print(f"block_N: {self.N}")
-        print(f"block_K: {self.K}")
-        print(f"warp_row_tiles: {m_warp}")
-        print(f"warp_col_tiles: {n_warp}")
         
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
@@ -142,11 +136,12 @@ class GemmMMAC(GemmBase):
                             ki,
                         )
                     else:
-                        for kj in T.serial(0, self.k_pack):
+                        for kp in T.serial(0, self.k_pack):
                             mmac_emitter.ldmatrix_b(
                                 B_local,
                                 B_region,
                                 ki,
+                                kp,
                             )
 
                     # Perform Matrix Multiplication

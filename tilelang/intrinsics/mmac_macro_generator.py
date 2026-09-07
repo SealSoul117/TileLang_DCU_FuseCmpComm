@@ -343,51 +343,44 @@ class MatrixCoreIntrinEmitter:
                     for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
                         row, col = ki_shared_cvt(row, col + ki * m_dim * self.k_pack* micro_size_k, stride, new_stride)
-                        # row, col = layoutInfer.base(tx, local_id)
-                        # slab padding
-                        # row, col = layoutInfer.slab(row, col)
-                        # warp offset
-                        # row, col = layoutInfer.warp(row, col, warp_m)
-                        # iteration offset
-                        # row, col = layoutInfer.itera(row, col, i, self.block_row_warps)
-                        
-                        # rewind offset
-                        # row, col = layoutInfer.rewind(row, col, tx, warp_m, i, self.block_row_warps)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
 
-    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, rk=0):
+    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, kp, rk=0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk
         micro_size_y = self.micro_size_y
-        
+        n_dim = self.block_col_warps * self.warp_col_tiles
         micro_size_k = self.micro_size_k
         local_size_b = self.local_size_b
         k_pack = self.k_pack
         is_transposed = self.b_transposed
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
-        print("k_pack:", k_pack)
-        print("warp_cols:", warp_cols)
-        print("warp_col_tiles:", self.block_col_warps)
+        
         if not is_transposed:
             if self.enable_fast_lds:
                 layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
         else:
             layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols, self.b_dtype)
-        print("self.enable_fast_lds:", self.enable_fast_lds)
         # legalize shared buffer to region
         B_region = self._legalize_to_buffer_region(B_shared_buf)
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
+        if is_transposed:
+            new_stride = B_region.buffer.shape[1]
+        else:
+            new_stride = B_region.buffer.shape[0]
+        stride = micro_size_k * k_pack
         @T.macro
         def _warp_ldmatrix_b(
             B_local_buf,
             B_shared_buf,
             ki,
+            kp,
             thread_binding,
             rk=0,
         ):
@@ -396,20 +389,21 @@ class MatrixCoreIntrinEmitter:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = shared_to_local_layout_A(tx, local_id, warp_n, j, layout_config)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col + ki * micro_size_k]
+                        row, col = ki_shared_cvt(row, col + ki * n_dim * self.k_pack* micro_size_k, stride, new_stride)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
 
             else:
                 if self.enable_fast_lds:
                     for j in T.serial(warp_cols // 2):
                         for local_id in T.vectorized(2 * local_size_b):
                             row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
-                            B_local_buf[ki * warp_cols * local_size_b + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
+                            B_local_buf[kp * local_size_b * warp_cols + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * self.k_pack *micro_size_k + kp * micro_size_k, B_base1 + col]
                 else:
                     for j in T.serial(warp_cols):
                         for local_id in T.vectorized(k_pack * local_size_b):
                             row, col = shared_to_local_layout_B_simple(tx, local_id)
                             B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
-        return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
+        return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, kp, thread_binding, rk)
 
     def mmac(
         self,
@@ -764,8 +758,6 @@ class MatrixCoreIntrinEmitter:
             A fragment object describing the thread and index layout for MMAC.
         """
         from tilelang.utils import is_fragment
-        print("enter make_mmac_store_layout")
-
         shape = local_buf.shape
         inverse_mmac_store_layout = self.get_store_index_map(inverse=True)
         assert is_fragment(local_buf), "local_buf must be a fragment"

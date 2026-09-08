@@ -65,9 +65,11 @@ public:
 
   void SetHostCopyBufferMaps(Optional<Map<String, Integer>> copy_major,
                              Optional<Map<String, Integer>> need_layout,
+                             Optional<Map<String, Integer>> need_shadow,
                              Optional<Map<String, Integer>> gemm_operand) {
     host_copy_major_map_ = std::move(copy_major);
     host_need_layout_map_ = std::move(need_layout);
+    host_need_shadow_map_ = std::move(need_shadow);
     host_gemm_operand_map_ = std::move(gemm_operand);
   }
 
@@ -192,6 +194,10 @@ private:
       device_func =
           WithAttr(std::move(device_func), kDCUNeedLayoutMap, host_need_layout_map_.value());
     }
+    if (host_need_shadow_map_.defined()) {
+      device_func =
+          WithAttr(std::move(device_func), kDCUNeedShadowMap, host_need_shadow_map_.value());
+    }
     if (host_gemm_operand_map_.defined()) {
       device_func =
           WithAttr(std::move(device_func), kDCUGemmOperandMap, host_gemm_operand_map_.value());
@@ -228,6 +234,7 @@ private:
   Optional<Bool> host_trans_b_;
   Optional<Map<String, Integer>> host_copy_major_map_;
   Optional<Map<String, Integer>> host_need_layout_map_;
+  Optional<Map<String, Integer>> host_need_shadow_map_;
   Optional<Map<String, Integer>> host_gemm_operand_map_;
 };
 
@@ -239,6 +246,7 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
                                 func->attrs.GetAttr<Bool>(kDCUGemmTransB));
     splitter.SetHostCopyBufferMaps(func->attrs.GetAttr<Map<String, Integer>>(kDCUCopyMajorMap),
                                    func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedLayoutMap),
+                                   func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedShadowMap),
                                    func->attrs.GetAttr<Map<String, Integer>>(kDCUGemmOperandMap));
   }
   // Propagate non-restrict parameter list from host func to device kernels

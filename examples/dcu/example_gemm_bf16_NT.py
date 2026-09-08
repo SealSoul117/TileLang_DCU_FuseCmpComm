@@ -364,9 +364,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local, k_pack=2)
+                T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
+                T.copy(B[k * block_K, bx * block_N], B_shared, major="col_major")
+                T.gemm(A_shared, B_shared, C_local, k_pack=1, policy=T.GemmWarpPolicy.FullRow,)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -375,9 +375,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 def main():
     M = 128
-    N = 128
-    K = 32
-    kernel = matmul(M, N, K, 128, 128, 32)
+    N = 32
+    K = 128
+    kernel = matmul(M, N, K, 128, 32, 128)
 
     a = torch.randn(M, K).cuda().half()
     b = torch.randn(K, N).cuda().half()

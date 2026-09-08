@@ -113,6 +113,7 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const tir::PrimFunc& func);
 struct DCUCopyBufferMaps {
   std::unordered_map<std::string, int> copy_major;
   std::unordered_map<std::string, bool> need_layout;
+  std::unordered_map<std::string, bool> need_shadow;
   std::unordered_map<std::string, int> gemm_operand;
 };
 
@@ -126,6 +127,9 @@ std::optional<std::string> MatchDCUCopyBufferKey(const DCUCopyBufferMaps& maps,
                                                  const std::string& name);
 
 bool LookupDCUNeedLayout(const DCUCopyBufferMaps& maps, const std::string& name,
+                         bool default_value = true);
+
+bool LookupDCUNeedShadow(const DCUCopyBufferMaps& maps, const std::string& name,
                          bool default_value = true);
 
 bool LookupDCUNeedLayoutForOperand(const DCUCopyBufferMaps& maps, int gemm_operand,

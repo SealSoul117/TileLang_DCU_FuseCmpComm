@@ -719,7 +719,8 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
     DcuResShadowSpec spec;
     spec.var = item.first;
     spec.global_name = item.second;
-    spec.need_layout = LookupDCUNeedLayout(maps, item.second, /*default_value=*/true);
+    spec.need_layout = LookupDCUNeedLayout(maps, item.second, /*default_value=*/true) &&
+                       LookupDCUNeedShadow(maps, item.second, /*default_value=*/true);
     spec.copy_major = LookupDCUCopyMajor(maps, item.second, /*default_value=*/0);
     spec.elem_bytes = is_a ? a_elem_bytes : b_elem_bytes;
     if (is_a) {

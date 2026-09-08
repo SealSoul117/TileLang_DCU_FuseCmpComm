@@ -113,7 +113,7 @@ def mma0_kernel(
         #
         # -----------------------
         # T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
-        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, k_pack=1, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
+        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
 
         # -----------------------
         # causal mask
@@ -137,7 +137,7 @@ def mma0_kernel(
         by: T.int32,
         bz: T.int32,
     ):
-        T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
+        T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared, major="col_major")
         T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
         
     @T.prim_func
@@ -236,7 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=1, help="heads")
     parser.add_argument("--seq_q", type=int, default=128, help="query sequence length")
     parser.add_argument("--seq_kv", type=int, default=128, help="key/value sequence length")
-    parser.add_argument("--dim", type=int, default=64, help="dim")
+    parser.add_argument("--dim", type=int, default=32, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal)

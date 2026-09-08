@@ -347,7 +347,7 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
 
-    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, kp, rk=0):
+    def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, kp=0, rk=0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk

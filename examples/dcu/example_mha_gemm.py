@@ -214,7 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=1, help="heads")
     parser.add_argument("--seq_q", type=int, default=128, help="query sequence length")
     parser.add_argument("--seq_kv", type=int, default=128, help="key/value sequence length")
-    parser.add_argument("--dim", type=int, default=128, help="dim")
+    parser.add_argument("--dim", type=int, default=32, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal)

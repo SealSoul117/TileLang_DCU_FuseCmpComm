@@ -118,6 +118,7 @@ class LayoutConfig():
         self.intra_iter_num = self.slab_num * 4 // (self.warp_num * self.micro_m * self.micro_n * self.k_pack)
         self.row_per_4slab = self.slab_num * 4 // (self.micro_n * self.k_pack)
         self.row_per_slab = self.slab_num // (self.micro_n * self.k_pack)
+        self.slabs = self.micro_m * self.micro_n * self.k_pack * self.iter_num * self.warp_num // self.slab_num
         if is_B:
             self.padding_bytes = 64
         else:
@@ -165,6 +166,9 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
             + (idx % layout_config.intra_iter_num) * layout_config.row_per_warp * layout_config.warp_num
             + (idx // layout_config.intra_iter_num) * layout_config.row_per_4slab
         )
+    
+    if layout_config.slabs < 4:
+        return row, col
     
     # rewind
     new_col = (((row % layout_config.row_per_4slab) // layout_config.row_per_slab) * layout_config.padding_num + col) % (layout_config.micro_n * layout_config.k_pack)
@@ -273,6 +277,9 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
     
     # iter
     col = col + idx * layout_config.element_per_row * layout_config.warp_num
+    
+    if layout_config.slabs < 4:
+        return row, col
     
     # rewind
     col = (((row % layout_config.row_per_2slab) // layout_config.row_per_slab) * layout_config.padding_num + col)

@@ -306,7 +306,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.PersistThreadblock()(mod)
 
     if dcu_async_copy_supported(target):
-        print(mod)
+        
         mod = tilelang.transform.InjectDCUAsyncScope()(mod)
         mod = tilelang.transform.LowerSharedGlobalCopy()(mod)
         mod = tilelang.transform.VectorizeSharedLocalCopy()(mod)
@@ -322,6 +322,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         
         mod = tilelang.transform.InjectWarpIdx()(mod)
         # Shadow offset follows per-buffer T.copy major / need_layout maps.
+        # Skip shadow when LayoutConfig.slabs < 4 (no rewind padding on LDS loads).
         mod = tilelang.transform.InjectDCUAsyncCopyShadowAddr()(mod)
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 

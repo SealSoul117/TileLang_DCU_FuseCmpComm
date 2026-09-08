@@ -383,6 +383,10 @@ def InjectDCUAsyncCopyShadowAddr():
     allocation but without shadow bits. Mixed kernels must not reuse another
     GEMM's ``*_shared_addr`` (e.g. K's ``B_shared_addr`` for a V copy).
 
+    When ``LayoutConfig.slabs < 4``, LDS→register rewind padding is disabled;
+    the matching global→shared copy also skips shadow bits
+    (``tl.dcu_need_shadow`` = 0) even if the copy still uses the layout path.
+
     Shadow offset style follows that buffer's T.copy ``major``
     (via ``AnnotateDCUGemmTranspose``):
     - row_major (half_t): ``(warp_idx & 3) << 16``

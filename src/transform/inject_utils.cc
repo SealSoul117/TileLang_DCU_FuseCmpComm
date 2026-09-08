@@ -263,7 +263,8 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const PrimFunc& func) {
 }
 
 bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps) {
-  return maps.copy_major.empty() && maps.need_layout.empty() && maps.gemm_operand.empty();
+  return maps.copy_major.empty() && maps.need_layout.empty() && maps.need_shadow.empty() &&
+         maps.gemm_operand.empty();
 }
 
 namespace {
@@ -290,6 +291,11 @@ DCUCopyBufferMaps GetDCUCopyBufferMaps(const PrimFunc& func) {
     if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedLayoutMap)) {
       for (const auto& kv : m.value()) {
         maps.need_layout[std::string(kv.first)] = kv.second->value != 0;
+      }
+    }
+    if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedShadowMap)) {
+      for (const auto& kv : m.value()) {
+        maps.need_shadow[std::string(kv.first)] = kv.second->value != 0;
       }
     }
   }
@@ -350,6 +356,9 @@ std::optional<std::string> MatchDCUCopyBufferKey(const DCUCopyBufferMaps& maps,
   if (auto key = find_in(maps.need_layout)) {
     return key;
   }
+  if (auto key = find_in(maps.need_shadow)) {
+    return key;
+  }
   if (auto key = find_in(maps.copy_major)) {
     return key;
   }
@@ -364,6 +373,19 @@ bool LookupDCUNeedLayout(const DCUCopyBufferMaps& maps, const std::string& name,
   }
   auto it = maps.need_layout.find(*key);
   if (it == maps.need_layout.end()) {
+    return default_value;
+  }
+  return it->second;
+}
+
+bool LookupDCUNeedShadow(const DCUCopyBufferMaps& maps, const std::string& name,
+                         bool default_value) {
+  auto key = MatchDCUCopyBufferKey(maps, name);
+  if (!key.has_value()) {
+    return default_value;
+  }
+  auto it = maps.need_shadow.find(*key);
+  if (it == maps.need_shadow.end()) {
     return default_value;
   }
   return it->second;

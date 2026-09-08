@@ -201,6 +201,85 @@ void CollectAddTerms(const PrimExpr& expr, std::vector<PrimExpr>* terms) {
   }
 }
 
+// Match FloorMod(x, m) or (x & (m-1)) with m > 1. Returns (x, m).
+std::optional<std::pair<PrimExpr, int64_t>> MatchBoundedIndex(const PrimExpr& expr) {
+  PrimExpr e = StripCast(expr);
+  if (const auto* fm = e.as<FloorModNode>()) {
+    if (const auto* imm = fm->b.as<IntImmNode>()) {
+      if (imm->value > 1) {
+        return std::make_pair(fm->a, imm->value);
+      }
+    }
+  }
+  if (const auto* call = e.as<CallNode>()) {
+    if (call->op.same_as(builtin::bitwise_and()) && call->args.size() == 2) {
+      const IntImmNode* mask = call->args[1].as<IntImmNode>();
+      PrimExpr x = call->args[0];
+      if (mask == nullptr) {
+        mask = call->args[0].as<IntImmNode>();
+        x = call->args[1];
+      }
+      if (mask != nullptr && mask->value > 0) {
+        const int64_t m = mask->value + 1;
+        if ((m & (m - 1)) == 0) {
+          return std::make_pair(x, m);
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// (x % m) * coeff can exceed one K-stride even when coeff itself is not a
+// multiple of K, e.g. (tx % 8) * 8 with K=32:
+//   (tx % 8) * 8 = ((tx % 8) >> 2) * 32 + (tx % 4) * 8
+// Put the high part into idxen so offen stays strictly inside one record.
+std::optional<std::pair<PrimExpr, PrimExpr>> TrySplitOverflowModTerm(const PrimExpr& term,
+                                                                     int64_t k_dim) {
+  PrimExpr e = StripCast(term);
+  const auto* mul = e.as<MulNode>();
+  if (mul == nullptr) {
+    return std::nullopt;
+  }
+
+  const IntImmNode* imm = mul->a.as<IntImmNode>();
+  PrimExpr other = mul->b;
+  if (imm == nullptr) {
+    imm = mul->b.as<IntImmNode>();
+    other = mul->a;
+  }
+  if (imm == nullptr || k_dim <= 0) {
+    return std::nullopt;
+  }
+  const int64_t coeff = imm->value;
+  if (coeff == 0) {
+    return std::nullopt;
+  }
+  const int64_t acoeff = coeff < 0 ? -coeff : coeff;
+  if (k_dim % acoeff != 0) {
+    return std::nullopt;
+  }
+  const int64_t units = k_dim / acoeff;
+  auto bounded = MatchBoundedIndex(other);
+  if (!bounded.has_value() || bounded->second <= units) {
+    return std::nullopt;
+  }
+
+  const PrimExpr& x = bounded->first;
+  const int64_t m = bounded->second;
+  const DataType dt = e.dtype();
+  PrimExpr idxen =
+      floordiv(floormod(x, make_const(x.dtype(), m)), make_const(x.dtype(), units));
+  if (coeff < 0) {
+    idxen = -idxen;
+  }
+  if (idxen.dtype() != dt) {
+    idxen = Cast(dt, idxen);
+  }
+  PrimExpr rest = floormod(x, make_const(x.dtype(), units)) * make_const(dt, coeff);
+  return std::make_pair(idxen, rest);
+}
+
 // If `term` is (expr * coeff) or (coeff * expr) with coeff divisible by K, return expr * (coeff/K).
 std::optional<PrimExpr> TryExtractIdxenTerm(const PrimExpr& term, int64_t k_dim) {
   PrimExpr e = StripCast(term);
@@ -287,7 +366,8 @@ class IdxenInjector : public StmtExprMutator {
 
   // Split offset = sum(K-scaled terms) + sum(rest) into:
   //   idxen = sum(term / K) for terms whose coefficient is a multiple of K
-  //   new_offset = idxen * (K - tile_width) + sum(rest)
+  //           plus high bits of (x % m) * coeff when that product can exceed K
+  //   new_offset = idxen * (K - tile_width) + sum(rest)  with rest < K
   std::pair<PrimExpr, PrimExpr> SplitSrcOffset(const PrimExpr& offset, const IdxenMatrixParams& params) {
     auto split_scalar = [&](const PrimExpr& base) -> std::pair<PrimExpr, PrimExpr> {
       std::vector<PrimExpr> terms;
@@ -298,6 +378,9 @@ class IdxenInjector : public StmtExprMutator {
       for (const PrimExpr& term : terms) {
         if (auto idxen_term = TryExtractIdxenTerm(term, params.k_dim)) {
           idxen = idxen + idxen_term.value();
+        } else if (auto overflow = TrySplitOverflowModTerm(term, params.k_dim)) {
+          idxen = idxen + overflow->first;
+          offset_rest = offset_rest + overflow->second;
         } else {
           offset_rest = offset_rest + term;
         }

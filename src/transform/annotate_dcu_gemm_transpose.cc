@@ -76,6 +76,11 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
       if (!name.empty()) {
         copy_maps.need_layout[name] = AttrStmtIntValue(op->value) != 0;
       }
+    } else if (op->attr_key == kDCUNeedShadowStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.need_shadow[name] = AttrStmtIntValue(op->value) != 0;
+      }
     } else if (op->attr_key == kDCUGemmOperandStmt) {
       const std::string name = AttrStmtBufferName(op);
       if (!name.empty()) {
@@ -91,7 +96,7 @@ class DCUGemmTransposeStmtRemover : public StmtMutator {
   Stmt VisitStmt_(const AttrStmtNode* op) final {
     if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt ||
         op->attr_key == kDCUCopyMajorStmt || op->attr_key == kDCUNeedLayoutStmt ||
-        op->attr_key == kDCUGemmOperandStmt) {
+        op->attr_key == kDCUNeedShadowStmt || op->attr_key == kDCUGemmOperandStmt) {
       return VisitStmt(op->body);
     }
     return StmtMutator::VisitStmt_(op);
@@ -120,6 +125,9 @@ void MergeCopyMaps(DCUCopyBufferMaps* dst, const DCUCopyBufferMaps& src) {
   }
   for (const auto& kv : src.need_layout) {
     dst->need_layout[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.need_shadow) {
+    dst->need_shadow[kv.first] = kv.second;
   }
   for (const auto& kv : src.gemm_operand) {
     dst->gemm_operand[kv.first] = kv.second;
@@ -163,6 +171,9 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
     }
     if (!copy_maps.need_layout.empty()) {
       f = WithAttr(std::move(f), kDCUNeedLayoutMap, NeedLayoutToIntegerMap(copy_maps.need_layout));
+    }
+    if (!copy_maps.need_shadow.empty()) {
+      f = WithAttr(std::move(f), kDCUNeedShadowMap, NeedLayoutToIntegerMap(copy_maps.need_shadow));
     }
     if (!copy_maps.gemm_operand.empty()) {
       f = WithAttr(std::move(f), kDCUGemmOperandMap, ToIntegerMap(copy_maps.gemm_operand));

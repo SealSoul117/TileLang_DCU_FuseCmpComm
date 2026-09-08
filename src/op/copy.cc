@@ -572,42 +572,75 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
   int dim0 = params.dim0.as<IntImmNode>()->value;
   int dim1 = params.dim1.as<IntImmNode>()->value;
   int elem_bytes = params.dtype.bytes();
+  int mn_dim = params.mn_dim;
+  int k_dim = params.k_dim;
+  int k_pack = params.k_pack;
+  int micro_k = 16;
 
   PrimExpr i_raw = loop_vars[0]->var;
-  PrimExpr r = floordiv(make_const(i_raw.dtype(), 1024 / elem_bytes), dim1);
-  PrimExpr n = make_const(i_raw.dtype(), 4 / elem_bytes);
-  PrimExpr rn = r * n;
+  PrimExpr j_raw = loop_vars[1]->var;
+
+  // Original col swizzle (part1–part6). Do not change these offsets.
+  auto map_col_like_else = [&](PrimExpr row_raw, int row_extent, int inner_dim) {
+    int slab_size = 1024;
+    int row_per_slab = slab_size / elem_bytes / inner_dim;
+
+    PrimExpr part1 = floormod(row_raw, row_per_slab) * 2;
+    PrimExpr part2 = floormod(floordiv(row_raw, row_per_slab), 2);
+    PrimExpr part3 = floordiv(row_raw, 2 * row_per_slab) * 2 * row_per_slab;
+
+    PrimExpr mapped = part1 + part2 + part3;
+    mapped = analyzer->Simplify(mapped);
+
+    if (row_extent > 16) {
+      PrimExpr part4 = floormod(mapped, 4);
+      PrimExpr part5 = floordiv(floormod(mapped, 16), 4) * 8;
+      PrimExpr part6 = floordiv(mapped, 16) * 4;
+      mapped = part4 + part5 + part6;
+      mapped = analyzer->Simplify(mapped);
+    }
+    return mapped;
+  };
+
   PrimExpr i_mapped;
-  
-  int slab_size = 1024;
-  int row_per_slab = slab_size / elem_bytes / dim1;
-  
-  PrimExpr part1 = floormod(i_raw, row_per_slab) * 2;
-  PrimExpr part2 = floormod(floordiv(i_raw, row_per_slab), 2);
-  PrimExpr part3 = floordiv(i_raw, 2 * row_per_slab) * 2 * row_per_slab;
+  PrimExpr j_mapped = j_raw;
 
-  i_mapped = part1 + part2 + part3;
-  i_mapped = analyzer->Simplify(i_mapped);
+  if (k_dim > micro_k * k_pack) {
+    const int tile_k = micro_k * k_pack;
+    ICHECK_GT(tile_k, 0);
+    ICHECK_EQ(k_dim % tile_k, 0)
+        << "k_dim=" << k_dim << " must be divisible by micro_k*k_pack=" << tile_k;
+    const int col_extent = mn_dim > 0 ? mn_dim : dim1;
 
-  if (dim0 > 16){
-    PrimExpr part4 = floormod(i_mapped, 4);
-    PrimExpr part5 = floordiv(floormod(i_mapped, 16), 4) * 8;
-    PrimExpr part6 = floordiv(i_mapped, 16) * 4;
-    i_mapped = part4 + part5 + part6;
-    i_mapped = analyzer->Simplify(i_mapped);
+    // dst stays identity (sequential store). src is gathered as k_tiles of
+    // (tile_k x col_extent); each tile uses the same col swizzle as the else path.
+    PrimExpr linear = i_raw * make_const(i_raw.dtype(), dim1) + j_raw;
+    PrimExpr tile_elems = make_const(i_raw.dtype(), tile_k * col_extent);
+    PrimExpr k_tile = floordiv(linear, tile_elems);
+    PrimExpr off = floormod(linear, tile_elems);
+    PrimExpr k_in_tile = floordiv(off, col_extent);
+    PrimExpr col_in_tile = floormod(off, col_extent);
+    i_mapped = k_tile * make_const(i_raw.dtype(), tile_k) +
+               map_col_like_else(k_in_tile, tile_k, col_extent);
+    j_mapped = col_in_tile;
+  } else {
+    i_mapped = map_col_like_else(i_raw, dim0, dim1);
   }
-  
-  // 构造特殊的 src_indices
+
+  i_mapped = analyzer->Simplify(i_mapped);
+  j_mapped = analyzer->Simplify(j_mapped);
+
+  // 只改 src：dst 保持一一映射顺着写。
   Array<PrimExpr> src_indices;
-  // 我们手动替换第一个非 unit 维度的变量
   size_t idx_in_vars = 0;
   for (size_t i = 0; i < src_range.size(); ++i) {
     if (is_one(src_range[i]->extent)) {
       src_indices.push_back(src_range[i]->min);
     } else {
       if (idx_in_vars == 0) {
-        // 对第一个主维度应用变换
         src_indices.push_back(src_range[i]->min + i_mapped);
+      } else if (idx_in_vars == 1) {
+        src_indices.push_back(src_range[i]->min + j_mapped);
       } else {
         src_indices.push_back(src_range[i]->min + loop_vars[idx_in_vars]->var);
       }
@@ -1509,6 +1542,7 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   // 直接生成针对 DCU 优化的 SIMT 循环
   Stmt simt_loop;
   bool need_layout = true;
+  bool need_shadow = true;
   if (dst->shape.size() == 2)
   {
       DCUAsyncCopyParams copy_params;
@@ -1555,6 +1589,22 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
         }
       }
 
+      // Match LayoutConfig.slabs in mmac_layout.py. Rewind padding (and the
+      // corresponding G→S shadow bits) only apply when slabs >= 4.
+      auto compute_layout_slabs = [&]() {
+        const int elem_bytes = copy_params.dtype.bytes();
+        ICHECK_GT(elem_bytes, 0);
+        const int slab_num = 1024 / elem_bytes;
+        ICHECK_GT(slab_num, 0);
+        constexpr int micro_m = 16;
+        constexpr int micro_n = 16;
+        // Non-transposed B (K on dim0) uses warp_cols//2 as iter_num.
+        const int mn_per_iter_warp = (copy_params.k_axis == 0) ? (micro_n * 2) : micro_m;
+        const int iter_times_warp = copy_params.mn_dim / mn_per_iter_warp;
+        return micro_m * micro_n * copy_params.k_pack * iter_times_warp / slab_num;
+      };
+      need_shadow = need_layout && compute_layout_slabs() >= 4;
+
 
   }
   else {
@@ -1597,6 +1647,7 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   }
 
   const StringImm dst_name_node = StringImm(dst->name);
+  result = AttrStmt(dst_name_node, kDCUNeedShadowStmt, Bool(need_shadow), result);
   result = AttrStmt(dst_name_node, kDCUNeedLayoutStmt, Bool(need_layout), result);
   result = AttrStmt(dst_name_node, kDCUCopyMajorStmt,
                     IntImm(DataType::Int(32), copy_major), result);

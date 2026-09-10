@@ -375,9 +375,9 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 def main():
     M = 128
-    N = 32
+    N = 128
     K = 128
-    kernel = matmul(M, N, K, 128, 32, 128)
+    kernel = matmul(M, N, K, 128, 128, 16)
 
     a = torch.randn(M, K).cuda().half()
     b = torch.randn(K, N).cuda().half()

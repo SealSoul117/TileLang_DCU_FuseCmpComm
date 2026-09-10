@@ -1,6 +1,7 @@
 /*!
  * \file inject_warp_k_loop_divergence.cc
- * \brief Split the DCU GEMM k-loop across warp halves with divergent mmac
+ * \brief Split the DCU GEMM k-loop across two warp groups (only when the
+ *        kernel has exactly 8 warps, at warp_idx < 4) with divergent mmac
  *        scheduling, and zero async_gld_sld_fence in the prologue.
  */
 #include <tvm/ffi/reflection/registry.h>
@@ -16,6 +17,7 @@
 
 #include "../op/builtin.h"
 #include "inject_utils.h"
+#include "common/pipeline_attrs.h"
 #include "tir/transforms/ir_utils.h"
 
 using tvm::ffi::GetRef;
@@ -170,6 +172,13 @@ class ContainsMmacChecker : public StmtExprVisitor {
     if (op->op.same_as(tvm_mmac())) {
       has_mmac = true;
     }
+    if (op->op.same_as(builtin::call_extern()) && !op->args.empty()) {
+      if (const auto* s = op->args[0].as<StringImmNode>()) {
+        if (std::string(s->value).find("mmac") != std::string::npos) {
+          has_mmac = true;
+        }
+      }
+    }
     StmtExprVisitor::VisitExpr_(op);
   }
 };
@@ -236,6 +245,7 @@ class InfoCollector : public StmtExprVisitor {
   Var warp_idx_var;
   PrimExpr thread_extent;
   bool found_k_loop{false};
+  bool found_warp_div_loop{false};
 
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
@@ -253,6 +263,9 @@ class InfoCollector : public StmtExprVisitor {
     }
     if (IsDCUMainLoop(op)) {
       found_k_loop = true;
+      if (LoopHasWarpDivergence(op)) {
+        found_warp_div_loop = true;
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -269,12 +282,20 @@ enum class PipelinePhase { kBeforeMainLoop, kInMainLoop, kAfterMainLoop };
 
 class WarpKLoopDivergenceMutator : public StmtMutator {
  public:
-  WarpKLoopDivergenceMutator(Var warp_idx_var, int warp_half)
-      : warp_idx_var_(std::move(warp_idx_var)), warp_half_(warp_half) {}
+  WarpKLoopDivergenceMutator(Var warp_idx_var, int warp_half, bool kernel_enabled)
+      : warp_idx_var_(std::move(warp_idx_var)), warp_half_(warp_half),
+        kernel_enabled_(kernel_enabled) {}
 
  private:
+  bool LoopShouldDiverge(const ForNode* op) const {
+    if (!IsDCUMainLoop(op) || !LoopHasRegisterPipeline(op)) {
+      return false;
+    }
+    return kernel_enabled_ || LoopHasWarpDivergence(op);
+  }
+
   Stmt VisitStmt_(const ForNode* op) override {
-    if (IsDCUMainLoop(op)) {
+    if (LoopShouldDiverge(op)) {
       ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before main loop divergence";
       ICHECK(warp_half_ > 0) << "warp_half must be positive";
 
@@ -310,20 +331,24 @@ class WarpKLoopDivergenceMutator : public StmtMutator {
 
   Var warp_idx_var_;
   int warp_half_;
+  bool kernel_enabled_{false};
   PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
 };
 
-std::optional<int> ComputeWarpHalf(const PrimExpr& thread_extent) {
+std::optional<int> ComputeSplitIndex(const PrimExpr& thread_extent) {
+  constexpr int kWarpSize = 64;
+  constexpr int kRequiredWarpNum = 8;
+  constexpr int kFixedSplitIndex = 4;
   if (auto extent = GetConstIntValue(thread_extent)) {
-    ICHECK(*extent > 0 && (*extent % 64) == 0)
-        << "thread extent must be a positive multiple of 64, got " << *extent;
-    int warp_num = static_cast<int>(*extent / 64);
-    if (warp_num == 1) {
+    if (*extent <= 0 || (*extent % kWarpSize) != 0) {
       return std::nullopt;
     }
-    ICHECK(warp_num >= 2 && (warp_num % 2) == 0)
-        << "warp count must be an even number >= 2, got " << warp_num;
-    return warp_num / 2;
+    int warp_num = static_cast<int>(*extent / kWarpSize);
+    // Only 512 threads / 8 warps: split at warp_idx < 4 (fixed, not warp_num/2).
+    if (warp_num != kRequiredWarpNum) {
+      return std::nullopt;
+    }
+    return kFixedSplitIndex;
   }
   return std::nullopt;
 }
@@ -332,15 +357,8 @@ PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
   InfoCollector collector;
   collector(func->body);
 
-  // Besides the explicit tl.use_warp_divergence annotation, auto-enable the
-  // pass when the block launches at least 512 threads (threadIdx.x extent).
-  // Otherwise the default remains disabled.
-  bool enabled = HasUseWarpDivergenceAttr(func);
-  if (!enabled) {
-    if (auto extent = GetConstIntValue(collector.thread_extent)) {
-      enabled = *extent >= 512;
-    }
-  }
+  bool kernel_enabled = HasUseWarpDivergenceAttr(func);
+  bool enabled = kernel_enabled || collector.found_warp_div_loop;
   if (!enabled) {
     return func;
   }
@@ -350,8 +368,8 @@ PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
     return func;
   }
 
-  auto warp_half = ComputeWarpHalf(collector.thread_extent);
-  if (!warp_half.has_value()) {
+  auto split_index = ComputeSplitIndex(collector.thread_extent);
+  if (!split_index.has_value()) {
     return func;
   }
 
@@ -359,7 +377,8 @@ PrimFunc InjectWarpKLoopDivergenceToFunc(PrimFunc func) {
   StripUseWarpDivergenceMutator stripper;
   n->body = stripper(std::move(n->body));
 
-  WarpKLoopDivergenceMutator mutator(collector.warp_idx_var, warp_half.value());
+  WarpKLoopDivergenceMutator mutator(collector.warp_idx_var, split_index.value(),
+                                     kernel_enabled);
   n->body = mutator(std::move(n->body));
   n->body = ConvertSSA(std::move(n->body));
   return WithoutAttr(std::move(func), attr::kUseWarpDivergence);

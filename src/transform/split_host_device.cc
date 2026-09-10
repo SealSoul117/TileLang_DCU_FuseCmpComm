@@ -66,11 +66,13 @@ public:
   void SetHostCopyBufferMaps(Optional<Map<String, Integer>> copy_major,
                              Optional<Map<String, Integer>> need_layout,
                              Optional<Map<String, Integer>> need_shadow,
-                             Optional<Map<String, Integer>> gemm_operand) {
+                             Optional<Map<String, Integer>> gemm_operand,
+                             Optional<Map<String, Integer>> use_idxen) {
     host_copy_major_map_ = std::move(copy_major);
     host_need_layout_map_ = std::move(need_layout);
     host_need_shadow_map_ = std::move(need_shadow);
     host_gemm_operand_map_ = std::move(gemm_operand);
+    host_use_idxen_map_ = std::move(use_idxen);
   }
 
   void SetNonRestrictParams(Optional<Array<tir::Var>> params) {
@@ -202,6 +204,9 @@ private:
       device_func =
           WithAttr(std::move(device_func), kDCUGemmOperandMap, host_gemm_operand_map_.value());
     }
+    if (host_use_idxen_map_.defined()) {
+      device_func = WithAttr(std::move(device_func), kDCUUseIdxenMap, host_use_idxen_map_.value());
+    }
 
     GlobalVar kernel_symbol_global = var_supply_();
     (*device_mod_)->Add(kernel_symbol_global, device_func);
@@ -236,6 +241,7 @@ private:
   Optional<Map<String, Integer>> host_need_layout_map_;
   Optional<Map<String, Integer>> host_need_shadow_map_;
   Optional<Map<String, Integer>> host_gemm_operand_map_;
+  Optional<Map<String, Integer>> host_use_idxen_map_;
 };
 
 tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
@@ -247,7 +253,8 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
     splitter.SetHostCopyBufferMaps(func->attrs.GetAttr<Map<String, Integer>>(kDCUCopyMajorMap),
                                    func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedLayoutMap),
                                    func->attrs.GetAttr<Map<String, Integer>>(kDCUNeedShadowMap),
-                                   func->attrs.GetAttr<Map<String, Integer>>(kDCUGemmOperandMap));
+                                   func->attrs.GetAttr<Map<String, Integer>>(kDCUGemmOperandMap),
+                                   func->attrs.GetAttr<Map<String, Integer>>(kDCUUseIdxenMap));
   }
   // Propagate non-restrict parameter list from host func to device kernels
   if (auto opt = func->GetAttr<Array<tir::Var>>(tl::attr::kNonRestrictParams)) {

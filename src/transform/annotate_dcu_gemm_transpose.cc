@@ -86,6 +86,11 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
       if (!name.empty()) {
         copy_maps.gemm_operand[name] = AttrStmtIntValue(op->value);
       }
+    } else if (op->attr_key == kDCUUseIdxenStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.use_idxen[name] = AttrStmtIntValue(op->value) != 0;
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -96,7 +101,8 @@ class DCUGemmTransposeStmtRemover : public StmtMutator {
   Stmt VisitStmt_(const AttrStmtNode* op) final {
     if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt ||
         op->attr_key == kDCUCopyMajorStmt || op->attr_key == kDCUNeedLayoutStmt ||
-        op->attr_key == kDCUNeedShadowStmt || op->attr_key == kDCUGemmOperandStmt) {
+        op->attr_key == kDCUNeedShadowStmt || op->attr_key == kDCUGemmOperandStmt ||
+        op->attr_key == kDCUUseIdxenStmt) {
       return VisitStmt(op->body);
     }
     return StmtMutator::VisitStmt_(op);
@@ -131,6 +137,9 @@ void MergeCopyMaps(DCUCopyBufferMaps* dst, const DCUCopyBufferMaps& src) {
   }
   for (const auto& kv : src.gemm_operand) {
     dst->gemm_operand[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.use_idxen) {
+    dst->use_idxen[kv.first] = kv.second;
   }
 }
 
@@ -177,6 +186,9 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
     }
     if (!copy_maps.gemm_operand.empty()) {
       f = WithAttr(std::move(f), kDCUGemmOperandMap, ToIntegerMap(copy_maps.gemm_operand));
+    }
+    if (!copy_maps.use_idxen.empty()) {
+      f = WithAttr(std::move(f), kDCUUseIdxenMap, NeedLayoutToIntegerMap(copy_maps.use_idxen));
     }
     return f;
   };

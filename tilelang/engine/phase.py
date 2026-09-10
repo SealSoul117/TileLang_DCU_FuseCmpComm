@@ -317,6 +317,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
         mod = tilelang.transform.InjectDSRead()(mod)
 
+        # Wait counts are in commit-group units (see FixDCUWaitCount).
+        # MMA fence first (sld_fence + barrier), then G2S wait is inserted
+        # between them — same as the previously-correct gemm.log.
         mod = tilelang.transform.InsertAsyncMMAFence()(mod)
         mod = tilelang.transform.InsertAsyncGldFence()(mod)
         
@@ -327,6 +330,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.InjectDCUAsyncCopyIdxen()(mod)
 
         mod = tilelang.transform.UnrollDCUKLoop()(mod)
+        # Warp split is opt-in per T.Pipelined(enable_warp_divergence=True).
         mod = tilelang.transform.InjectWarpKLoopDivergence()(mod)
 
     return mod

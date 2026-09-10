@@ -17,6 +17,45 @@ from tilelang.language.utils import (
 from tilelang.env import env as _env
 
 
+class DCULdsLayout:
+    """DCU shared-memory (LDS) layout for T.gemm operands.
+
+    AUTO picks per-operand from tile size:
+      SIMPLE  — tile too small for ds_read_m32x16 (e.g. 16x16); sequential G→LDS, no shadow
+      SWIZZLE — ds_read ok but slabs < 4 (e.g. 16x32); XOR bank swizzle, no shadow
+      SLAB    — slabs >= 4; warp shadow offsets + rewind
+    """
+
+    AUTO = 0
+    SIMPLE = 1
+    SWIZZLE = 2
+    SLAB = 3
+
+    _ALIASES = {
+        "auto": AUTO,
+        "default": AUTO,
+        "simple": SIMPLE,
+        "sequential": SIMPLE,
+        "swizzle": SWIZZLE,
+        "xor": SWIZZLE,
+        "slab": SLAB,
+        "shadow": SLAB,
+    }
+
+    @classmethod
+    def parse(cls, value) -> int:
+        if value is None:
+            return cls.AUTO
+        if isinstance(value, str):
+            key = value.lower()
+            if key not in cls._ALIASES:
+                raise ValueError(
+                    f"Unknown lds_layout={value!r}, expected one of {sorted(cls._ALIASES)}"
+                )
+            return cls._ALIASES[key]
+        return int(value)
+
+
 def _gemm_impl(
     op_key: str,
     A: tir.Buffer | tir.Var,
@@ -30,6 +69,7 @@ def _gemm_impl(
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
     transpose_C: bool = True,
+    lds_layout: int | str | None = None,
 ):
     """Shared GEMM implementation.
 
@@ -124,6 +164,7 @@ def _gemm_impl(
         C_coords[0],
         C_coords[1],
         transpose_C,
+        DCULdsLayout.parse(lds_layout),
     )
 
 
@@ -140,6 +181,7 @@ def gemm_v1(
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
     transpose_C: bool = True,
+    lds_layout: int | str | None = None,
 ):
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
@@ -155,6 +197,7 @@ def gemm_v1(
         wg_wait,
         mbar,
         transpose_C,
+        lds_layout,
     )
 
 
@@ -171,6 +214,7 @@ def gemm_v2(
     wg_wait: int = 0,
     mbar: tir.Buffer | None = None,
     transpose_C: bool = True,
+    lds_layout: int | str | None = None,
 ):
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
@@ -186,6 +230,7 @@ def gemm_v2(
         wg_wait,
         mbar,
         transpose_C,
+        lds_layout,
     )
 
 

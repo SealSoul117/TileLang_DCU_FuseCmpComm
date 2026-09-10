@@ -120,6 +120,13 @@ class GemmBase:
         return bool(value)
 
     @property
+    def lds_layout(self) -> int:
+        value = getattr(self.gemm_node, "ldsLayout", 0)
+        if value is None:
+            return 0
+        return int(value)
+
+    @property
     def wg_wait(self) -> int:
         return getattr(self.gemm_node, "wgWait", 0)
 

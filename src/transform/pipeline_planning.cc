@@ -7,6 +7,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include "common/pipeline_attrs.h"
 #include <unordered_map>
 #include <utility>
 
@@ -691,20 +692,7 @@ private:
     // consumer of shared memory is s2r, not MMA. Keep compute at num_stages so
     // prologue can prefetch num_stages global→shared tiles (see
     // RegisterPipelinePlanning).
-    bool register_pipeline_enabled = false;
-    if (auto reg_anno = loop->annotations.Get("num_register_stages")) {
-      if (const auto *imm = reg_anno->as<IntImmNode>()) {
-        register_pipeline_enabled = imm->value > 1;
-      }
-    }
-    if (!register_pipeline_enabled && num_stages >= 2) {
-      for (size_t i = 0; i < pipeline_body_seq->size(); ++i) {
-        if (PipelineStageHasMma(pipeline_body_seq->seq[i])) {
-          register_pipeline_enabled = true;
-          break;
-        }
-      }
-    }
+    bool register_pipeline_enabled = LoopHasRegisterPipeline(loop);
 
     if (copy_stage_at_end > 0 && num_stages >= 2) {
       for (auto &pinfo : pipeline_stage_infos) { // move copy to the beginning
@@ -720,8 +708,8 @@ private:
     // Finally, make the pipeline annotation. Keep num_stages so downstream
     // InjectSoftwarePipeline can size shared-memory banks (see use-def cap there).
     Map<String, Any> annotations(loop->annotations);
-    if (register_pipeline_enabled && !loop->annotations.count("num_register_stages")) {
-      annotations.Set("num_register_stages", Integer(2));
+    if (register_pipeline_enabled && !loop->annotations.count(kNumRegisterStages)) {
+      annotations.Set(kNumRegisterStages, Integer(kDefaultNumRegisterStages));
     }
 
     std::vector<Integer> orders, stages;

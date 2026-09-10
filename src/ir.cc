@@ -5,6 +5,7 @@
  */
 
 #include "./transform/common/attr.h"
+#include "./transform/common/pipeline_attrs.h"
 #include "op/builtin.h"
 #include "tvm/ffi/any.h"
 #include <tvm/ffi/object.h>
@@ -92,7 +93,9 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
                       const Array<PrimExpr> &stages,
                       const Array<Array<PrimExpr>> &sync,
-                      const Array<Array<PrimExpr>> &groups) {
+                      const Array<Array<PrimExpr>> &groups,
+                      bool enable_register_pipeline,
+                      bool enable_warp_divergence) {
   using namespace tvm::tir;
   ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
   DataType dtype = stop.dtype();
@@ -107,9 +110,13 @@ ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
     Map<String, tvm::ffi::Any> anno;
     if (num_stages > 0)
       anno.Set("num_stages", PrimExpr(num_stages));
-    // Default register ping-pong depth when shared pipeline has multiple stages.
-    if (num_stages >= 2)
-      anno.Set("num_register_stages", PrimExpr(2));
+    if (enable_register_pipeline) {
+      anno.Set(kEnableRegisterPipeline, IntImm(DataType::Int(32), 1));
+      anno.Set(kNumRegisterStages, IntImm(DataType::Int(32), kDefaultNumRegisterStages));
+    }
+    if (enable_warp_divergence) {
+      anno.Set(kEnableWarpDivergence, IntImm(DataType::Int(32), 1));
+    }
     if (!order.empty())
       anno.Set("tl_pipeline_order", order);
     if (!stages.empty())

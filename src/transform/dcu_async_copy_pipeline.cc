@@ -1,9 +1,12 @@
+#include <tvm/tir/builtin.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/stmt.h>
+
 #include <algorithm>
+
+#include "inject_utils.h"
 
 using namespace tvm::tir;
 using tvm::ffi::GetRef;
@@ -12,98 +15,160 @@ namespace tvm {
 namespace tl {
 using namespace tir;
 
-/**
- * @brief 分析器：计算 Stmt 内部的 async 指令贡献
- * 注意：这里计算的是“静态进入一次该 Stmt 后产生的指令总数”
+namespace {
+
+bool IsWaitAttr(const AttrStmtNode* op) {
+  return op->attr_key == tir::attr::async_wait_queue_scope ||
+         op->attr_key == "async_wait_queue_scope" ||
+         op->attr_key == tir::attr::async_wait_inflight_count ||
+         op->attr_key == "async_wait_inflight_count";
+}
+
+bool IsCommitAttr(const AttrStmtNode* op) {
+  return op->attr_key == tir::attr::async_commit_queue_scope ||
+         op->attr_key == "async_commit_queue_scope";
+}
+
+bool IsPtxCommitStmt(const Stmt& stmt) {
+  if (const auto* eval = stmt.as<EvaluateNode>()) {
+    if (const auto* call = eval->value.as<CallNode>()) {
+      return call->op.same_as(builtin::ptx_commit_group());
+    }
+  }
+  return false;
+}
+
+Stmt UnwrapWaitAttrs(Stmt stmt) {
+  while (true) {
+    const auto* attr = stmt.as<AttrStmtNode>();
+    if (attr == nullptr || !IsWaitAttr(attr)) {
+      break;
+    }
+    stmt = attr->body;
+  }
+  return stmt;
+}
+
+bool IsOutermostCommitStmt(const Stmt& stmt) {
+  if (IsPtxCommitStmt(stmt)) {
+    return true;
+  }
+  if (const auto* attr = stmt.as<AttrStmtNode>()) {
+    return IsCommitAttr(attr);
+  }
+  return false;
+}
+
+/*!
+ * \brief Count outermost async commit groups in a statement (not individual
+ *        cp_async / dcu_async_copy instructions).
  */
-class AsyncCountAnalyzer : public StmtExprVisitor {
-public:
-    static int64_t Analyze(const Stmt& stmt) {
-        AsyncCountAnalyzer analyzer;
-        analyzer.VisitStmt(stmt);
-        return analyzer.count_;
+int CountOutermostCommits(const Stmt& stmt) {
+  struct Scanner : public StmtVisitor {
+    int commits{0};
+    int commit_depth{0};
+
+    void NoteCommit() {
+      if (commit_depth == 0) {
+        commits += 1;
+      }
     }
 
-private:
-    void VisitStmt_(const ForNode* op) override {
-        // 如果遇到了嵌套循环，需要计算：子循环内部单次产生的量 * 子循环次数
-        int64_t sub_loop_body_count = Analyze(op->body);
-        
-        int64_t extent = 1;
-        if (auto e = op->extent.as<IntImmNode>()) {
-            extent = e->value;
+    void VisitStmt_(const AttrStmtNode* op) override {
+      if (IsWaitAttr(op)) {
+        VisitStmt(UnwrapWaitAttrs(GetRef<AttrStmt>(op)));
+        return;
+      }
+      if (IsCommitAttr(op)) {
+        NoteCommit();
+        ++commit_depth;
+        VisitStmt(op->body);
+        --commit_depth;
+        return;
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const SeqStmtNode* op) override {
+      Stmt flattened = SeqStmt::Flatten(GetRef<Stmt>(op));
+      const auto* seq = flattened.as<SeqStmtNode>();
+      if (seq == nullptr) {
+        VisitStmt(flattened);
+        return;
+      }
+      for (const Stmt& s : seq->seq) {
+        Stmt cur = UnwrapWaitAttrs(s);
+        if (IsOutermostCommitStmt(cur)) {
+          NoteCommit();
+          ++commit_depth;
+          VisitStmt(cur);
+          --commit_depth;
+          continue;
         }
-        count_ += sub_loop_body_count * extent;
-        // 停止递归，因为 Analyze(op->body) 已经处理完了
+        VisitStmt(cur);
+      }
     }
 
-    void VisitExpr_(const CallNode* op) override {
-        bool is_async = op->op.same_as(Op::Get("tl.dcu_async_copy")) ||
-                        op->op.same_as(Op::Get("tl.dcu_async_copy_idxen")) ||
-                        op->op.same_as(builtin::ptx_cp_async());
-        if (is_async) {
-            count_++;
-        }
-        StmtExprVisitor::VisitExpr_(op);
+    void VisitStmt_(const EvaluateNode* op) override {
+      if (IsPtxCommitStmt(GetRef<Evaluate>(op))) {
+        NoteCommit();
+      }
     }
+  };
+  Scanner scanner;
+  scanner(stmt);
+  return scanner.commits;
+}
 
-    int64_t count_ = 0;
-};
+class GlobalMaxCommitFinder : public StmtVisitor {
+ public:
+  static int64_t FindMax(const Stmt& stmt) {
+    GlobalMaxCommitFinder finder;
+    finder.VisitStmt(stmt);
+    return std::max(static_cast<int64_t>(1), finder.max_commits_);
+  }
 
-/**
- * @brief 寻找循环体内部倍率的最大值
- */
-class GlobalMaxAsyncFinder : public StmtVisitor {
-public:
-    static int64_t FindMax(const Stmt& stmt) {
-        GlobalMaxAsyncFinder finder;
-        finder.VisitStmt(stmt);
-        return std::max(static_cast<int64_t>(1), finder.max_multiplier_);
+ private:
+  void VisitStmt_(const ForNode* op) override {
+    if (IsDCUMainLoop(op)) {
+      int64_t cpt = CountOutermostCommits(op->body);
+      if (cpt > max_commits_) {
+        max_commits_ = cpt;
+      }
     }
+    StmtVisitor::VisitStmt_(op);
+  }
 
-private:
-    void VisitStmt_(const ForNode* op) override {
-        // 【关键修正】：我们只分析循环的 Body 产生的 async 数量
-        // 这样对于最外层的 for k，得到的结果就是它 body 里的 2 个 async 
-        int64_t inner_count = AsyncCountAnalyzer::Analyze(op->body);
-        
-        if (inner_count > max_multiplier_) {
-            max_multiplier_ = inner_count;
-        }
-        
-        // 继续向下递归，检查是否有更深层的循环内部产生了更多指令
-        StmtVisitor::VisitStmt_(op);
-    }
-
-    int64_t max_multiplier_ = 0;
+  int64_t max_commits_ = 0;
 };
 
 class ROCmWaitCountRewriter : public StmtMutator {
-public:
-    static Stmt Substitute(const Stmt& stmt) {
-        int64_t max_mult = GlobalMaxAsyncFinder::FindMax(stmt);
-        ROCmWaitCountRewriter rewriter(max_mult);
-        return rewriter(stmt);
-    }
+ public:
+  static Stmt Substitute(const Stmt& stmt) {
+    int64_t max_commits = GlobalMaxCommitFinder::FindMax(stmt);
+    ROCmWaitCountRewriter rewriter(max_commits);
+    return rewriter(stmt);
+  }
 
-private:
-    explicit ROCmWaitCountRewriter(int64_t mult) : global_max_mult_(mult) {}
+ private:
+  explicit ROCmWaitCountRewriter(int64_t mult) : commits_per_tile_(mult) {}
 
-    Stmt VisitStmt_(const AttrStmtNode* op) override {
-        if (op->attr_key == tir::attr::async_wait_inflight_count ||
-            op->attr_key == "async_wait_inflight_count") {
-            if (auto int_imm = op->value.as<IntImmNode>()) {
-                int64_t new_val = int_imm->value * global_max_mult_;
-                return AttrStmt(op->node, op->attr_key, make_const(DataType::Int(32), new_val),
-                                this->VisitStmt(op->body));
-            }
-        }
-        return StmtMutator::VisitStmt_(op);
+  Stmt VisitStmt_(const AttrStmtNode* op) override {
+    if (op->attr_key == tir::attr::async_wait_inflight_count ||
+        op->attr_key == "async_wait_inflight_count") {
+      if (auto int_imm = op->value.as<IntImmNode>()) {
+        int64_t new_val = int_imm->value * commits_per_tile_;
+        return AttrStmt(op->node, op->attr_key, make_const(DataType::Int(32), new_val),
+                        this->VisitStmt(op->body));
+      }
     }
-    int64_t global_max_mult_;
+    return StmtMutator::VisitStmt_(op);
+  }
+  int64_t commits_per_tile_;
 };
 
-// Pass 包装省略 (同前)
+}  // namespace
+
 namespace transform {
 using namespace tir::transform;
 tvm::transform::Pass FixDCUWaitCount() {
@@ -117,7 +182,7 @@ tvm::transform::Pass FixDCUWaitCount() {
 TVM_FFI_STATIC_INIT_BLOCK() {
   tvm::ffi::reflection::GlobalDef().def("tl.transform.FixDCUWaitCount", FixDCUWaitCount);
 }
-}
+}  // namespace transform
 
 }  // namespace tl
 }  // namespace tvm

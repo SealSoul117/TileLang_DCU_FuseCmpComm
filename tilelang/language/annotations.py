@@ -25,13 +25,14 @@ def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
 
 
 def use_warp_divergence(enable: bool = True):
-    """Enable or disable DCU warp K-loop divergence lowering for this kernel.
+    """Kernel-level enable for DCU warp K-loop divergence (legacy).
+
+    Prefer ``T.Pipelined(..., enable_warp_divergence=True, enable_register_pipeline=True)``
+    on the K loop. This helper still enables the pass for the whole kernel.
 
     Args:
-        enable: If True (default), the InjectWarpKLoopDivergence pass is applied.
-                If False, the pass is skipped for this kernel.
-
-    This is a compile-time hint only; it does not emit device code.
+        enable: If True, InjectWarpKLoopDivergence is applied to DCU GEMM K loops.
+                If False, this helper is a no-op.
     """
     if not enable:
         return None

@@ -18,6 +18,7 @@ def copy(
     disable_tma: bool = False,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
     major: Literal["row_major", "col_major"] | None = None,
+    enable_async: bool | None = None,
 ):
     """Copy data between memory regions.
 
@@ -27,6 +28,9 @@ def copy(
         coalesced_width (Optional[int], optional): Width for coalesced memory access. Defaults to None.
         major (Optional[Literal["row_major", "col_major"]], optional): Memory access
             major order for DCU async copy lowering. Defaults to "row_major".
+        enable_async (Optional[bool], optional): Whether to lower global→shared as an
+            asynchronous copy. ``True`` / ``False`` force the DCU async / SIMT path.
+            ``None`` keeps the historical DCU default (auto-async for G→S).
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -99,6 +103,10 @@ def copy(
         copy_major = 0
     else:
         copy_major = {"row_major": 0, "col_major": 1}[major]
+    if enable_async is None:
+        is_async_copy = -1
+    else:
+        is_async_copy = 1 if enable_async else 0
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.tileop.copy"),
@@ -108,6 +116,25 @@ def copy(
         disable_tma,
         eviction_policy,
         copy_major,
+        is_async_copy,
+    )
+
+
+def async_copy(
+    src: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
+    dst: tir.Buffer | tir.BufferLoad | tir.BufferRegion,
+    coalesced_width: int | None = None,
+    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    major: Literal["row_major", "col_major"] | None = None,
+):
+    """Asynchronous global→shared copy. Equivalent to ``T.copy(..., enable_async=True)``."""
+    return copy(
+        src,
+        dst,
+        coalesced_width=coalesced_width,
+        eviction_policy=eviction_policy,
+        major=major,
+        enable_async=True,
     )
 
 

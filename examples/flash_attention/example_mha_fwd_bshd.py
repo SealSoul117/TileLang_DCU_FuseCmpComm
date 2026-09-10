@@ -9,11 +9,26 @@ from functools import partial
 
 
 def get_configs():
-    iter_params = dict(block_M=[64], block_N=[64], num_stages=[1], threads=[128])
+    iter_params = dict(
+        block_M=[64, 128, 256],
+        block_N=[64, 128],
+        num_stages=[1, 2],
+        threads=[128, 256],
+    )
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
 
-@autotune(configs=get_configs(), warmup=10, rep=10)
+# The autotuner invokes ref_prog(Q, K, V) with its generated input tensors only,
+# but ref_program also needs `is_causal`, which is only known at call time.
+# Bind it through this module-level flag (must be defined before the decorators below).
+_TUNE_IS_CAUSAL = False
+
+
+def _tune_ref_program(Q, K, V):
+    return ref_program(Q, K, V, _TUNE_IS_CAUSAL)
+
+
+@autotune(configs=get_configs(), warmup=10, rep=10, ref_prog=_tune_ref_program)
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
@@ -37,15 +52,19 @@ def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num
         by: T.int32,
         bz: T.int32,
     ):
-        T.copy(K[bz, k * block_N : (k + 1) * block_N, by, :], K_shared)
+        T.copy(K[bz, k * block_N : (k + 1) * block_N, by, :], K_shared, major="row_major")
+        T.fill(acc_s, 0)
+        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
         if is_causal:
             for i, j in T.Parallel(block_M, block_N):
-                acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
+                acc_s[i, j] = T.if_then_else(
+                    bx * block_M + i >= k * block_N + j, acc_s[i, j], -T.infinity(acc_s.dtype)
+                )
         else:
-            # We shall fill -inf for OOB positions
             for i, j in T.Parallel(block_M, block_N):
-                acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
-        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                acc_s[i, j] = T.if_then_else(
+                    k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), acc_s[i, j]
+                )
 
     @T.macro
     def MMA1(
@@ -57,8 +76,8 @@ def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num
         by: T.int32,
         bz: T.int32,
     ):
-        T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared)
-        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+        T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared, major="col_major")
+        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
 
     @T.macro
     def Softmax(
@@ -111,7 +130,6 @@ def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
-            O_shared = T.alloc_shared([block_M, dim], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
@@ -121,7 +139,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num
             scores_sum = T.alloc_fragment([block_M], accum_dtype)
             logsum = T.alloc_fragment([block_M], accum_dtype)
 
-            T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+            T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared, major="row_major")
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
@@ -137,8 +155,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num
                 MMA1(V, V_shared, acc_s_cast, acc_o, k, by, bz)
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
+            T.copy(acc_o, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return main
 
@@ -183,6 +200,8 @@ def main(
         print("Tile-lang: {:.2f} ms".format(latency))
         print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
     else:
+        global _TUNE_IS_CAUSAL
+        _TUNE_IS_CAUSAL = is_causal
         best_result = flashattn(batch, heads, seq_len, dim, is_causal)
         best_latency = best_result.latency
         best_config = best_result.config
@@ -195,7 +214,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=8, help="batch size")
+    parser.add_argument("--batch", type=int, default=1, help="batch size")
     parser.add_argument("--heads", type=int, default=32, help="heads")
     parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
     parser.add_argument("--dim", type=int, default=128, help="dim")

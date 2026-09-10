@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "../op/builtin.h"
+#include "common/pipeline_attrs.h"
 
 #include "support/utils.h"
 #include "tir/schedule/utils.h"
@@ -1274,6 +1275,18 @@ private:
           }
           preserved_annotations.Set(key, kv.second);
         }
+      }
+      if (stage_attr_key_ == "tl_register_pipeline_stage") {
+        auto keep_if_present = [&](const char *key) {
+          if (auto val = pipeline_loop_->annotations.Get(key)) {
+            preserved_annotations.Set(key, val.value());
+          }
+        };
+        keep_if_present("num_stages");
+        keep_if_present(kEnableRegisterPipeline);
+        keep_if_present(kNumRegisterStages);
+        keep_if_present(kEnableWarpDivergence);
+        preserved_annotations.Set(kRegisterPipelineApplied, Integer(1));
       }
       new_loop = For(Downcast<Var>(new_loop_var), pipeline_loop_->min, extent,
                      unroll_loop ? ForKind::kUnrolled : pipeline_loop_->kind,

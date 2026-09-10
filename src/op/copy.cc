@@ -160,6 +160,9 @@ Copy::Copy(Array<PrimExpr> args) {
   if (args.size() >= 6) {
     node->copy_major = Downcast<IntImm>(args[5])->value;
   }
+  if (args.size() >= 7) {
+    node->enable_async = Downcast<IntImm>(args[6])->value;
+  }
   data_ = std::move(node);
 }
 
@@ -665,6 +668,66 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
   return Downcast<For>(body);
 }
 
+For CopyNode::MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
+                                        const DCUAsyncCopyParams &params) const {
+  Array<IterVar> loop_vars = MakeIterVars();
+  for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+
+  ICHECK_GE(loop_vars.size(), 2) << "XOR swizzle copy requires a 2D tile";
+  PrimExpr i_raw = loop_vars[0]->var;
+  PrimExpr j_raw = loop_vars[1]->var;
+
+  const int dim1 = params.dim1.as<IntImmNode>()->value;
+  const int elem_bytes = params.dtype.bytes();
+  const int vec_bytes = 16;
+  const int vec_size = elem_bytes > 0 ? vec_bytes / elem_bytes : 0;
+  const int elems_per_bank_row = (32 * 32) / (elem_bytes * 8);
+  const int per_phase = std::max(1, dim1 > 0 ? elems_per_bank_row / dim1 : 1);
+  const int max_phase =
+      vec_size > 0 ? std::min(16 / per_phase, dim1 / vec_size) : 0;
+
+  PrimExpr j_mapped = j_raw;
+  if (vec_size > 0 && max_phase > 1) {
+    PrimExpr phase = floormod(floordiv(i_raw, per_phase), max_phase);
+    PrimExpr col_vec = floordiv(j_raw, vec_size);
+    PrimExpr col_off = floormod(j_raw, vec_size);
+    j_mapped = bitwise_xor(col_vec, Cast(col_vec.dtype(), phase)) *
+                   make_const(j_raw.dtype(), vec_size) +
+               col_off;
+    j_mapped = analyzer->Simplify(j_mapped);
+  }
+
+  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
+  Array<PrimExpr> dst_indices;
+  size_t idx_in_vars = 0;
+  for (size_t i = 0; i < dst_range.size(); ++i) {
+    if (is_one(dst_range[i]->extent)) {
+      dst_indices.push_back(dst_range[i]->min);
+    } else {
+      if (idx_in_vars == 0) {
+        dst_indices.push_back(dst_range[i]->min + i_raw);
+      } else if (idx_in_vars == 1) {
+        dst_indices.push_back(dst_range[i]->min + j_mapped);
+      } else {
+        dst_indices.push_back(dst_range[i]->min + loop_vars[idx_in_vars]->var);
+      }
+      idx_in_vars++;
+    }
+  }
+
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
+  Stmt body = BufferStore(dst, value, dst_indices);
+
+  for (int i = loop_vars.size() - 1; i >= 0; i--) {
+    Map<String, ObjectRef> annotations = {};
+    if (coalesced_width.defined()) annotations.Set("coalesced_width", coalesced_width);
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent, ForKind::kParallel,
+               body, std::nullopt, annotations);
+  }
+  return Downcast<For>(body);
+}
+
 /**
  * @brief Compute a linearized shared-memory layout used for TMA transfers.
  *
@@ -1088,9 +1151,16 @@ bool CopyNode::CheckTMemStore(Target target) const {
  * false otherwise.
  */
 bool CopyNode::CheckDCUAsyncCopy(Target target) const {
-  return TargetIsDCU(target) &&
-         dst.scope() == "shared.dyn" &&
-         (src.scope() == "global" || src.scope() == "shared");
+  if (!TargetIsDCU(target) || dst.scope() != "shared.dyn" ||
+      (src.scope() != "global" && src.scope() != "shared")) {
+    return false;
+  }
+  // enable_async=0 disables the DCU async lower path (plain SIMT copy).
+  // Unspecified (-1) keeps historical DCU G→S auto-async; 1 forces it.
+  if (enable_async == 0) {
+    return false;
+  }
+  return true;
 }
 /**
  * @brief Selects the most specific copy instruction supported for the given
@@ -1364,6 +1434,10 @@ struct DCUAsyncCopyGemmInfo {
   // BK from the shared tile on the gemm reduce axis.
   Optional<PrimExpr> k_dim;
   int k_axis{1};
+  // 0 = auto, 1 = simple, 2 = xor-swizzle, 3 = slab/shadow.
+  int lds_layout{0};
+  bool trans_a{false};
+  bool trans_b{false};
 };
 
 static bool SameDCUBuffer(const Buffer &a, const Buffer &b) {
@@ -1393,6 +1467,7 @@ static DCUAsyncCopyGemmInfo ComputeWarpNForDCUAsyncCopy(
     int k_pack{1};
     bool trans_a{false};
     bool trans_b{false};
+    int lds_layout{0};
   };
 
   struct Collector : public StmtExprVisitor {
@@ -1430,6 +1505,11 @@ static DCUAsyncCopyGemmInfo ComputeWarpNForDCUAsyncCopy(
         if (op->args.size() > 14) {
           if (const auto *imm = op->args[14].as<IntImmNode>()) {
             ev.k_pack = static_cast<int>(imm->value);
+          }
+        }
+        if (op->args.size() > 20) {
+          if (const auto *imm = op->args[20].as<IntImmNode>()) {
+            ev.lds_layout = static_cast<int>(imm->value);
           }
         }
         events.push_back(ev);
@@ -1477,6 +1557,9 @@ static DCUAsyncCopyGemmInfo ComputeWarpNForDCUAsyncCopy(
 
   const Event &gemm = matched_gemm.value();
   result.k_pack = gemm.k_pack;
+  result.lds_layout = gemm.lds_layout;
+  result.trans_a = gemm.trans_a;
+  result.trans_b = gemm.trans_b;
 
   int block_size = 0;
   if (auto *imm = thread_bounds->extent.as<IntImmNode>()) {
@@ -1519,13 +1602,20 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   std::optional<int> gemm_operand;
   Optional<PrimExpr> gemm_k_dim;
   int gemm_k_axis = 1;
+  int gemm_lds_layout = 0;
+  bool gemm_trans_a = false;
+  bool gemm_trans_b = false;
+  DCUAsyncCopyGemmInfo gemm_info;
   if (T.func_body.defined()) {
-    auto gemm_info = ComputeWarpNForDCUAsyncCopy(
+    gemm_info = ComputeWarpNForDCUAsyncCopy(
         T.func_body.value(), src, dst, T.thread_bounds, T.target);
     k_pack = gemm_info.k_pack;
     gemm_operand = gemm_info.gemm_operand;
     gemm_k_dim = gemm_info.k_dim;
     gemm_k_axis = gemm_info.k_axis;
+    gemm_lds_layout = gemm_info.lds_layout;
+    gemm_trans_a = gemm_info.trans_a;
+    gemm_trans_b = gemm_info.trans_b;
     if (gemm_info.warp_count.has_value()) {
       warp_m = make_const(total_threads.dtype(), gemm_info.warp_count.value());
     } else {
@@ -1565,20 +1655,43 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
         copy_params.k_dim = (copy_params.k_axis == 0) ? dim0_i : dim1_i;
       }
       
-      PrimExpr tile_elems =
-          analyzer->Simplify(make_const(DataType::Int(32), copy_params.mn_dim) *
-                             copy_params.k_pack * 16);
-      PrimExpr warp_capacity =
-          analyzer->Simplify(copy_params.warp_num * 64);
-      ICHECK(is_const_int(tile_elems) && is_const_int(warp_capacity))
-          << "DCU async copy path selection requires constant tile/warp sizes, "
-          << "got tile_elems=" << tile_elems
-          << ", warp_capacity=" << warp_capacity;
-      if (*as_const_int(tile_elems) <= *as_const_int(warp_capacity)) {
+      const int slabs = [&]() {
+        const int elem_bytes = copy_params.dtype.bytes();
+        ICHECK_GT(elem_bytes, 0);
+        const int slab_num = 1024 / elem_bytes;
+        ICHECK_GT(slab_num, 0);
+        constexpr int micro_m = 16;
+        constexpr int micro_n = 16;
+        const int mn_per_iter_warp = (copy_params.k_axis == 0) ? (micro_n * 2) : micro_m;
+        const int iter_times_warp = copy_params.mn_dim / mn_per_iter_warp;
+        return micro_m * micro_n * copy_params.k_pack * iter_times_warp / slab_num;
+      }();
+
+      // Match pick_dcu_lds_layout: 16-wide A / <32-wide B NT cannot use
+      // ds_read_m32x16. Forced slab with slabs<4 degrades to XOR swizzle.
+      const bool too_small = (copy_params.k_axis == 0)
+                                 ? (copy_params.mn_dim < 32)
+                                 : (copy_params.mn_dim * copy_params.k_pack <= 16);
+      int lds_mode = gemm_lds_layout;
+      if (lds_mode == 1 || too_small) {
+        lds_mode = 1;
+      } else if (lds_mode == 3 && slabs < 4) {
+        lds_mode = 2;
+      } else if (lds_mode == 0) {
+        lds_mode = (slabs >= 4) ? 3 : 2;
+      }
+
+      if (lds_mode == 1) {
         need_layout = false;
+        need_shadow = false;
         simt_loop = MakeDCUSIMTLoop(analyzer, copy_params);
+      } else if (lds_mode == 2) {
+        need_layout = true;
+        need_shadow = false;
+        simt_loop = MakeDCUXorSwizzleSIMTLoop(analyzer, copy_params);
       } else {
-        // Layout path follows where K lives on the shared tile, not T.copy major.
+        need_layout = true;
+        need_shadow = true;
         if (copy_params.k_axis == 0) {
           simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
         } else {
@@ -1588,22 +1701,6 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
           simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
         }
       }
-
-      // Match LayoutConfig.slabs in mmac_layout.py. Rewind padding (and the
-      // corresponding G→S shadow bits) only apply when slabs >= 4.
-      auto compute_layout_slabs = [&]() {
-        const int elem_bytes = copy_params.dtype.bytes();
-        ICHECK_GT(elem_bytes, 0);
-        const int slab_num = 1024 / elem_bytes;
-        ICHECK_GT(slab_num, 0);
-        constexpr int micro_m = 16;
-        constexpr int micro_n = 16;
-        // Non-transposed B (K on dim0) uses warp_cols//2 as iter_num.
-        const int mn_per_iter_warp = (copy_params.k_axis == 0) ? (micro_n * 2) : micro_m;
-        const int iter_times_warp = copy_params.mn_dim / mn_per_iter_warp;
-        return micro_m * micro_n * copy_params.k_pack * iter_times_warp / slab_num;
-      };
-      need_shadow = need_layout && compute_layout_slabs() >= 4;
 
 
   }
@@ -1654,6 +1751,11 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   if (gemm_operand.has_value()) {
     result = AttrStmt(dst_name_node, kDCUGemmOperandStmt,
                       IntImm(DataType::Int(32), gemm_operand.value()), result);
+    // Same rule as NeedsDCUAsyncCopyIdxenForOperand: A not-transposed / B transposed.
+    const bool use_idxen =
+        need_layout && ((gemm_operand.value() == 0 && !gemm_trans_a) ||
+                        (gemm_operand.value() == 1 && gemm_trans_b));
+    result = AttrStmt(dst_name_node, kDCUUseIdxenStmt, Bool(use_idxen), result);
   }
   return result;
 }
@@ -2760,11 +2862,11 @@ void CopyNode::CollectFragmentLayouts(const PrimExpr &expr,
 
 // Register the Copy operation with TVM's TIR system
 // This makes the copy operation available for use in TVM programs
-// - Takes 6 inputs: src_buffer, dst_buffer, coalesced_width, disable_tma,
-// eviction_policy, copy_major
+// - Takes 7 inputs: src, dst, coalesced_width, disable_tma, eviction_policy,
+// copy_major, enable_async
 // - Marked as opaque since it has side effects (memory writes)
 TIR_REGISTER_TL_TILE_OP(Copy, copy)
-    .set_num_inputs(6)
+    .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

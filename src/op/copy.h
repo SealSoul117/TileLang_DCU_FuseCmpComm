@@ -113,6 +113,8 @@ public:
   Bool disable_tma = Bool(false); // Whether to disable TMA acceleration
   // 0: row_major, 1: col_major
   int copy_major = 0;
+  // -1: unspecified (DCU G→S keeps current auto-async), 0: force sync, 1: force async.
+  int enable_async = -1;
 
   mutable ParallelOp par_op_; // Optional associated parallelization operator
 
@@ -266,6 +268,16 @@ protected:
 
   For MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
                               const DCUAsyncCopyParams &params) const;
+
+  /*!
+   * \brief DCU G→LDS copy with XOR bank swizzle on the destination (innermost dim).
+   *
+   * Used when ds_read is legal but there are fewer than 4 slabs, so warp-shadow
+   * interleave cannot be applied. Src stays sequential; dst column is XOR-swizzled
+   * (same formula as make_mfma_swizzle_layout).
+   */
+  For MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
+                                const DCUAsyncCopyParams &params) const;
 
   /*!
    * \brief Compute linear layout for tma copy.

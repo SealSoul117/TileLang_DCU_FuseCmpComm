@@ -189,7 +189,102 @@ def ki_shared_cvt(row, col, stride, new_stride):
     new_row = index // new_stride
     new_col = index - new_row * new_stride
     return new_row, new_col
-    
+
+
+# DCU LDS layout modes (keep in sync with tilelang.language.gemm_op.DCULdsLayout).
+LDS_AUTO = 0
+LDS_SIMPLE = 1
+LDS_SWIZZLE = 2
+LDS_SLAB = 3
+
+
+def dtype_elem_bytes(dtype):
+    name = str(dtype)
+    if "bfloat16" in name or name in ("float16", "fp16"):
+        return 2
+    if "float32" in name or name == "fp32":
+        return 4
+    if "int8" in name or "uint8" in name:
+        return 1
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def compute_dcu_lds_slabs(mn_dim, k_pack, type_size, k_axis):
+    """Match copy.cc slab count: k_axis 0 uses 32-wide B NT tiles, else 16-wide."""
+    if type_size <= 0 or mn_dim <= 0:
+        return 0
+    slab_num = 1024 // type_size
+    if slab_num <= 0:
+        return 0
+    mn_per_iter_warp = 32 if k_axis == 0 else 16
+    if mn_dim < mn_per_iter_warp:
+        return 0
+    iter_times_warp = mn_dim // mn_per_iter_warp
+    return 16 * 16 * k_pack * iter_times_warp // slab_num
+
+
+def xor_swizzle_col(row, col, inner_dim, type_size, vec_bytes=16):
+    """AMD/NVIDIA-style XOR bank swizzle on the innermost (contiguous) dimension.
+
+    Matches ``make_mfma_swizzle_layout`` / ``makeMatrixCoreSwizzleLayout``:
+    phase = (row // per_phase) % max_phase
+    col' = ((col // vec) XOR phase) * vec + col % vec
+    """
+    if type_size <= 0 or inner_dim <= 0:
+        return row, col
+    vec_size = vec_bytes // type_size
+    if vec_size <= 0 or inner_dim < vec_size:
+        return row, col
+    elems_per_bank_row = (32 * 32) // (type_size * 8)
+    per_phase = max(1, elems_per_bank_row // inner_dim)
+    max_phase = min(16 // per_phase, inner_dim // vec_size)
+    if max_phase <= 1:
+        return row, col
+    phase = (row // per_phase) % max_phase
+    col_off = ((col // vec_size) ^ phase) * vec_size + (col % vec_size)
+    return row, col_off
+
+
+def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1):
+    """Select SIMPLE / SWIZZLE / SLAB. ``user_mode`` 0 means AUTO.
+
+    SIMPLE when the operand cannot use ds_read_m32x16:
+      B NT (k_axis=0): N < 32;  A / B-T (k_axis=1): MN <= 16.
+    Forced SWIZZLE/SLAB on a too-small tile degrades (SLAB also degrades
+    when slabs < 4).
+    """
+    too_small = (mn_dim < 32) if k_axis == 0 else (mn_dim * k_pack <= 16)
+    if user_mode == LDS_SIMPLE:
+        return LDS_SIMPLE
+    if too_small:
+        return LDS_SIMPLE
+    if user_mode == LDS_SWIZZLE:
+        return LDS_SWIZZLE
+    if user_mode == LDS_SLAB:
+        return LDS_SWIZZLE if slabs < 4 else LDS_SLAB
+    if slabs < 4:
+        return LDS_SWIZZLE
+    return LDS_SLAB
+
+
+def shared_to_local_layout_A_swizzle(tx, local_id, warp_m, idx, k_pack, block_row_warps=1):
+    """16x16 matrix-core A coords without slab permute / rewind.
+
+    Warps are interleaved every 16 rows to match ``make_mmac_store_layout``:
+    row = lane + warp_m * 16 + idx * 16 * m_warp.
+    """
+    row = tx % 16 + warp_m * 16 + idx * 16 * block_row_warps
+    col = (tx // 16) * 4 * k_pack + local_id
+    return row, col
+
+
+def shared_to_local_layout_B_swizzle(tx, local_id, warp_n, idx, warp_num, element_per_row=32):
+    """16x16 matrix-core B coords (K-row / N-col) without slab permute / rewind."""
+    row = tx // 4
+    col = (tx % 4) * 8 + local_id
+    col = col + warp_n * element_per_row + idx * element_per_row * warp_num
+    return row, col
+
 
 @dataclass(frozen=True)
 class SharedToLocalLayoutA:
@@ -295,11 +390,16 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
     row = row - layout_config.row_per_slab * cond
     return row, new_col
 
-def shared_to_local_layout_B_simple(tx, local_id):
-    # base
+def shared_to_local_layout_B_simple(tx, local_id, warp_n=0, idx=0, micro_n=16):
     row = local_id + (tx // 16) * 4
-    col = tx % 16
+    col = tx % 16 + warp_n * micro_n + idx * micro_n
     return row, col
+
+
+def shared_to_local_layout_A_simple(tx, local_id, warp_m, idx, k_pack, block_row_warps=1):
+    """Sequential 16x16 A coords (same as swizzle, without XOR)."""
+    return shared_to_local_layout_A_swizzle(
+        tx, local_id, warp_m, idx, k_pack, block_row_warps)
 
     
 @dataclass(frozen=True)

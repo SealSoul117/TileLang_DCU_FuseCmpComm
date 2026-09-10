@@ -131,6 +131,9 @@ void CodeGenTileLangHIP::PrintExtraAttrs(const PrimFunc &f, std::ostream &os) {
       // return
       return;
     }
+    // Match examples/gemm/gemm.log: do not emit __launch_bounds__.
+    // Default plus --gpu-max-threads-per-block=256 is how the passing
+    // 512-thread kernel was compiled (compiler warns, results were correct).
     // stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
     // stream << " __launch_bounds__(256)";
   }
@@ -814,9 +817,7 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
                    << ", " << condition << ");\n";
     }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
-    // this->PrintIndent();
-    //   this->stream << "tl::wave_barrier();\n";
-    // print_extern_call_stmt("tl::cp_async_commit");
+    print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
     int n = Downcast<IntImm>(op->args[0])->value;
     std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
@@ -1259,9 +1260,10 @@ void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
     const IntImmNode *queue_id = op->value.as<IntImmNode>();
     ICHECK(queue_id && queue_id->value == 0)
         << "For CUDA, the index of an async queue must be 0.";
+    // DCU commits are emitted after each tl.dcu_async_copy in
+    // LowerSharedGlobalCopy (empty tl::cp_async_commit for wait counting).
+    // Do not emit a second commit for the queue AttrStmt.
     this->VisitStmt(op->body);
-    auto commit_group = Call(DataType::Void(), builtin::ptx_commit_group(), {});
-    this->VisitExpr(commit_group, this->stream);
     return;
   } else if (op->attr_key == tir::attr::async_wait_queue_scope) {
     auto wait_attrs = GetAsyncWaitAttributes(op);

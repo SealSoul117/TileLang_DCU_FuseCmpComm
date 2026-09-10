@@ -93,6 +93,10 @@ GemmPy::GemmPy(Array<PrimExpr> args) {
   if (args.size() > 19) {
     node->transC_ = args[19].as<Bool>().value();
   }
+  node->ldsLayout_ = 0;
+  if (args.size() > 20) {
+    node->ldsLayout_ = args[20].as<IntImm>().value()->value;
+  }
   data_ = std::move(node);
 }
 

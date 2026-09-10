@@ -19,6 +19,7 @@
 #include "inject_utils.h"
 
 using tvm::ffi::Array;
+using tvm::ffi::GetRef;
 namespace tvm {
 namespace tl {
 namespace {
@@ -57,6 +58,30 @@ bool IsWaveBarrierStmt(const Stmt& stmt) {
     if (const auto* call = eval->value.as<CallNode>()) {
       return IsWaveBarrierCall(call);
     }
+  }
+  return false;
+}
+
+bool IsPtxCommitStmt(const Stmt& stmt) {
+  if (const auto* eval = stmt.as<EvaluateNode>()) {
+    if (const auto* call = eval->value.as<CallNode>()) {
+      return call->op.same_as(builtin::ptx_commit_group());
+    }
+  }
+  return false;
+}
+
+bool IsCommitAttr(const AttrStmtNode* op) {
+  return op->attr_key == tir::attr::async_commit_queue_scope ||
+         op->attr_key == "async_commit_queue_scope";
+}
+
+bool IsPrologueCommitStmt(const Stmt& stmt) {
+  if (IsPtxCommitStmt(stmt)) {
+    return true;
+  }
+  if (const auto* attr = stmt.as<AttrStmtNode>()) {
+    return IsCommitAttr(attr);
   }
   return false;
 }
@@ -213,19 +238,61 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
     std::deque<int> saved_pending = std::move(pending_wait_counts_);
     pending_wait_counts_.clear();
 
+    const bool emit_prologue_pair_barriers =
+        seq_nesting_ == 0 && phase_ == PipelinePhase::kBeforeMainLoop;
+    ++seq_nesting_;
+
+    Stmt flattened = SeqStmt::Flatten(GetRef<Stmt>(op));
+    const auto* seq_op = flattened.as<SeqStmtNode>();
+    if (seq_op == nullptr) {
+      Stmt inner = VisitStmt(flattened);
+      --seq_nesting_;
+      pending_wait_counts_ = std::move(saved_pending);
+      return inner;
+    }
+
     Array<Stmt> result;
-    result.reserve(op->seq.size());
-    for (const Stmt& s : op->seq) {
-      result.push_back(VisitStmt(s));
+    result.reserve(seq_op->seq.size() + 8);
+    int prologue_stage_commits = 0;
+    auto append_leaf = [&](const Stmt& leaf) {
+      result.push_back(leaf);
+      if (!emit_prologue_pair_barriers || !IsPrologueCommitStmt(leaf)) {
+        return;
+      }
+      prologue_stage_commits += 1;
+      // Reference gemm.log: wave_barrier after each A+B pair.
+      if (prologue_stage_commits >= 2) {
+        if (result.empty() || !IsWaveBarrierStmt(result.back())) {
+          result.push_back(MakeWaveBarrierStmt());
+        }
+        prologue_stage_commits = 0;
+      }
+    };
+    auto append_stmt = [&](const Stmt& stmt) {
+      if (const auto* inner = stmt.as<SeqStmtNode>()) {
+        for (const Stmt& child : inner->seq) {
+          append_leaf(child);
+        }
+      } else {
+        append_leaf(stmt);
+      }
+    };
+    for (const Stmt& s : seq_op->seq) {
+      append_stmt(VisitStmt(s));
       TryInsertEpilogueGldFenceAfterSldFence(result);
       TryInsertGldFenceAfterPair(result);
     }
+
+    --seq_nesting_;
 
     for (int count : pending_wait_counts_) {
       saved_pending.push_back(count);
     }
     pending_wait_counts_ = std::move(saved_pending);
 
+    if (result.empty()) {
+      return Evaluate(0);
+    }
     if (result.size() == 1) {
       return result[0];
     }
@@ -281,6 +348,7 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
 
   PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
   bool has_main_loop_{true};
+  int seq_nesting_{0};
   std::deque<int> pending_wait_counts_;
   const std::vector<int> epilogue_gld_fence_values_;
   int epilogue_gld_insert_idx_{0};

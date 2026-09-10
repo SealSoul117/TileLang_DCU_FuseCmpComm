@@ -85,11 +85,16 @@ def _find_cuda_home() -> str:
     return cuda_home if cuda_home is not None else ""
 
 
+def get_hip_compiler() -> str:
+    """Prefer ``aicc`` (HCU/DTK) when on PATH, otherwise ``hipcc``."""
+    return "aicc" if shutil.which("aicc") else "hipcc"
+
+
 def _find_rocm_home() -> str:
     """Find the ROCM install path."""
     rocm_home = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
     if rocm_home is None:
-        rocmcc_path = shutil.which("hipcc")
+        rocmcc_path = shutil.which(get_hip_compiler())
         if rocmcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(rocmcc_path))
         else:

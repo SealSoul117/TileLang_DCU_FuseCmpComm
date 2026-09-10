@@ -3,6 +3,11 @@ from tilelang.layout import make_swizzled_layout, make_linear_layout
 from tilelang.intrinsics.mmac_macro_generator import (
     MatrixCoreIntrinEmitter,
 )
+from tilelang.intrinsics.mmac_layout import (
+    pick_dcu_lds_layout,
+    compute_dcu_lds_slabs,
+    dtype_elem_bytes,
+)
 from tilelang.utils.language import is_shared, is_fragment, is_full_region
 from tilelang import tvm as tvm
 from tvm.target import Target
@@ -11,12 +16,36 @@ from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
 
 
+def _resolve_dcu_lds_layouts(gemm, thread_nums: int):
+    """Per-operand SIMPLE / SWIZZLE / SLAB, matching copy.cc heuristics."""
+    user_mode = gemm.lds_layout
+    k_pack = int(gemm.k_pack or 1)
+    elem = dtype_elem_bytes(gemm.in_dtype)
+    a_k_axis = 0 if gemm.trans_A else 1
+    b_k_axis = 1 if gemm.trans_B else 0
+    a_mode = pick_dcu_lds_layout(
+        user_mode,
+        compute_dcu_lds_slabs(int(gemm.M), k_pack, elem, a_k_axis),
+        int(gemm.M),
+        a_k_axis,
+        k_pack,
+    )
+    b_mode = pick_dcu_lds_layout(
+        user_mode,
+        compute_dcu_lds_slabs(int(gemm.N), k_pack, elem, b_k_axis),
+        int(gemm.N),
+        b_k_axis,
+        k_pack,
+    )
+    return a_mode, b_mode
+
+
 class GemmMMAC(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, False)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
-        enable_fast_lds = ((self.N * self.k_pack * 16) // 64) > 4
+        a_lds_layout, b_lds_layout = _resolve_dcu_lds_layouts(self, thread_nums)
         
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
@@ -30,7 +59,8 @@ class GemmMMAC(GemmBase):
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
             k_pack=self.k_pack,
-            enable_fast_lds=enable_fast_lds,
+            a_lds_layout=a_lds_layout,
+            b_lds_layout=b_lds_layout,
             transpose_C=self.trans_C,
         )
 
@@ -65,7 +95,7 @@ class GemmMMAC(GemmBase):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, False)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
-        enable_fast_lds = ((self.N * self.k_pack * 16) // 64) > 4
+        a_lds_layout, b_lds_layout = _resolve_dcu_lds_layouts(self, thread_nums)
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
             b_dtype=self.in_dtype,
@@ -79,7 +109,8 @@ class GemmMMAC(GemmBase):
             chunk=self.chunk,
             thread_var=thread_var,
             k_pack=self.k_pack,
-            enable_fast_lds=enable_fast_lds,
+            a_lds_layout=a_lds_layout,
+            b_lds_layout=b_lds_layout,
             transpose_C=self.trans_C,
         )
 

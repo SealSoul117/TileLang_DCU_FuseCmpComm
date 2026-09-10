@@ -661,10 +661,10 @@ def InsertAsyncGldFence():
 
 
 def UnrollDCUKLoop():
-    """Unroll the unique DCU GEMM k-loop by a configurable factor (default 4)."""
+    """Unroll a DCU GEMM K loop annotated with T.Pipelined(enable_register_pipeline=True)."""
     return _ffi_api.UnrollDCUKLoop()  # type: ignore
 
 
 def InjectWarpKLoopDivergence():
-    """Split the DCU GEMM k-loop across warp halves with divergent mmac scheduling."""
+    """Split a DCU GEMM K loop across warp halves when enable_warp_divergence is set."""
     return _ffi_api.InjectWarpKLoopDivergence()  # type: ignore

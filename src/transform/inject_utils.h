@@ -115,6 +115,7 @@ struct DCUCopyBufferMaps {
   std::unordered_map<std::string, bool> need_layout;
   std::unordered_map<std::string, bool> need_shadow;
   std::unordered_map<std::string, int> gemm_operand;
+  std::unordered_map<std::string, bool> use_idxen;
 };
 
 bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps);
@@ -140,6 +141,9 @@ int LookupDCUCopyMajor(const DCUCopyBufferMaps& maps, const std::string& name,
 
 std::optional<int> LookupDCUGemmOperand(const DCUCopyBufferMaps& maps,
                                         const std::string& name);
+
+std::optional<bool> LookupDCUUseIdxen(const DCUCopyBufferMaps& maps,
+                                      const std::string& name);
 
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
                                const DCUCopyBufferMaps& maps,

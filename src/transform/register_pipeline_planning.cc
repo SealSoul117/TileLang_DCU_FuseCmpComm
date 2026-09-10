@@ -4,6 +4,8 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "common/pipeline_attrs.h"
+
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -134,11 +136,9 @@ class RegisterPipelinePlanner : public StmtExprMutator {
       return for_node;
     }
 
-    int num_register_stages = 2;
-    if (auto num_reg_stages_anno = op->annotations.Get("num_register_stages")) {
-      if (const auto* imm = num_reg_stages_anno.value().as<IntImmNode>()) {
-        num_register_stages = imm->value;
-      }
+    int num_register_stages = LoopAnnotationInt(op, kNumRegisterStages, 0);
+    if (num_register_stages <= 1 && LoopAnnotationIsTruthy(op, kEnableRegisterPipeline)) {
+      num_register_stages = kDefaultNumRegisterStages;
     }
     int num_shared_stages = 0;
     if (auto num_stages_anno = op->annotations.Get("num_stages")) {

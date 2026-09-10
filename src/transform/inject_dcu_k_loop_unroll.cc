@@ -17,6 +17,7 @@
 
 #include "../op/builtin.h"
 #include "inject_utils.h"
+#include "common/pipeline_attrs.h"
 #include "tir/transforms/ir_utils.h"
 
 using tvm::ffi::GetRef;
@@ -191,6 +192,11 @@ class DCUKLoopUnrollMutator : public StmtMutator {
     if (!IsDCUMainLoop(op) || *transformed_) {
       return StmtMutator::VisitStmt_(op);
     }
+    // Opt-in via T.Pipelined(enable_register_pipeline=True). Unroll folds
+    // register ping-pong indices such as (k * factor) % stages.
+    if (!LoopHasRegisterPipeline(op)) {
+      return StmtMutator::VisitStmt_(op);
+    }
 
     auto extent_opt = GetConstIntExtent(op->extent);
     if (!extent_opt.has_value() || *extent_opt <= 0) {
@@ -274,7 +280,14 @@ tvm::transform::Pass UnrollDCUKLoop() {
 
     CandidateCollector collector;
     collector(f->body);
-    if (collector.candidates.size() != 1) {
+    bool any_enabled = false;
+    for (const auto &c : collector.candidates) {
+      if (LoopHasRegisterPipeline(c.node)) {
+        any_enabled = true;
+        break;
+      }
+    }
+    if (!any_enabled) {
       return f;
     }
 

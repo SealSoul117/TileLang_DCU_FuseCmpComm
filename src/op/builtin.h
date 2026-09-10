@@ -78,6 +78,11 @@ static constexpr const char *kDCUCopyMajorMap = "tl.dcu_copy_major";
 static constexpr const char *kDCUNeedLayoutMap = "tl.dcu_need_layout";
 static constexpr const char *kDCUNeedShadowMap = "tl.dcu_need_shadow";
 static constexpr const char *kDCUGemmOperandMap = "tl.dcu_gemm_operand";
+// Explicit T.copy(enable_async=True) / is_async_copy annotation.
+static constexpr const char *kIsAsyncCopy = "is_async_copy";
+// Per-shared-buffer: rewrite tl.dcu_async_copy → idxen (from Copy.Lower).
+static constexpr const char *kDCUUseIdxenMap = "tl.dcu_use_idxen";
+static constexpr const char *kDCUUseIdxenStmt = "tl.dcu_use_idxen_stmt";
 // Temporary AttrStmt keys; node is StringImm(dst buffer name).
 static constexpr const char *kDCUCopyMajorStmt = "tl.dcu_copy_major_stmt";
 static constexpr const char *kDCUNeedLayoutStmt = "tl.dcu_need_layout_stmt";

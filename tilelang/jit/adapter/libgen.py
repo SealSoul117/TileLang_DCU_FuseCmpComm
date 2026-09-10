@@ -105,6 +105,9 @@ class LibraryGenerator:
             libpath = src.name.replace(".cpp", ".so")
             rocm_path = find_rocm_path()
             arch = get_rocm_arch(rocm_path)
+            # Match examples/gemm/gemm.log compile: hipcc +
+            # --gpu-max-threads-per-block=256, no hygon -mllvm latency flags.
+            # Those flags without sched_barrier can reorder MMA vs LDS.
             command = [
                 "hipcc",
                 "-std=c++17",

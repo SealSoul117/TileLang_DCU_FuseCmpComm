@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include "inject_utils.h"
+#include "../op/builtin.h"
 
 using tvm::ffi::GetRef;
 using tvm::ffi::make_object;
@@ -166,6 +167,8 @@ CollectResult CollectResources(const Stmt& body) {
 
     private:
         bool in_async{false};
+        bool in_need_layout_{false};
+        bool skip_async_{false};
         std::unordered_set<const tvm::tir::VarNode*> loop_vars_;
         std::unordered_set<const tvm::tir::VarNode*> thread_vars_;
         bool IsSharedScope(const Buffer& buf) {
@@ -195,6 +198,18 @@ CollectResult CollectResources(const Stmt& body) {
                     StmtExprVisitor::VisitStmt_(attr);
                 }
 
+            } else if (attr->attr_key == kDCUNeedLayoutStmt) {
+                bool old = in_need_layout_;
+                in_need_layout_ = !is_zero(attr->value);
+                StmtExprVisitor::VisitStmt_(attr);
+                in_need_layout_ = old;
+            } else if (attr->attr_key == kDCUNeedShadowStmt) {
+                bool old_skip = skip_async_;
+                // XOR-swizzle copies (need_layout, no shadow): per-thread LDS
+                // destinations cannot use cp_async_gs, which takes lane-0 M0.
+                skip_async_ = in_need_layout_ && is_zero(attr->value);
+                StmtExprVisitor::VisitStmt_(attr);
+                skip_async_ = old_skip;
             } else if (attr->attr_key == tir::attr::async_scope) {
                 ICHECK(in_async == false) << "Nested async scopes not supported";
                 in_async = true;
@@ -231,6 +246,21 @@ CollectResult CollectResources(const Stmt& body) {
             Buffer src = load->buffer;
             if (!IsGlobalScope(src)) {
                 return false;
+            }
+            if (skip_async_) {
+                return false;
+            }
+            for (const auto& idx : op->indices) {
+                bool has_xor = false;
+                tir::PostOrderVisit(idx, [&](const ObjectRef& n) {
+                    const auto* call = n.as<CallNode>();
+                    if (call && call->op.same_as(builtin::bitwise_xor())) {
+                        has_xor = true;
+                    }
+                });
+                if (has_xor) {
+                    return false;
+                }
             }
             // cp_async_gs<16> always transfers 16 consecutive bytes; skip scalar /
             // non-vectorized g2s (e.g. B_shared[tid] = B[...]) so they stay as
@@ -355,14 +385,14 @@ private:
                 Stmt async_copy = Evaluate(
                     Call(DataType::Int(32), Op::Get("tl.dcu_async_copy"),
                          {dst_res, thread_dst_off, src_res, src_off, smem_offset, elem_dtype}));
+                Stmt commit = Evaluate(
+                    Call(DataType::Handle(), builtin::ptx_commit_group(), {}));
+                Stmt async_with_commit = SeqStmt({async_copy, commit});
 
                 if (copy.predicated) {
-                    // TODO: temporarily disable else branch zero-store
-                    // Stmt zero_store =
-                    //     BufferStore(copy.dst_buffer, copy.else_value, copy.dst_indices);
-                    return IfThenElse(copy.predicate, async_copy);
+                    return IfThenElse(copy.predicate, async_with_commit);
                 }
-                return async_copy;
+                return async_with_commit;
             }
         }
         return StmtExprMutator::VisitStmt_(op);

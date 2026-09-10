@@ -76,6 +76,13 @@ class DSReadInjector : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     }
 
+    const auto dst_scope = std::string(buffer.scope());
+    const auto src_scope = std::string(load->buffer.scope());
+    if (dst_scope.find("local") == std::string::npos ||
+        (src_scope != "shared" && src_scope != "shared.dyn")) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
+
     if (!NeedsDCULocalLayoutDSRead(flags_, maps_, std::string(buffer->name),
                                    std::string(load->buffer->name))) {
       return StmtExprMutator::VisitStmt_(op);

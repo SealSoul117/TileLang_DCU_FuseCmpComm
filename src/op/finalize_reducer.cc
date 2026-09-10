@@ -54,7 +54,7 @@ FinalizeReducerOp::FinalizeReducerOp(Array<PrimExpr> args) {
  *   - if extent == 1, emits a no-op Evaluate(0);
  *   - otherwise constructs an AllReduce extern call (uses `run_hopper` when the
  *     compilation target is Hopper) with an optional workspace (allocated via
- *     T.AddWorkspace when reducing_threads >= 32) and stores the result via
+ *     T.AddWorkspace when reducing_threads/2 >= warp size) and stores the result via
  *     BufferStore.
  * - Wraps the store in parallel outer For loops over each output dimension.
  *
@@ -108,7 +108,7 @@ Stmt FinalizeReducerOpNode::Lower(const LowerArgs &T,
   }
   Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                         BufferLoad(buffer, indices_0)};
-  if (reducing_threads >= 32) {
+  if (reducing_threads / 2 >= TargetGetWarpSize(T.target)) {
     PrimExpr workspace =
         T.AddWorkspace(*as_const_int(T.thread_bounds->extent), buffer->dtype);
     thread_reduce_args.push_back(workspace);

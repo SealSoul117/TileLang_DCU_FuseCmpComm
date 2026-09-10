@@ -162,23 +162,56 @@ struct IdxenMatrixParams {
 
 class InfoCollector : public StmtExprVisitor {
  public:
+  explicit InfoCollector(const DCUCopyBufferMaps& maps) : maps_(maps) {}
   std::unordered_set<const VarNode*> a_dcu_res_vars;
   std::unordered_set<const VarNode*> b_dcu_res_vars;
 
  private:
+  std::optional<int> OperandForGlobal(const std::string& global_name) const {
+    if (auto use = LookupDCUUseIdxen(maps_, global_name)) {
+      if (!*use) {
+        return std::nullopt;
+      }
+    }
+    if (auto op = LookupDCUGemmOperand(maps_, global_name)) {
+      return op;
+    }
+    for (const auto& kv : maps_.use_idxen) {
+      if (!kv.second) {
+        continue;
+      }
+      if (SharedNameMatchesGlobal(kv.first, global_name) || kv.first == global_name) {
+        if (auto op = LookupDCUGemmOperand(maps_, kv.first)) {
+          return op;
+        }
+      }
+    }
+    if (IsABufferName(global_name)) {
+      return 0;
+    }
+    if (IsBBufferName(global_name)) {
+      return 1;
+    }
+    return std::nullopt;
+  }
+
   void VisitStmt_(const LetStmtNode* op) final {
     if (const auto* call = op->value.as<CallNode>()) {
       if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
         const std::string global_name = GetGlobalBufferName(call->args[0]);
-        if (IsABufferName(global_name)) {
-          a_dcu_res_vars.insert(op->var.get());
-        } else if (IsBBufferName(global_name)) {
-          b_dcu_res_vars.insert(op->var.get());
+        if (auto operand = OperandForGlobal(global_name)) {
+          if (*operand == 0) {
+            a_dcu_res_vars.insert(op->var.get());
+          } else if (*operand == 1) {
+            b_dcu_res_vars.insert(op->var.get());
+          }
         }
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
+
+  const DCUCopyBufferMaps& maps_;
 };
 
 PrimExpr StripCast(const PrimExpr& expr) {
@@ -340,12 +373,14 @@ IdxenMatrixParams BuildMatrixParams(bool enabled, int64_t k_dim, int elem_bytes,
 
 class IdxenInjector : public StmtExprMutator {
  public:
-  IdxenInjector(IdxenMatrixParams a_params, IdxenMatrixParams b_params)
-      : a_params_(std::move(a_params)), b_params_(std::move(b_params)) {}
+  IdxenInjector(IdxenMatrixParams a_params, IdxenMatrixParams b_params, DCUCopyBufferMaps maps)
+      : a_params_(std::move(a_params)),
+        b_params_(std::move(b_params)),
+        maps_(std::move(maps)) {}
 
   static PrimFunc Substitute(PrimFunc func, const IdxenMatrixParams& a_params,
-                             const IdxenMatrixParams& b_params) {
-    IdxenInjector mutator(a_params, b_params);
+                             const IdxenMatrixParams& b_params, DCUCopyBufferMaps maps) {
+    IdxenInjector mutator(a_params, b_params, std::move(maps));
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -408,10 +443,23 @@ class IdxenInjector : public StmtExprMutator {
     }
     const std::string global_name = GetGlobalBufferName(call->args[0]);
     const IdxenMatrixParams* params = nullptr;
-    if (IsABufferName(global_name)) {
-      params = a_params_.enabled ? &a_params_ : nullptr;
-    } else if (IsBBufferName(global_name)) {
-      params = b_params_.enabled ? &b_params_ : nullptr;
+    if (auto use = LookupDCUUseIdxen(maps_, global_name)) {
+      if (*use) {
+        if (auto operand = LookupDCUGemmOperand(maps_, global_name)) {
+          if (*operand == 0 && a_params_.enabled) {
+            params = &a_params_;
+          } else if (*operand == 1 && b_params_.enabled) {
+            params = &b_params_;
+          }
+        }
+      }
+    }
+    if (params == nullptr) {
+      if (IsABufferName(global_name)) {
+        params = a_params_.enabled ? &a_params_ : nullptr;
+      } else if (IsBBufferName(global_name)) {
+        params = b_params_.enabled ? &b_params_ : nullptr;
+      }
     }
     if (params == nullptr) {
       return GetRef<PrimExpr>(call);
@@ -476,6 +524,7 @@ class IdxenInjector : public StmtExprMutator {
 
   IdxenMatrixParams a_params_;
   IdxenMatrixParams b_params_;
+  DCUCopyBufferMaps maps_;
   arith::Analyzer analyzer_;
 };
 
@@ -512,10 +561,27 @@ bool HasAsyncCopyForVars(const Stmt& body, const std::unordered_set<const VarNod
 PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
   DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(func);
   DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(func);
-  const bool enable_a = NeedsDCUAsyncCopyIdxenForOperand(
-      flags, 0, LookupDCUNeedLayoutForOperand(maps, 0, true));
-  const bool enable_b = NeedsDCUAsyncCopyIdxenForOperand(
-      flags, 1, LookupDCUNeedLayoutForOperand(maps, 1, true));
+  bool enable_a = false;
+  bool enable_b = false;
+  if (!maps.use_idxen.empty()) {
+    for (const auto& kv : maps.use_idxen) {
+      if (!kv.second) {
+        continue;
+      }
+      if (auto operand = LookupDCUGemmOperand(maps, kv.first)) {
+        if (*operand == 0) {
+          enable_a = true;
+        } else if (*operand == 1) {
+          enable_b = true;
+        }
+      }
+    }
+  } else {
+    enable_a = NeedsDCUAsyncCopyIdxenForOperand(
+        flags, 0, LookupDCUNeedLayoutForOperand(maps, 0, true));
+    enable_b = NeedsDCUAsyncCopyIdxenForOperand(
+        flags, 1, LookupDCUNeedLayoutForOperand(maps, 1, true));
+  }
   if (!enable_a && !enable_b) {
     return func;
   }
@@ -526,7 +592,7 @@ PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
   }
   FillGemmDimInfoFromBufferMap(func, flags.trans_a, flags.trans_b, &dim_info);
 
-  InfoCollector collector;
+  InfoCollector collector(maps);
   collector(func->body);
 
   IdxenMatrixParams a_params =
@@ -560,7 +626,7 @@ PrimFunc InjectDCUAsyncCopyIdxenToFunc(PrimFunc func, const IRModule& mod) {
     b_params.enabled = false;
   }
 
-  return IdxenInjector::Substitute(std::move(func), a_params, b_params);
+  return IdxenInjector::Substitute(std::move(func), a_params, b_params, std::move(maps));
 }
 
 namespace transform {

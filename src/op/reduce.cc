@@ -170,9 +170,8 @@ std::string ReduceOpNode::MakeCodegenReducer() const {
  * - Performs iterator compression for local reduction loops using `analyzer`.
  * - Detects parallel thread splitting from the normalized iterator sum and
  *   emits a call to a templated `tl::AllReduce<...>::run` (or `run_hopper`)
- *   via `builtin::call_extern`. For sufficiently large reducing thread counts
- *   (>= 32) a workspace is allocated via T.AddWorkspace and passed to the
- *   AllReduce call.
+ *   via `builtin::call_extern`. Workspace is allocated only when AllReduce
+ *   actually stages through shared memory (reducing_threads/2 >= warp size).
  * - The final body is wrapped in parallel loops over the destination spatial
  *   dimensions and partitioned by the lowering thread variable. If a temporary
  *   clear buffer is used, it is allocated for the body.
@@ -320,7 +319,10 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         }
         Array<PrimExpr> thread_reduce_args = {
             StringImm(ss.str()), BufferLoad(clear_buffer, dst_indices)};
-        if (reducing_threads >= 32) {
+        // tl::AllReduce uses smem iff offset=threads/2 >= warpSize (32 CUDA / 64 DCU).
+        // A CUDA-centric `>= 32` would still allocate 256*4B=1KB on DCU warp-64
+        // reduces, overflowing 64KB LDS when Q+K already fill the cap (e.g. MHA dim=128).
+        if (reducing_threads / 2 >= TargetGetWarpSize(T.target)) {
           PrimExpr workspace = T.AddWorkspace(
               *as_const_int(T.thread_bounds->extent), clear_buffer->dtype);
           thread_reduce_args.push_back(workspace);

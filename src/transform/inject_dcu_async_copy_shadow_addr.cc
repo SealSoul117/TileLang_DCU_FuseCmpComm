@@ -184,6 +184,19 @@ const CallNode* ExtractDCUAsyncCopyFromStmt(const Stmt& stmt) {
   return nullptr;
 }
 
+PrimExpr SelectSplitAddr(const std::vector<Var>& addr_vars, const PrimExpr& loop_var) {
+  ICHECK(!addr_vars.empty());
+  if (addr_vars.size() == 1) {
+    return addr_vars[0];
+  }
+  PrimExpr idx = floormod(loop_var, make_const(loop_var.dtype(), static_cast<int>(addr_vars.size())));
+  PrimExpr result = addr_vars.back();
+  for (int i = static_cast<int>(addr_vars.size()) - 2; i >= 0; --i) {
+    result = if_then_else(idx == make_const(idx.dtype(), i), addr_vars[i], result);
+  }
+  return result;
+}
+
 bool IsThreadIdxXAttr(const AttrStmtNode* op, const IterVarNode** out_iv = nullptr) {
   if (op->attr_key != tir::attr::thread_extent) {
     return false;
@@ -524,6 +537,10 @@ class ShadowAddrInjector : public StmtExprMutator {
     if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 3) {
       return nullptr;
     }
+    // Already remapped to a per-sub shadow pointer; do not split again.
+    if (!IsBufDynShmem(call->args[0])) {
+      return nullptr;
+    }
     const ResEntry* entry = FindRes(call->args[2]);
     if (entry == nullptr || !entry->need_layout || entry->split_factor <= 1) {
       return nullptr;
@@ -531,7 +548,59 @@ class ShadowAddrInjector : public StmtExprMutator {
     return entry;
   }
 
-  Stmt SplitForWithAsyncCopy(const ForNode* op, const CallNode* copy_call, const ResEntry* entry) {
+  const ResEntry* FindSplitCopyInStmt(const Stmt& stmt) const {
+    if (const CallNode* copy_call = ExtractDCUAsyncCopyFromStmt(stmt)) {
+      return GetSplitResForCopy(copy_call);
+    }
+    if (const auto* seq = stmt.as<SeqStmtNode>()) {
+      const ResEntry* found = nullptr;
+      for (const Stmt& child : seq->seq) {
+        if (const ResEntry* entry = FindSplitCopyInStmt(child)) {
+          if (found != nullptr && found != entry) {
+            return nullptr;
+          }
+          found = entry;
+        }
+      }
+      return found;
+    }
+    if (const auto* attr = stmt.as<AttrStmtNode>()) {
+      return FindSplitCopyInStmt(attr->body);
+    }
+    return nullptr;
+  }
+
+  class SplitBodyRewriter : public StmtExprMutator {
+   public:
+    SplitBodyRewriter(Var loop_var, PrimExpr replacement, Var new_dst)
+        : loop_var_(std::move(loop_var)), replacement_(std::move(replacement)),
+          new_dst_(std::move(new_dst)) {}
+
+   private:
+    PrimExpr VisitExpr_(const VarNode* op) final {
+      if (op == loop_var_.get()) {
+        return replacement_;
+      }
+      return GetRef<PrimExpr>(op);
+    }
+
+    PrimExpr VisitExpr_(const CallNode* op) final {
+      PrimExpr rewritten = StmtExprMutator::VisitExpr_(op);
+      const auto* call = rewritten.as<CallNode>();
+      if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 3) {
+        return rewritten;
+      }
+      Array<PrimExpr> args = call->args;
+      args.Set(0, new_dst_);
+      return Call(call->dtype, call->op, args);
+    }
+
+    Var loop_var_;
+    PrimExpr replacement_;
+    Var new_dst_;
+  };
+
+  Stmt SplitForWithAsyncCopy(const ForNode* op, const ResEntry* entry) {
     const int split_factor = entry->split_factor;
     const std::vector<Var>& addr_vars = entry->addr_vars;
     ICHECK_EQ(static_cast<int>(addr_vars.size()), split_factor);
@@ -544,16 +613,15 @@ class ShadowAddrInjector : public StmtExprMutator {
 
     Array<Stmt> seq;
     for (int sub_idx = 0; sub_idx < split_factor; ++sub_idx) {
-      PrimExpr loop_replacement = op->loop_var * split_factor + sub_idx;
-      Array<PrimExpr> new_args = copy_call->args;
-      new_args.Set(0, addr_vars[sub_idx]);
-      for (size_t arg_idx = 1; arg_idx < new_args.size(); ++arg_idx) {
-        new_args.Set(arg_idx, ReplaceVar(new_args[arg_idx], op->loop_var, loop_replacement));
-      }
-      seq.push_back(Evaluate(Call(copy_call->dtype, copy_call->op, new_args)));
+      PrimExpr loop_replacement =
+          op->loop_var * make_const(op->loop_var.dtype(), split_factor) +
+          make_const(op->loop_var.dtype(), sub_idx);
+      SplitBodyRewriter rewriter(op->loop_var, loop_replacement, addr_vars[sub_idx]);
+      seq.push_back(rewriter(op->body));
     }
 
     Stmt new_body = seq.size() == 1 ? seq[0] : SeqStmt(seq);
+    new_body = VisitStmt(new_body);
     const int64_t new_extent = *extent_imm / split_factor;
     return For(op->loop_var, op->min, make_const(op->extent.dtype(), new_extent), op->kind,
                new_body, op->thread_binding, op->annotations);
@@ -576,6 +644,8 @@ class ShadowAddrInjector : public StmtExprMutator {
       new_base = plain_shared_addr_var_;
     } else if (entry->addr_vars.empty()) {
       return GetRef<PrimExpr>(op);
+    } else if (entry->split_factor > 1 && split_loop_var_.defined()) {
+      new_base = SelectSplitAddr(entry->addr_vars, split_loop_var_);
     } else {
       new_base = entry->addr_vars[0];
     }
@@ -586,11 +656,18 @@ class ShadowAddrInjector : public StmtExprMutator {
 
   Stmt VisitStmt_(const ForNode* op) final {
     if (shadow_injected_) {
-      if (const CallNode* copy_call = ExtractDCUAsyncCopyFromStmt(op->body)) {
-        if (const ResEntry* entry = GetSplitResForCopy(copy_call)) {
-          return SplitForWithAsyncCopy(op, copy_call, entry);
+      if (const ResEntry* entry = FindSplitCopyInStmt(op->body)) {
+        const auto extent_imm = GetConstInt(op->extent);
+        if (extent_imm.has_value() && *extent_imm % entry->split_factor == 0 &&
+            *extent_imm >= entry->split_factor) {
+          return SplitForWithAsyncCopy(op, entry);
         }
       }
+      Var old_split_loop_var = split_loop_var_;
+      split_loop_var_ = op->loop_var;
+      Stmt ret = StmtExprMutator::VisitStmt_(op);
+      split_loop_var_ = old_split_loop_var;
+      return ret;
     }
     return StmtExprMutator::VisitStmt_(op);
   }
@@ -630,6 +707,7 @@ class ShadowAddrInjector : public StmtExprMutator {
   Var warp_idx_var_;
   Var shmem_base_var_;
   Var plain_shared_addr_var_;
+  Var split_loop_var_;
   bool shadow_injected_{false};
 };
 

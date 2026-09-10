@@ -167,7 +167,7 @@ def mma0_kernel(
 
             loop_range = T.ceildiv(seq_kv, block_N)
 
-            for k in T.Pipelined(loop_range, num_stages=0):
+            for k in T.Pipelined(loop_range, num_stages=1):
                 MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
                 Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
                 Rescale(acc_o, scores_scale)
@@ -208,7 +208,7 @@ def main(
     K = torch.randn(batch, heads, seq_kv, dim, device="cuda", dtype=torch.float16)
     flops_per_matmul = 2.0 * batch * heads * seq_q * seq_kv * dim
     total_flops = 2 * flops_per_matmul
-    kernel = mma0_kernel(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=128, block_N=128, num_stages=4, threads=256)
+    kernel = mma0_kernel(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=64, block_N=64, num_stages=4, threads=256)
     
     print(kernel.get_kernel_source())
 
@@ -233,10 +233,10 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=1, help="batch size")
-    parser.add_argument("--heads", type=int, default=1, help="heads")
-    parser.add_argument("--seq_q", type=int, default=128, help="query sequence length")
-    parser.add_argument("--seq_kv", type=int, default=128, help="key/value sequence length")
-    parser.add_argument("--dim", type=int, default=32, help="dim")
+    parser.add_argument("--heads", type=int, default=32, help="heads")
+    parser.add_argument("--seq_q", type=int, default=512, help="query sequence length")
+    parser.add_argument("--seq_kv", type=int, default=512, help="key/value sequence length")
+    parser.add_argument("--dim", type=int, default=128, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal)

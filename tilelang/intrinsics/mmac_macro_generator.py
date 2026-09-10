@@ -43,8 +43,15 @@ from .mmac_layout import (
     shared_to_local_layout_A,
     shared_to_local_layout_B,
     shared_to_local_layout_B_simple,
+    shared_to_local_layout_A_simple,
+    shared_to_local_layout_A_swizzle,
+    shared_to_local_layout_B_swizzle,
     ki_shared_cvt,
-    LayoutConfig
+    xor_swizzle_col,
+    LayoutConfig,
+    LDS_SIMPLE,
+    LDS_SWIZZLE,
+    LDS_SLAB,
 )
 
 lift = convert
@@ -96,6 +103,8 @@ class MatrixCoreIntrinEmitter:
         thread_var: Var | None = None,
         enable_fast_lds: bool | None = False,
         transpose_C: bool = True,
+        a_lds_layout: int | None = None,
+        b_lds_layout: int | None = None,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -111,7 +120,13 @@ class MatrixCoreIntrinEmitter:
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
-        self.enable_fast_lds = enable_fast_lds
+        if a_lds_layout is None:
+            a_lds_layout = LDS_SLAB if enable_fast_lds else LDS_SIMPLE
+        if b_lds_layout is None:
+            b_lds_layout = LDS_SLAB if enable_fast_lds else LDS_SIMPLE
+        self.a_lds_layout = a_lds_layout
+        self.b_lds_layout = b_lds_layout
+        self.enable_fast_lds = b_lds_layout == LDS_SLAB
         
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
@@ -296,7 +311,7 @@ class MatrixCoreIntrinEmitter:
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
         layoutInfer = SharedToLocalLayoutA if micro_size_k == 16 else SharedToLocalKDim32LayoutA
-        layout_config = LayoutConfig(k_pack, self.block_row_warps, warp_rows, self.a_dtype)
+        layout_config = LayoutConfig(k_pack, self.block_row_warps, max(1, warp_rows), self.a_dtype)
         # legalize shared buffer to region
         A_region = self._legalize_to_buffer_region(A_shared_buf)
         A_buf = A_region.buffer
@@ -341,8 +356,21 @@ class MatrixCoreIntrinEmitter:
             else:
                 for i in T.serial(warp_rows):
                     for local_id in T.vectorized(k_pack * local_size_a):
-                        row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
-                        row, col = ki_shared_cvt(row, col + ki * m_dim * self.k_pack* micro_size_k, stride, new_stride)
+                        if self.a_lds_layout == LDS_SWIZZLE:
+                            row, col = shared_to_local_layout_A_swizzle(
+                                tx, local_id, warp_m, i, k_pack, self.block_row_warps)
+                            inner_dim = int(A_buf.shape[-1])
+                            row, col = xor_swizzle_col(
+                                row, col + ki * k_pack * micro_size_k,
+                                inner_dim, layout_config.type_size)
+                        elif self.a_lds_layout == LDS_SIMPLE:
+                            row, col = shared_to_local_layout_A_simple(
+                                tx, local_id, warp_m, i, k_pack, self.block_row_warps)
+                            row, col = row, col + ki * k_pack * micro_size_k
+                        else:
+                            row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
+                            row, col = ki_shared_cvt(
+                                row, col + ki * m_dim * self.k_pack * micro_size_k, stride, new_stride)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + row, A_base1 + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)      
@@ -361,8 +389,13 @@ class MatrixCoreIntrinEmitter:
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
         
         if not is_transposed:
-            if self.enable_fast_lds:
-                layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols // 2, self.b_dtype, not is_transposed)
+            if self.b_lds_layout != LDS_SIMPLE:
+                layout_config = LayoutConfig(
+                    k_pack, self.block_col_warps, max(1, warp_cols // 2),
+                    self.b_dtype, True)
+            else:
+                layout_config = LayoutConfig(
+                    k_pack, self.block_col_warps, max(1, warp_cols), self.b_dtype, True)
         else:
             layout_config = LayoutConfig(k_pack, self.block_col_warps, warp_cols, self.b_dtype)
         # legalize shared buffer to region
@@ -386,14 +419,39 @@ class MatrixCoreIntrinEmitter:
         ):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             if is_transposed:
+                inner_dim = int(B_buf.shape[-1])
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
-                        row, col = shared_to_local_layout_A(tx, local_id, warp_n, j, layout_config)
-                        row, col = ki_shared_cvt(row, col + ki * n_dim * self.k_pack* micro_size_k, stride, new_stride)
+                        if self.b_lds_layout == LDS_SWIZZLE:
+                            row, col = shared_to_local_layout_A_swizzle(
+                                tx, local_id, warp_n, j, k_pack, self.block_col_warps)
+                            row, col = xor_swizzle_col(
+                                row, col + ki * k_pack * micro_size_k,
+                                inner_dim, layout_config.type_size)
+                        elif self.b_lds_layout == LDS_SIMPLE:
+                            row, col = shared_to_local_layout_A_simple(
+                                tx, local_id, warp_n, j, k_pack, self.block_col_warps)
+                            row, col = row, col + ki * k_pack * micro_size_k
+                        else:
+                            row, col = shared_to_local_layout_A(
+                                tx, local_id, warp_n, j, layout_config)
+                            row, col = ki_shared_cvt(
+                                row, col + ki * n_dim * self.k_pack * micro_size_k,
+                                stride, new_stride)
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
 
             else:
-                if self.enable_fast_lds:
+                if self.b_lds_layout == LDS_SWIZZLE:
+                    inner_dim = int(B_buf.shape[-1])
+                    for j in T.serial(warp_cols):
+                        for local_id in T.vectorized(k_pack * local_size_b):
+                            row, col = shared_to_local_layout_B_simple(
+                                tx, local_id, warp_n, j, micro_size_y)
+                            row, col = xor_swizzle_col(
+                                row + ki * micro_size_k,
+                                col, inner_dim, layout_config.type_size)
+                            B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
+                elif self.b_lds_layout != LDS_SIMPLE:
                     for j in T.serial(warp_cols // 2):
                         for local_id in T.vectorized(2 * local_size_b):
                             row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
@@ -401,7 +459,8 @@ class MatrixCoreIntrinEmitter:
                 else:
                     for j in T.serial(warp_cols):
                         for local_id in T.vectorized(k_pack * local_size_b):
-                            row, col = shared_to_local_layout_B_simple(tx, local_id)
+                            row, col = shared_to_local_layout_B_simple(
+                                tx, local_id, warp_n, j, micro_size_y)
                             B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, kp, thread_binding, rk)
 
@@ -631,22 +690,34 @@ class MatrixCoreIntrinEmitter:
             warp_rows = self.warp_rows
             warp_size = self.WARP_SIZE
             is_m_first = self.is_m_first
-            data_byte = DataType(self.a_dtype).bits // 8
-            slab4_num = self.block_row_warps * self.warp_row_tiles * self.micro_size_k * self.k_pack // (
-                1024 // data_byte * 4)
-            micro_size_dcu_x = slab4_num * 16
+            data_byte = max(1, DataType(self.a_dtype).bits // 8)
+            slab4_elems = (1024 // data_byte) * 4
+            raw_slab4 = (self.block_row_warps * self.warp_row_tiles * self.micro_size_k *
+                         self.k_pack) // slab4_elems
+            if raw_slab4 < 1:
+                slab4_num = 1
+                micro_size_dcu_x = micro_size_x
+            else:
+                slab4_num = raw_slab4
+                micro_size_dcu_x = raw_slab4 * 16
             # K plays the role of store's N: one warp owns the full K extent.
             block_col_warps_k = 1
             warp_col_tiles_k = self.chunk
-            warp_cols_k = warp_col_tiles_k // micro_size_k
-            micro_size_dcu_k = 32
-            slab4_num_k = block_col_warps_k * warp_col_tiles_k * self.micro_size_k * self.k_pack // (
-                1024 // data_byte * 4)
-            if self.b_transposed:
+            warp_cols_k = max(1, warp_col_tiles_k // micro_size_k)
+            raw_slab4_k = (block_col_warps_k * warp_col_tiles_k * self.micro_size_k *
+                           self.k_pack) // slab4_elems
+            if warp_col_tiles_k < 32 or raw_slab4_k < 1:
+                slab4_num_k = 1
+                micro_size_dcu_k = micro_size_k
+            else:
+                slab4_num_k = max(1, raw_slab4_k)
+                micro_size_dcu_k = 32
+            if self.b_transposed and raw_slab4_k >= 1:
                 micro_size_dcu_k = slab4_num_k * 16
 
             def forward_thread_a(i: int, j: int) -> int:
-                warp_cols_dcu = warp_cols_k // (micro_size_dcu_k // micro_size_k)
+                k_group = max(1, micro_size_dcu_k // micro_size_k)
+                warp_cols_dcu = warp_cols_k // k_group
                 block_i = (i // micro_size_dcu_x) % block_row_warps
                 block_j = (j // micro_size_dcu_k) % block_col_warps_k
                 mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
@@ -658,20 +729,23 @@ class MatrixCoreIntrinEmitter:
             def forward_index_a(i: int, j: int) -> int:
                 warp_i = (i // micro_size_dcu_x) // block_row_warps
                 warp_j = j // micro_size_dcu_k // block_col_warps_k
-                warp_i_in_32_16 = (i // 16) % slab4_num
-                warp_j_in_32_16 = (j // 16) % 2
+                x_group = max(1, micro_size_dcu_x // micro_size_x)
+                k_group = max(1, micro_size_dcu_k // micro_size_k)
+                warp_i_in_32_16 = (i // 16) % x_group
+                warp_j_in_32_16 = (j // 16) % k_group
                 mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
                 _, local_id = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
                 return (
-                    warp_j * ((micro_size_dcu_k // micro_size_k) * local_size_a)
+                    warp_j * (k_group * local_size_a)
                     + warp_j_in_32_16 * local_size_a
                     + local_id
-                    + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x))
+                    + (warp_i + warp_i_in_32_16 * warp_rows // x_group)
                     * (warp_cols_k * local_size_a)
                 )
 
             def forward_thread_a_nt(i: int, j: int) -> int:
-                warp_cols_dcu = warp_cols_k // (micro_size_dcu_k // micro_size_k)
+                k_group = max(1, micro_size_dcu_k // micro_size_k)
+                warp_cols_dcu = warp_cols_k // k_group
                 block_i = (i // micro_size_dcu_x) % block_row_warps
                 block_j = (j // micro_size_dcu_k) % block_col_warps_k
                 mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
@@ -683,15 +757,17 @@ class MatrixCoreIntrinEmitter:
             def forward_index_a_nt(i: int, j: int) -> int:
                 warp_i = (i // micro_size_dcu_x) // block_row_warps
                 warp_j = j // micro_size_dcu_k // block_col_warps_k
-                warp_i_in_32_16 = (i // 16) % slab4_num
-                warp_j_in_32_16 = (j // 16) % slab4_num_k
+                x_group = max(1, micro_size_dcu_x // micro_size_x)
+                k_group = max(1, micro_size_dcu_k // micro_size_k)
+                warp_i_in_32_16 = (i // 16) % x_group
+                warp_j_in_32_16 = (j // 16) % k_group
                 mmac_i, mmac_j = i % micro_size_x, j % micro_size_k
                 _, local_id = inverse_mmac_load_layout.map_indices([mmac_i, mmac_j])
                 return (
-                    (warp_j + warp_j_in_32_16 * warp_cols_k // (micro_size_dcu_k // micro_size_k))
+                    (warp_j + warp_j_in_32_16 * warp_cols_k // k_group)
                     * local_size_a
                     + local_id
-                    + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x))
+                    + (warp_i + warp_i_in_32_16 * warp_rows // x_group)
                     * (warp_cols_k * local_size_a)
                 )
 
@@ -768,18 +844,37 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
-        data_byte = DataType(self.a_dtype).bits // 8
-        slab4_num = self.block_row_warps * self.warp_row_tiles * self.micro_size_k * self.k_pack // (1024 // data_byte * 4)
-        micro_size_dcu_x = slab4_num * 16
-        micro_size_dcu_y = 32
-        if self.b_transposed:
-            slab4_num_b = self.block_col_warps * self.warp_col_tiles * self.micro_size_k * self.k_pack // (1024 // data_byte * 4)
+        data_byte = max(1, DataType(self.a_dtype).bits // 8)
+        slab4_elems = (1024 // data_byte) * 4
+        raw_slab4 = (self.block_row_warps * self.warp_row_tiles * self.micro_size_k *
+                     self.k_pack) // slab4_elems
+        # Small tiles (e.g. 16x16) yield slab4_num=0 and i//0 in IndexMap inverse.
+        if raw_slab4 < 1:
+            slab4_num = 1
+            micro_size_dcu_x = micro_size_x
+        else:
+            slab4_num = raw_slab4
+            micro_size_dcu_x = raw_slab4 * 16
+        n_extent = self.block_col_warps * self.warp_col_tiles
+        raw_slab4_b = (n_extent * self.micro_size_k * self.k_pack) // slab4_elems
+        # 32-wide C grouping is only valid once a full 4-slab (N>=128) exists.
+        # N=64 still has n_extent>=32 but raw_slab4_b==0; using y=32 makes
+        # forward_index_nt permute 16-col tiles (0,8,4,12) while mmac writes
+        # them linearly (0,4,8,12), which breaks softmax on BM=BN=64.
+        if n_extent < 32 or raw_slab4_b < 1:
+            slab4_num_b = 1
+            micro_size_dcu_y = micro_size_y
+        else:
+            slab4_num_b = max(1, raw_slab4_b)
+            micro_size_dcu_y = 32
+        if self.b_transposed and raw_slab4_b >= 1:
             micro_size_dcu_y = slab4_num_b * 16
         def forward_thread(i: int, j: int) -> int:
             """
             Map fragment row `i` and column `j` to a thread index.
             """
-            warp_cols_dcu = warp_cols // (micro_size_dcu_y // micro_size_y)
+            y_group = max(1, micro_size_dcu_y // micro_size_y)
+            warp_cols_dcu = warp_cols // y_group
             block_i, block_j = (i // micro_size_dcu_x) % block_row_warps, (j // micro_size_dcu_y) % block_col_warps
             # (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
@@ -797,14 +892,16 @@ class MatrixCoreIntrinEmitter:
             Map fragment row `i` and column `j` to a local index within a thread's registers.
             """
             warp_i, warp_j = (i // micro_size_dcu_x) // block_row_warps, j // micro_size_dcu_y // block_col_warps
-            warp_i_in_32_16 = (i // 16) % slab4_num
-            warp_j_in_32_16 = (j // 16) % 2
+            x_group = max(1, micro_size_dcu_x // micro_size_x)
+            y_group = max(1, micro_size_dcu_y // micro_size_y)
+            warp_i_in_32_16 = (i // 16) % x_group
+            warp_j_in_32_16 = (j // 16) % y_group
             # (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
             
             # 使用 MMAC 的底层硬件逆映射获取局部偏移
             _, local_id = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
-            return warp_j * ((micro_size_dcu_y // micro_size_y) * local_size_out) + warp_j_in_32_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
+            return warp_j * (y_group * local_size_out) + warp_j_in_32_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // x_group) * (warp_cols * local_size_out)
             # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
 
         def forward_thread_nt(i: int, j: int) -> int:
@@ -824,7 +921,8 @@ class MatrixCoreIntrinEmitter:
             # else:
             #     thread_id = block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
             # return thread_id
-            warp_cols_dcu = warp_cols // (micro_size_dcu_y // micro_size_y)
+            y_group = max(1, micro_size_dcu_y // micro_size_y)
+            warp_cols_dcu = warp_cols // y_group
             block_i, block_j = (i // micro_size_dcu_x) % block_row_warps, (j // micro_size_dcu_y) % block_col_warps
             # (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
@@ -854,14 +952,16 @@ class MatrixCoreIntrinEmitter:
             # return warp_j_in_32_16 * (4 * local_size_out) + warp_j_in_64_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
             # # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
             warp_i, warp_j = (i // micro_size_dcu_x) // block_row_warps, j // micro_size_dcu_y // block_col_warps
-            warp_i_in_32_16 = (i // 16) % slab4_num
-            warp_j_in_32_16 = (j // 16) % slab4_num_b
+            x_group = max(1, micro_size_dcu_x // micro_size_x)
+            y_group = max(1, micro_size_dcu_y // micro_size_y)
+            warp_i_in_32_16 = (i // 16) % x_group
+            warp_j_in_32_16 = (j // 16) % y_group
             # (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             mmac_i, mmac_j = i % micro_size_x, j % micro_size_y
             
             # 使用 MMAC 的底层硬件逆映射获取局部偏移
             _, local_id = inverse_mmac_store_layout.map_indices([mmac_i, mmac_j])
-            return (warp_j + warp_j_in_32_16 * warp_cols // (micro_size_dcu_y // micro_size_y)) * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
+            return (warp_j + warp_j_in_32_16 * warp_cols // y_group) * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // x_group) * (warp_cols * local_size_out)
         # warp_j * ((16 // micro_size_y) * local_size_out) + warp_j_in_32_16 * local_size_out + local_id + (warp_i + warp_i_in_32_16 * warp_rows // (micro_size_dcu_x // micro_size_x)) * (warp_cols * local_size_out)
             # return warp_j * (warp_rows * local_size_out) * 2 + warp_i * local_size_out + local_id + warp_j_in_32_16 * local_size_out
 

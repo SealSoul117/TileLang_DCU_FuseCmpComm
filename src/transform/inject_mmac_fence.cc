@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/pipeline_attrs.h"
 #include "inject_utils.h"
 
 namespace tvm {
@@ -87,12 +88,31 @@ bool StmtIsDCUAsyncCopyRoot(const Stmt& stmt) {
             return StmtIsDCUAsyncCopyRoot(attr->body);
         }
     }
+    if (const auto* seq = stmt.as<SeqStmtNode>()) {
+        for (const Stmt& child : seq->seq) {
+            if (StmtIsDCUAsyncCopyRoot(child)) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
 Stmt MakeWaveBarrierStmt() {
     auto barrier_call = Call(DataType::Void(), Op::Get("tl.wave_barrier"), {});
     return Evaluate(barrier_call);
+}
+
+Stmt MakeSldFenceStmt(int wait_count) {
+    constexpr int kLgkmcntMax = 15;
+    if (wait_count < 0) {
+        wait_count = 0;
+    } else if (wait_count > kLgkmcntMax) {
+        wait_count = kLgkmcntMax;
+    }
+    auto fence_call =
+        Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"), {Integer(wait_count)});
+    return Evaluate(fence_call);
 }
 
 bool IsWaveBarrierStmt(const Stmt& stmt) {
@@ -557,8 +577,23 @@ class MMABarrierMutator : public StmtExprMutator {
 public:
     explicit MMABarrierMutator(const Stmt& root_body)
         : global_last_fence_mma_(ComputeGlobalLastFenceMMAStmt(root_body)),
-          epilogue_last_mma_(ComputeEpilogueLastMMAStmt(root_body)),
-          prefetch_barrier_plan_(ComputePrefetchBarrierPlan(root_body)) {}
+          epilogue_last_mma_(ComputeEpilogueLastMMAStmt(root_body)) {
+        bool skip_prefetch_barriers = false;
+        for (const ForNode* loop : CollectDCUMainLoops(root_body)) {
+            if (LoopHasRegisterPipeline(loop)) {
+                register_pipeline_ = true;
+            }
+            if (GetPipelineNumStages(loop) >= 2) {
+                skip_prefetch_barriers = true;
+            }
+        }
+        // Pipelined prologue A+B pair barriers come from InsertAsyncGldFence
+        // (one wave_barrier per commit pair). Prefetch-plan barriers land on
+        // the wrong copy (e.g. after A1/A3) and break that pairing.
+        if (!skip_prefetch_barriers) {
+            prefetch_barrier_plan_ = ComputePrefetchBarrierPlan(root_body);
+        }
+    }
 
     bool ContainsMMA(const Stmt& stmt) {
         bool found = false;
@@ -583,6 +618,7 @@ public:
         bool is_main_loop = IsDCUMainLoop(op);
         if (is_main_loop) {
             phase_ = PipelinePhase::kInMainLoop;
+            register_pipeline_ = LoopHasRegisterPipeline(op);
             ++inside_k_loop_depth_;
         }
         Stmt body = VisitStmt(op->body);
@@ -664,12 +700,28 @@ public:
         for (size_t i = 0; i < seq_op->seq.size(); ++i) {
             const auto& stmt = seq_op->seq[i];
 
+            if (const auto* for_op = stmt.as<ForNode>()) {
+                if (IsDCUMainLoop(for_op)) {
+                    emit_pending_g2s_barrier();
+                    // After prologue LDS, drain lgkmcnt before the K loop
+                    // (async_gld_sld_fence(0) + wave_barrier).
+                    if (register_pipeline_ && pending_load_count > 0 &&
+                        phase_ == PipelinePhase::kBeforeMainLoop) {
+                        new_seq.push_back(MakeSldFenceStmt(0));
+                        new_seq.push_back(MakeWaveBarrierStmt());
+                        pending_load_count = 0;
+                    }
+                    new_seq.push_back(this->VisitStmt(stmt));
+                    prev_stmt_is_dcu_async_copy = false;
+                    continue;
+                }
+            }
+
             if (ContainsMMA(stmt)) {
                 emit_pending_g2s_barrier();
                 if (pending_load_count > 0) {
                     int fence_val = pending_load_count;
                     if (phase_ == PipelinePhase::kAfterMainLoop) {
-                        // Epilogue reuses the previous async_gld_sld_fence value.
                         if (last_sld_fence_val_ > 0) {
                             fence_val = last_sld_fence_val_;
                         }
@@ -678,10 +730,7 @@ public:
                         fence_val = 0;
                     }
 
-                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"),
-                                           {Integer(fence_val)});
-                    new_seq.push_back(Evaluate(fence_call));
-                    // wave_barrier only pairs with async_gld_fence in the main loop.
+                    new_seq.push_back(MakeSldFenceStmt(fence_val));
                     if (phase_ != PipelinePhase::kAfterMainLoop) {
                         new_seq.push_back(MakeWaveBarrierStmt());
                     }
@@ -690,10 +739,7 @@ public:
                     pending_load_count = 0;
                 } else if (phase_ == PipelinePhase::kAfterMainLoop &&
                            epilogue_last_mma_.defined() && stmt.same_as(epilogue_last_mma_)) {
-                    // Final epilogue drain: sld_fence(0) before the last mmac.
-                    auto fence_call = Call(DataType::Void(), Op::Get("tl.async_gld_sld_fence"),
-                                           {Integer(0)});
-                    new_seq.push_back(Evaluate(fence_call));
+                    new_seq.push_back(MakeSldFenceStmt(0));
                 }
                 new_seq.push_back(this->VisitStmt(stmt));
                 prev_stmt_is_dcu_async_copy = false;
@@ -784,6 +830,7 @@ private:
     PipelinePhase phase_{PipelinePhase::kBeforeMainLoop};
     int inside_k_loop_depth_ = 0;
     int last_sld_fence_val_ = 0;
+    bool register_pipeline_ = false;
 };
 
 namespace transform {

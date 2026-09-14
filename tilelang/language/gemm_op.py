@@ -23,13 +23,15 @@ class DCULdsLayout:
     AUTO picks per-operand from tile size:
       SIMPLE  — tile too small for ds_read_m32x16 (e.g. 16x16); sequential G→LDS, no shadow
       SWIZZLE — ds_read ok but slabs < 4 (e.g. 16x32); XOR bank swizzle, no shadow
-      SLAB    — slabs >= 4; warp shadow offsets + rewind
+      SLAB    — slabs >= 4; warp shadow offsets + staged rewind
+      REWIND  — hygon AT/BN + AN/BT formal storage (async / ds_read); extra to SLAB
     """
 
     AUTO = 0
     SIMPLE = 1
     SWIZZLE = 2
     SLAB = 3
+    REWIND = 4
 
     _ALIASES = {
         "auto": AUTO,
@@ -40,6 +42,9 @@ class DCULdsLayout:
         "xor": SWIZZLE,
         "slab": SLAB,
         "shadow": SLAB,
+        "rewind": REWIND,
+        "at_bn": REWIND,
+        "an_bt": REWIND,
     }
 
     @classmethod

@@ -94,6 +94,9 @@ struct DCUAsyncCopyParams {
   int k_dim{0};        // BK of this shared tile
   int mn_dim{0};       // the non-K shared extent (BM or BN)
   int k_axis{1};       // 0 if K is dst shape[0], 1 if K is dst shape[1]
+  int block_threads{0};
+  int warp_mn_count{0};
+  int operand_mn_atom{0};
 };
 
 /*!
@@ -278,6 +281,15 @@ protected:
    */
   For MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
                                 const DCUAsyncCopyParams &params) const;
+
+  /*!
+   * \brief G→LDS copy with hygon AT/BN (K-inner) / AN/BT (K-outer) storage.
+   *
+   * Writes src[logical] → dst[storage(logical)]. No warp-shadow. Returns
+   * NullOpt if the tile cannot form a rewind geom (caller falls back).
+   */
+  Optional<For> MakeDCURewindSIMTLoop(arith::Analyzer *analyzer,
+                                      const DCUAsyncCopyParams &params) const;
 
   /*!
    * \brief Compute linear layout for tma copy.

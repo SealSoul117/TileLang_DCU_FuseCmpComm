@@ -17,7 +17,7 @@ from tilelang.transform.simplify import _Simplify
 
 
 def _resolve_dcu_lds_layouts(gemm, thread_nums: int):
-    """Per-operand SIMPLE / SWIZZLE / SLAB, matching copy.cc heuristics."""
+    """Per-operand SIMPLE / SWIZZLE / SLAB / REWIND, matching copy.cc heuristics."""
     user_mode = gemm.lds_layout
     k_pack = int(gemm.k_pack or 1)
     elem = dtype_elem_bytes(gemm.in_dtype)

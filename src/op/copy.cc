@@ -22,6 +22,8 @@
 #include "../target/utils.h"
 #include "builtin.h"
 #include "gemm.h"
+#include <algorithm>
+#include <numeric>
 #include <optional>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
@@ -722,6 +724,401 @@ For CopyNode::MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
   for (int i = loop_vars.size() - 1; i >= 0; i--) {
     Map<String, ObjectRef> annotations = {};
     if (coalesced_width.defined()) annotations.Set("coalesced_width", coalesced_width);
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent, ForKind::kParallel,
+               body, std::nullopt, annotations);
+  }
+  return Downcast<For>(body);
+}
+
+namespace {
+
+constexpr int kRewindWarpSize = 64;
+constexpr int kRewindBankCount = 32;
+constexpr int kRewindBankWidthBytes = 4;
+constexpr int kRewindDsReadTileK = 16;
+constexpr int kRewindDsReadPanelN = 32;
+constexpr int kRewindDsReadBytesPerLane = 16;
+constexpr int kRewindAnBtWrapStep = 64;
+constexpr int kRewindAnBtWrapCount = 2;
+constexpr int kRewindB128WrapStep = 32;
+constexpr int kRewindLdsIssueBytes = 128;
+constexpr int kRewindWrapGranularityDwords = 8;
+constexpr int kRewindMaxWrapOffsetDwords = 24;
+constexpr int kRewindMmacK = 16;
+
+bool RewindIsPow2(int value) { return value > 0 && (value & (value - 1)) == 0; }
+
+int RewindCopyTxnBytes(int bytes_per_row, int copy_bytes_per_lane,
+                       int element_bytes) {
+  if (bytes_per_row <= 0 || copy_bytes_per_lane <= 0 || element_bytes <= 0) {
+    return 0;
+  }
+  for (int txn : {16, 8, 4}) {
+    if (txn % element_bytes == 0 && bytes_per_row % txn == 0 &&
+        copy_bytes_per_lane % txn == 0) {
+      return txn;
+    }
+  }
+  return 0;
+}
+
+bool RewindLegalWrap(int wrap_step_bytes, int wrap_count, int num_waves) {
+  if (!RewindIsPow2(wrap_count) || wrap_count > num_waves ||
+      num_waves % wrap_count != 0) {
+    return false;
+  }
+  if (wrap_count == 1) {
+    return wrap_step_bytes == 0;
+  }
+  if (wrap_step_bytes <= 0 || wrap_step_bytes % 4 != 0) {
+    return false;
+  }
+  const int off = wrap_step_bytes / 4;
+  if (off % kRewindWrapGranularityDwords != 0) {
+    return false;
+  }
+  return off * (wrap_count - 1) <= kRewindMaxWrapOffsetDwords;
+}
+
+struct AtBnRewindGeomC {
+  int block_mn{0};
+  int block_k{0};
+  int block_threads{0};
+  int element_bytes{0};
+  int copy_elements_per_lane{0};
+  int copy_segments_per_row{0};
+  int row_period{0};
+  int rows_per_copy_warp_transaction{0};
+  int rows_per_copy_transaction{0};
+  int wrap_offset{0};
+  int wrap_idx_mask{0};
+};
+
+struct AnBtRewindGeomC {
+  int block_k{0};
+  int block_mn{0};
+  int block_threads{0};
+  int element_bytes{0};
+  int copy_elements_per_lane{0};
+  int copy_segments_per_row{0};
+  int read_bytes_per_lane{0};
+  int wrap_offset{0};
+  int wrap_idx_mask{0};
+  bool permute_rows{false};
+  int rows_per_copy_wave{0};
+};
+
+bool TryAtBnRewindGeom(const DCUAsyncCopyParams &params, AtBnRewindGeomC *out) {
+  const int block_mn = params.mn_dim;
+  const int block_k = params.k_dim;
+  const int block_threads = params.block_threads;
+  const int element_bytes = params.dtype.bytes();
+  const int warp_mn_count = params.warp_mn_count;
+  const int operand_mn_atom = params.operand_mn_atom;
+  const int k_pack = params.k_pack > 0 ? params.k_pack : 1;
+  if (block_mn <= 0 || block_k <= 0 || block_threads <= 0 || element_bytes <= 0 ||
+      warp_mn_count <= 0 || operand_mn_atom <= 0 || k_pack <= 0) {
+    return false;
+  }
+  if (block_threads % kRewindWarpSize != 0 || !RewindIsPow2(warp_mn_count) ||
+      block_k % kRewindMmacK != 0 || block_mn % warp_mn_count != 0) {
+    return false;
+  }
+  const int packed = operand_mn_atom * kRewindMmacK * k_pack;
+  if (packed % kRewindWarpSize != 0) {
+    return false;
+  }
+  const int read_bytes = packed / kRewindWarpSize * element_bytes;
+  const int row_bytes = block_k * element_bytes;
+  if (read_bytes <= 0 || row_bytes % read_bytes != 0) {
+    return false;
+  }
+  int issue_lanes = 0;
+  if (read_bytes == kRewindDsReadBytesPerLane) {
+    issue_lanes = 4;
+  } else if (read_bytes > 0 && kRewindLdsIssueBytes % read_bytes == 0) {
+    issue_lanes = kRewindLdsIssueBytes / read_bytes;
+  } else {
+    return false;
+  }
+  if (issue_lanes <= 0 || kRewindWarpSize % issue_lanes != 0 ||
+      row_bytes % kRewindBankWidthBytes != 0) {
+    return false;
+  }
+  const int row_bank_stride = row_bytes / kRewindBankWidthBytes;
+  const int row_period =
+      kRewindBankCount / std::gcd(kRewindBankCount, row_bank_stride);
+  if (row_period <= 0) {
+    return false;
+  }
+  int required_wrap = 0;
+  if (row_period >= issue_lanes) {
+    required_wrap = 1;
+  } else if (issue_lanes % row_period == 0) {
+    required_wrap = issue_lanes / row_period;
+  } else {
+    return false;
+  }
+  const int tile_bytes = block_mn * block_k * element_bytes;
+  if (tile_bytes % block_threads != 0) {
+    return false;
+  }
+  const int copy_bytes = tile_bytes / block_threads;
+  const int txn = RewindCopyTxnBytes(row_bytes, copy_bytes, element_bytes);
+  if (txn < 4) {
+    return false;
+  }
+  const int segs = row_bytes / txn;
+  if (segs <= 0 || kRewindWarpSize % segs != 0) {
+    return false;
+  }
+  const int copy_warps = block_threads / kRewindWarpSize;
+  const bool b128 = read_bytes == kRewindDsReadBytesPerLane;
+  const int wrap_count = b128 ? required_wrap : std::max(warp_mn_count, required_wrap);
+  if (!RewindIsPow2(wrap_count) || wrap_count > copy_warps) {
+    return false;
+  }
+  int wrap_step = 0;
+  int wrap_offset = 0;
+  if (wrap_count == 1) {
+    wrap_step = 0;
+    wrap_offset = 0;
+  } else if (b128) {
+    wrap_step = kRewindB128WrapStep;
+    wrap_offset = kRewindB128WrapStep / 4;
+  } else {
+    return false;
+  }
+  if (!RewindLegalWrap(wrap_step, wrap_count, copy_warps)) {
+    return false;
+  }
+  const int rows_per_copy_warp_txn = kRewindWarpSize / segs;
+  if (block_mn % row_period != 0 || rows_per_copy_warp_txn % row_period != 0 ||
+      operand_mn_atom % row_period != 0) {
+    return false;
+  }
+  *out = AtBnRewindGeomC{block_mn,
+                         block_k,
+                         block_threads,
+                         element_bytes,
+                         txn / element_bytes,
+                         segs,
+                         row_period,
+                         rows_per_copy_warp_txn,
+                         block_threads / segs,
+                         wrap_offset,
+                         wrap_count - 1};
+  return true;
+}
+
+bool TryAnBtRewindGeom(const DCUAsyncCopyParams &params, AnBtRewindGeomC *out) {
+  const int block_k = params.k_dim;
+  const int block_mn = params.mn_dim;
+  const int block_threads = params.block_threads;
+  const int element_bytes = params.dtype.bytes();
+  if (block_k <= 0 || block_mn <= 0 || block_threads <= 0 || element_bytes != 2 ||
+      block_k % kRewindDsReadTileK != 0 || block_mn % kRewindDsReadPanelN != 0 ||
+      !RewindIsPow2(block_k) || !RewindIsPow2(block_mn) ||
+      block_threads % kRewindWarpSize != 0) {
+    return false;
+  }
+  const int tile_bytes = block_k * block_mn * element_bytes;
+  if (tile_bytes % block_threads != 0) {
+    return false;
+  }
+  const int copy_bytes = tile_bytes / block_threads;
+  const int bytes_per_row = block_mn * element_bytes;
+  const int txn = RewindCopyTxnBytes(bytes_per_row, copy_bytes, element_bytes);
+  if (txn < 4 || kRewindDsReadBytesPerLane % txn != 0) {
+    return false;
+  }
+  const int copy_elements = txn / element_bytes;
+  const int segs = block_mn / copy_elements;
+  const int segments_per_row = bytes_per_row / txn;
+  const int rows_per_copy_wave =
+      kRewindWarpSize / std::gcd(segments_per_row, kRewindWarpSize);
+  bool permute_rows = false;
+  int wrap_offset = 0;
+  int wrap_idx_mask = 0;
+  if (bytes_per_row >= kRewindBankCount * kRewindBankWidthBytes) {
+    const int wrap_count = kRewindAnBtWrapCount;
+    if (rows_per_copy_wave * wrap_count > kRewindDsReadTileK ||
+        kRewindDsReadTileK % (rows_per_copy_wave * wrap_count) != 0) {
+      return false;
+    }
+    if (!RewindLegalWrap(kRewindAnBtWrapStep, wrap_count,
+                         block_threads / kRewindWarpSize)) {
+      return false;
+    }
+    permute_rows = true;
+    wrap_offset = kRewindAnBtWrapStep / 4;
+    wrap_idx_mask = wrap_count - 1;
+  }
+  *out = AnBtRewindGeomC{block_k,
+                         block_mn,
+                         block_threads,
+                         element_bytes,
+                         copy_elements,
+                         segs,
+                         kRewindDsReadBytesPerLane,
+                         wrap_offset,
+                         wrap_idx_mask,
+                         permute_rows,
+                         rows_per_copy_wave};
+  return true;
+}
+
+PrimExpr AtBnRowPermuteC(const PrimExpr &row, const AtBnRewindGeomC &geom) {
+  if (geom.wrap_idx_mask == 0) {
+    return row;
+  }
+  const int copy_warps = geom.block_threads / kRewindWarpSize;
+  const int groups_per_copy_warp =
+      geom.rows_per_copy_warp_transaction / geom.row_period;
+  PrimExpr row_group = floordiv(row, Integer(geom.row_period));
+  PrimExpr inner = floormod(row, Integer(geom.row_period));
+  PrimExpr copy_warp = floormod(row_group, Integer(copy_warps));
+  PrimExpr group_round = floordiv(row_group, Integer(copy_warps));
+  return floordiv(group_round, Integer(groups_per_copy_warp)) *
+             Integer(geom.rows_per_copy_transaction) +
+         copy_warp * Integer(geom.rows_per_copy_warp_transaction) +
+         floormod(group_round, Integer(groups_per_copy_warp)) *
+             Integer(geom.row_period) +
+         inner;
+}
+
+void AtBnStorageMapC(const PrimExpr &row, const PrimExpr &col,
+                     const AtBnRewindGeomC &geom, PrimExpr *out_row,
+                     PrimExpr *out_col) {
+  PrimExpr mapped_row = AtBnRowPermuteC(row, geom);
+  PrimExpr segment = mapped_row * Integer(geom.copy_segments_per_row) +
+                     floordiv(col, Integer(geom.copy_elements_per_lane));
+  PrimExpr transaction = floordiv(segment, Integer(geom.block_threads));
+  PrimExpr thread = floormod(segment, Integer(geom.block_threads));
+  PrimExpr copy_warp = floordiv(thread, Integer(kRewindWarpSize));
+  PrimExpr lane = floormod(thread, Integer(kRewindWarpSize));
+  const int e_per_dword = 4 / geom.element_bytes;
+  PrimExpr wrap_cur = floormod(copy_warp, Integer(geom.wrap_idx_mask + 1)) *
+                      Integer(geom.wrap_offset);
+  PrimExpr wave = lane * Integer(geom.copy_elements_per_lane) +
+                  floormod(col, Integer(geom.copy_elements_per_lane));
+  const int span = kRewindWarpSize * geom.copy_elements_per_lane;
+  PrimExpr phys_wave =
+      floormod(wave + wrap_cur * Integer(e_per_dword), Integer(span));
+  PrimExpr linear =
+      (transaction * Integer(geom.block_threads) +
+       copy_warp * Integer(kRewindWarpSize)) *
+          Integer(geom.copy_elements_per_lane) +
+      phys_wave;
+  *out_row = floordiv(linear, Integer(geom.block_k));
+  *out_col = floormod(linear, Integer(geom.block_k));
+}
+
+void AnBtStorageMapC(const PrimExpr &k, const PrimExpr &n,
+                     const AnBtRewindGeomC &geom, PrimExpr *out_k,
+                     PrimExpr *out_n) {
+  PrimExpr mapped_k_inner = floormod(k, Integer(kRewindDsReadTileK));
+  if (geom.permute_rows) {
+    const int wrap_count = geom.wrap_idx_mask + 1;
+    PrimExpr k_inner = mapped_k_inner;
+    PrimExpr row_pair = floordiv(k_inner, Integer(wrap_count));
+    PrimExpr wrap_class = floormod(k_inner, Integer(wrap_count));
+    const int rp = geom.rows_per_copy_wave;
+    mapped_k_inner = floordiv(row_pair, Integer(rp)) * Integer(wrap_count * rp) +
+                     wrap_class * Integer(rp) + floormod(row_pair, Integer(rp));
+  }
+  PrimExpr mapped_k = floordiv(k, Integer(kRewindDsReadTileK)) *
+                          Integer(kRewindDsReadTileK) +
+                      mapped_k_inner;
+  const int read_elems = geom.read_bytes_per_lane / geom.element_bytes;
+  PrimExpr pack_start =
+      floordiv(n, Integer(read_elems)) * Integer(read_elems);
+  PrimExpr n_segment = floordiv(pack_start, Integer(geom.copy_elements_per_lane));
+  PrimExpr canonical =
+      mapped_k * Integer(geom.copy_segments_per_row) + n_segment;
+  PrimExpr transaction = floordiv(canonical, Integer(geom.block_threads));
+  PrimExpr thread = floormod(canonical, Integer(geom.block_threads));
+  PrimExpr intra = floormod(pack_start, Integer(geom.copy_elements_per_lane));
+  PrimExpr copy_warp = floordiv(thread, Integer(kRewindWarpSize));
+  PrimExpr copy_lane = floormod(thread, Integer(kRewindWarpSize));
+  const int e_per_dword = 4 / geom.element_bytes;
+  PrimExpr wrap_dwords = floormod(copy_warp, Integer(geom.wrap_idx_mask + 1)) *
+                         Integer(geom.wrap_offset);
+  PrimExpr wave = copy_lane * Integer(geom.copy_elements_per_lane) + intra;
+  const int span = kRewindWarpSize * geom.copy_elements_per_lane;
+  PrimExpr phys_wave =
+      floormod(wave + wrap_dwords * Integer(e_per_dword), Integer(span));
+  PrimExpr pack_base =
+      (transaction * Integer(geom.block_threads) +
+       copy_warp * Integer(kRewindWarpSize)) *
+          Integer(geom.copy_elements_per_lane) +
+      phys_wave;
+  *out_k = floordiv(pack_base, Integer(geom.block_mn));
+  *out_n = floormod(pack_base, Integer(geom.block_mn)) +
+           floormod(n, Integer(read_elems));
+}
+
+Array<PrimExpr> DCURewindDstIndices(const CopyNode *op, const PrimExpr &i_map,
+                                    const PrimExpr &j_map,
+                                    const Array<IterVar> &loop_vars) {
+  Array<PrimExpr> dst_indices;
+  size_t idx_in_vars = 0;
+  for (size_t i = 0; i < op->dst_range.size(); ++i) {
+    if (is_one(op->dst_range[i]->extent)) {
+      dst_indices.push_back(op->dst_range[i]->min);
+    } else {
+      if (idx_in_vars == 0) {
+        dst_indices.push_back(op->dst_range[i]->min + i_map);
+      } else if (idx_in_vars == 1) {
+        dst_indices.push_back(op->dst_range[i]->min + j_map);
+      } else {
+        dst_indices.push_back(op->dst_range[i]->min +
+                              loop_vars[idx_in_vars]->var);
+      }
+      idx_in_vars++;
+    }
+  }
+  return dst_indices;
+}
+
+}  // namespace
+
+Optional<For> CopyNode::MakeDCURewindSIMTLoop(
+    arith::Analyzer *analyzer, const DCUAsyncCopyParams &params) const {
+  Array<IterVar> loop_vars = MakeIterVars();
+  for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
+  ICHECK_GE(loop_vars.size(), 2) << "rewind copy requires a 2D tile";
+  PrimExpr i_raw = loop_vars[0]->var;
+  PrimExpr j_raw = loop_vars[1]->var;
+  PrimExpr i_map = i_raw;
+  PrimExpr j_map = j_raw;
+
+  if (params.k_axis == 1) {
+    AtBnRewindGeomC geom;
+    if (!TryAtBnRewindGeom(params, &geom)) {
+      return Optional<For>();
+    }
+    AtBnStorageMapC(i_raw, j_raw, geom, &i_map, &j_map);
+  } else {
+    ICHECK_EQ(params.k_axis, 0);
+    AnBtRewindGeomC geom;
+    if (!TryAnBtRewindGeom(params, &geom)) {
+      return Optional<For>();
+    }
+    AnBtStorageMapC(i_raw, j_raw, geom, &i_map, &j_map);
+  }
+  i_map = analyzer->Simplify(i_map);
+  j_map = analyzer->Simplify(j_map);
+
+  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
+  Array<PrimExpr> dst_indices = DCURewindDstIndices(this, i_map, j_map, loop_vars);
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
+  Stmt body = BufferStore(dst, value, dst_indices);
+  for (int i = loop_vars.size() - 1; i >= 0; i--) {
+    Map<String, ObjectRef> annotations = {};
+    if (coalesced_width.defined())
+      annotations.Set("coalesced_width", coalesced_width);
     body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent, ForKind::kParallel,
                body, std::nullopt, annotations);
   }
@@ -1434,7 +1831,7 @@ struct DCUAsyncCopyGemmInfo {
   // BK from the shared tile on the gemm reduce axis.
   Optional<PrimExpr> k_dim;
   int k_axis{1};
-  // 0 = auto, 1 = simple, 2 = xor-swizzle, 3 = slab/shadow.
+  // 0 = auto, 1 = simple, 2 = xor-swizzle, 3 = slab/shadow, 4 = rewind.
   int lds_layout{0};
   bool trans_a{false};
   bool trans_b{false};
@@ -1643,6 +2040,19 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
       copy_params.warp_num = warp_num;
       copy_params.k_pack = k_pack;
       copy_params.k_axis = gemm_k_axis;
+      if (const auto *thr = total_threads.as<IntImmNode>()) {
+        copy_params.block_threads = static_cast<int>(thr->value);
+      }
+      if (gemm_info.warp_count.has_value()) {
+        copy_params.warp_mn_count = gemm_info.warp_count.value();
+      } else if (const auto *wn = warp_num.as<IntImmNode>()) {
+        copy_params.warp_mn_count = static_cast<int>(wn->value);
+      }
+      if (copy_params.warp_mn_count > 0 &&
+          copy_params.mn_dim % copy_params.warp_mn_count == 0) {
+        copy_params.operand_mn_atom =
+            copy_params.mn_dim / copy_params.warp_mn_count;
+      }
       if (gemm_k_dim.defined()) {
         const auto* k_imm = gemm_k_dim.value().as<IntImmNode>();
         ICHECK(k_imm) << "k_dim must be a constant for DCU async copy mapping";
@@ -1689,6 +2099,24 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
         need_layout = true;
         need_shadow = false;
         simt_loop = MakeDCUXorSwizzleSIMTLoop(analyzer, copy_params);
+      } else if (lds_mode == 4) {
+        need_layout = true;
+        need_shadow = false;
+        Optional<For> rewind_loop =
+            MakeDCURewindSIMTLoop(analyzer, copy_params);
+        if (rewind_loop.defined()) {
+          simt_loop = rewind_loop.value();
+        } else {
+          need_shadow = true;
+          if (copy_params.k_axis == 0) {
+            simt_loop = MakeDCUColAsyncSIMTLoop(analyzer, copy_params);
+          } else {
+            ICHECK_EQ(copy_params.k_axis, 1)
+                << "k_axis must be 0 (K on dim0 / col) or 1 (K on dim1 / row), got "
+                << copy_params.k_axis;
+            simt_loop = MakeDCURowAsyncSIMTLoop(analyzer, copy_params);
+          }
+        }
       } else {
         need_layout = true;
         need_shadow = true;

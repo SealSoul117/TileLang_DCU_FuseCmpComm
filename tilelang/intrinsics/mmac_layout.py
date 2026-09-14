@@ -1,9 +1,8 @@
 # from tvm import DataType
 # from tvm.runtime import convert
-import tilelang.language as T
-
-
 from dataclasses import dataclass
+
+import tilelang.language as T
 
 @dataclass(frozen=True)
 class SharedToLocalKDim32LayoutA:
@@ -169,8 +168,8 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
     
     if layout_config.slabs < 4:
         return row, col
-    
-    # rewind
+
+    # rewind (legacy staged path: per-lane overflow). Prefer LDS_REWIND.
     new_col = (((row % layout_config.row_per_4slab) // layout_config.row_per_slab) * layout_config.padding_num + col) % (layout_config.micro_n * layout_config.k_pack)
     row = (((row % layout_config.row_per_4slab) // layout_config.row_per_slab) * layout_config.padding_num + col) // (layout_config.micro_n * layout_config.k_pack) + row
     if layout_config.k_pack == 1:
@@ -179,7 +178,7 @@ def shared_to_local_layout_A(tx, local_id, warp_m, idx, layout_config):
         select_thread = (tx == 31) | (tx == 45) | (tx == 47) | (tx == 59) | (tx == 61) | (tx == 63)
     else:
         assert False
-    
+
     cond = select_thread & (warp_m == (layout_config.warp_num - 1)) & ((idx % layout_config.intra_iter_num) == (layout_config.intra_iter_num - 1))
     row = row - layout_config.row_per_slab * cond
     return row, new_col
@@ -196,6 +195,8 @@ LDS_AUTO = 0
 LDS_SIMPLE = 1
 LDS_SWIZZLE = 2
 LDS_SLAB = 3
+# Formal AT/BN + AN/BT storage (hygon async/vector-load). Extra to SLAB.
+LDS_REWIND = 4
 
 
 def dtype_elem_bytes(dtype):
@@ -246,12 +247,12 @@ def xor_swizzle_col(row, col, inner_dim, type_size, vec_bytes=16):
 
 
 def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1):
-    """Select SIMPLE / SWIZZLE / SLAB. ``user_mode`` 0 means AUTO.
+    """Select SIMPLE / SWIZZLE / SLAB / REWIND. ``user_mode`` 0 means AUTO.
 
     SIMPLE when the operand cannot use ds_read_m32x16:
       B NT (k_axis=0): N < 32;  A / B-T (k_axis=1): MN <= 16.
     Forced SWIZZLE/SLAB on a too-small tile degrades (SLAB also degrades
-    when slabs < 4).
+    when slabs < 4). REWIND is opt-in and keeps the hygon AT/BN + AN/BT map.
     """
     too_small = (mn_dim < 32) if k_axis == 0 else (mn_dim * k_pack <= 16)
     if user_mode == LDS_SIMPLE:
@@ -260,6 +261,8 @@ def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1):
         return LDS_SIMPLE
     if user_mode == LDS_SWIZZLE:
         return LDS_SWIZZLE
+    if user_mode == LDS_REWIND:
+        return LDS_REWIND
     if user_mode == LDS_SLAB:
         return LDS_SWIZZLE if slabs < 4 else LDS_SLAB
     if slabs < 4:
@@ -375,8 +378,8 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
     
     if layout_config.slabs < 4:
         return row, col
-    
-    # rewind
+
+    # rewind (legacy staged path: per-lane overflow). Prefer LDS_REWIND.
     col = (((row % layout_config.row_per_2slab) // layout_config.row_per_slab) * layout_config.padding_num + col)
     new_col = col % layout_config.row_num
     row = row + col // layout_config.row_num
@@ -386,6 +389,8 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
         select_thread = (((tx % 32) >> 2) == 7)
     elif layout_config.row_num == 64:
         select_thread = ((tx >> 2) == 15)
+    else:
+        select_thread = 0
     cond = select_thread & (warp_n == (layout_config.warp_num - 1)) & (idx == (layout_config.iter_num - 1))
     row = row - layout_config.row_per_slab * cond
     return row, new_col

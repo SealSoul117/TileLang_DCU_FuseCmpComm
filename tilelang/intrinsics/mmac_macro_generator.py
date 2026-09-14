@@ -49,9 +49,17 @@ from .mmac_layout import (
     ki_shared_cvt,
     xor_swizzle_col,
     LayoutConfig,
+    dtype_elem_bytes,
     LDS_SIMPLE,
     LDS_SWIZZLE,
     LDS_SLAB,
+    LDS_REWIND,
+)
+from .dcu_lds_rewind import (
+    AnBtRewindGeom,
+    AtBnRewindGeom,
+    shared_to_local_rewind_an_bt,
+    shared_to_local_rewind_at_bn,
 )
 
 lift = convert
@@ -126,7 +134,7 @@ class MatrixCoreIntrinEmitter:
             b_lds_layout = LDS_SLAB if enable_fast_lds else LDS_SIMPLE
         self.a_lds_layout = a_lds_layout
         self.b_lds_layout = b_lds_layout
-        self.enable_fast_lds = b_lds_layout == LDS_SLAB
+        self.enable_fast_lds = b_lds_layout in (LDS_SLAB, LDS_REWIND)
         
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
@@ -294,8 +302,30 @@ class MatrixCoreIntrinEmitter:
                 (thread_id // (WARP_SIZE * block_row_warps)) % block_col_warps,
             )
             return lane_id, warp_n, warp_m
-    
-    
+
+    def _rewind_block_threads(self) -> int:
+        return self.block_row_warps * self.block_col_warps * self.WARP_SIZE
+
+    def _at_bn_rewind_geom(self, block_mn, warp_mn_count, operand_mn_atom, dtype):
+        return AtBnRewindGeom.try_create(
+            int(block_mn),
+            int(self.chunk),
+            self._rewind_block_threads(),
+            dtype_elem_bytes(dtype),
+            int(warp_mn_count),
+            int(operand_mn_atom),
+            int(self.k_pack),
+            int(self.micro_size_k),
+        )
+
+    def _an_bt_rewind_geom(self, block_mn, dtype):
+        return AnBtRewindGeom.try_create(
+            int(self.chunk),
+            int(block_mn),
+            self._rewind_block_threads(),
+            dtype_elem_bytes(dtype),
+        )
+
     def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, rk=0):
         # share mem a needs warp number
         warp_num = self.block_row_warps
@@ -367,6 +397,19 @@ class MatrixCoreIntrinEmitter:
                             row, col = shared_to_local_layout_A_simple(
                                 tx, local_id, warp_m, i, k_pack, self.block_row_warps)
                             row, col = row, col + ki * k_pack * micro_size_k
+                        elif self.a_lds_layout == LDS_REWIND:
+                            geom = self._at_bn_rewind_geom(
+                                m_dim, self.block_row_warps, warp_row_tiles, self.a_dtype)
+                            if geom is not None:
+                                row, col = shared_to_local_rewind_at_bn(
+                                    tx, local_id, warp_m, i, k_pack, self.block_row_warps,
+                                    ki * k_pack * micro_size_k, geom)
+                            else:
+                                row, col = shared_to_local_layout_A(
+                                    tx, local_id, warp_m, i, layout_config)
+                                row, col = ki_shared_cvt(
+                                    row, col + ki * m_dim * self.k_pack * micro_size_k,
+                                    stride, new_stride)
                         else:
                             row, col = shared_to_local_layout_A(tx, local_id, warp_m, i, layout_config)
                             row, col = ki_shared_cvt(
@@ -432,6 +475,19 @@ class MatrixCoreIntrinEmitter:
                             row, col = shared_to_local_layout_A_simple(
                                 tx, local_id, warp_n, j, k_pack, self.block_col_warps)
                             row, col = row, col + ki * k_pack * micro_size_k
+                        elif self.b_lds_layout == LDS_REWIND:
+                            geom = self._at_bn_rewind_geom(
+                                n_dim, self.block_col_warps, warp_col_tiles, self.b_dtype)
+                            if geom is not None:
+                                row, col = shared_to_local_rewind_at_bn(
+                                    tx, local_id, warp_n, j, k_pack, self.block_col_warps,
+                                    ki * k_pack * micro_size_k, geom)
+                            else:
+                                row, col = shared_to_local_layout_A(
+                                    tx, local_id, warp_n, j, layout_config)
+                                row, col = ki_shared_cvt(
+                                    row, col + ki * n_dim * self.k_pack * micro_size_k,
+                                    stride, new_stride)
                         else:
                             row, col = shared_to_local_layout_A(
                                 tx, local_id, warp_n, j, layout_config)
@@ -451,6 +507,20 @@ class MatrixCoreIntrinEmitter:
                                 row + ki * micro_size_k,
                                 col, inner_dim, layout_config.type_size)
                             B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row, B_base1 + col]
+                elif self.b_lds_layout == LDS_REWIND:
+                    geom = self._an_bt_rewind_geom(n_dim, self.b_dtype)
+                    if geom is not None:
+                        for j in T.serial(warp_cols // 2):
+                            for local_id in T.vectorized(2 * local_size_b):
+                                row, col = shared_to_local_rewind_an_bt(
+                                    tx, local_id, warp_n, j, self.block_col_warps,
+                                    ki * self.k_pack * micro_size_k + kp * micro_size_k, geom)
+                                B_local_buf[kp * local_size_b * warp_cols + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row, B_base1 + col]
+                    else:
+                        for j in T.serial(warp_cols // 2):
+                            for local_id in T.vectorized(2 * local_size_b):
+                                row, col = shared_to_local_layout_B(tx, local_id, warp_n, j, layout_config)
+                                B_local_buf[kp * local_size_b * warp_cols + j * local_size_b * 2 + local_id] = B_buf[B_base0 + row + ki * self.k_pack *micro_size_k + kp * micro_size_k, B_base1 + col]
                 elif self.b_lds_layout != LDS_SIMPLE:
                     for j in T.serial(warp_cols // 2):
                         for local_id in T.vectorized(2 * local_size_b):

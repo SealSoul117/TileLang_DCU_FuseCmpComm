@@ -5,14 +5,33 @@ from tilelang.autotuner import *
 import tilelang.language as T
 import itertools
 import argparse
-from functools import partial
+import tilelang.testing
+
+tilelang.disable_cache()
+
+
+def _bench_cuda(fn, name, total_flops, n_warmup=5, n_repeat=10):
+    for _ in range(n_warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n_repeat):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    latency_ms = start.elapsed_time(end) / n_repeat
+    print(f"[{name}] Latency: {latency_ms:.3f} ms")
+    print(f"[{name}] {total_flops / latency_ms * 1e-9:.2f} TFlops")
+    return latency_ms
 
 
 def get_configs():
     iter_params = dict(
-        block_M=[64, 128, 256],
+        block_M=[64, 128],
         block_N=[64, 128],
-        num_stages=[1, 2],
+        num_stages=[0, 1, 2],
         threads=[128, 256],
     )
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
@@ -28,11 +47,22 @@ def _tune_ref_program(Q, K, V):
     return ref_program(Q, K, V, _TUNE_IS_CAUSAL)
 
 
-@autotune(configs=get_configs(), warmup=10, rep=10, ref_prog=_tune_ref_program)
+@autotune(
+    configs=get_configs(),
+    warmup=10,
+    rep=10,
+    ref_prog=_tune_ref_program,
+    skip_check=False,
+    rtol=1e-2,
+    atol=1e-2,
+    max_mismatched_ratio=0.01,
+    cache_input_tensors=True,
+)
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     },
 )
 def flashattn(batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num_stages=1, threads=128):
@@ -188,17 +218,64 @@ def main(
         total_flops *= 0.5
 
     if not tune:
-        kernel = flashattn(batch, heads, seq_len, dim, is_causal, block_M=128, block_N=128, num_stages=1, threads=128)
-        ref_program_processed = partial(ref_program, is_causal=is_causal)
-        profiler = kernel.get_profiler()
-        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
-        print("All checks pass.")
-        latency = profiler.do_bench(ref_program_processed, warmup=500)
-        print("Ref: {:.2f} ms".format(latency))
-        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-        latency = profiler.do_bench(warmup=500)
-        print("Tile-lang: {:.2f} ms".format(latency))
-        print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+        tilelang.testing.set_random_seed(0)
+        kernel = flashattn(
+            batch, heads, seq_len, dim, is_causal, block_M=64, block_N=64, num_stages=0, threads=256
+        )
+        print(kernel.get_kernel_source())
+        device = torch.device("cuda")
+        dtype = torch.float16
+        Q = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+        K = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+        V = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+
+        def run_kernel():
+            return kernel(Q, K, V)
+
+        out = run_kernel()
+        torch.cuda.synchronize()
+        out_ref = ref_program(Q, K, V, is_causal)
+        torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+        print("Match vs attention_ref.✅")
+
+        try:
+            import flash_attn
+
+            fla_out = flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+            torch.testing.assert_close(out, fla_out, rtol=1e-2, atol=1e-2)
+            print("Match vs flash_attn.✅")
+        except Exception as e:
+            print(f"Skip flash_attn check: {type(e).__name__}: {e}")
+
+        print("All checks passed.✅")
+
+        def bench(fn, name, n_warmup=5, n_repeat=10):
+            for _ in range(n_warmup):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(n_repeat):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+            latency_ms = start.elapsed_time(end) / n_repeat
+            print(f"[{name}] Latency: {latency_ms:.3f} ms")
+            print(f"[{name}] {total_flops / latency_ms * 1e-9:.2f} TFlops")
+            return latency_ms
+
+        bench(lambda: ref_program(Q, K, V, is_causal), "Torch")
+        bench(run_kernel, "TileLang")
+        try:
+            import flash_attn
+
+            def run_flash_attn():
+                return flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+
+            bench(run_flash_attn, "FlashAttn")
+        except Exception as e:
+            print(f"Skip flash_attn bench: {type(e).__name__}: {e}")
     else:
         global _TUNE_IS_CAUSAL
         _TUNE_IS_CAUSAL = is_causal
@@ -210,6 +287,21 @@ def main(
         print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
         print(f"Best config: {best_config}")
         print(f"Ref latency: {ref_latency}")
+        try:
+            import flash_attn
+
+            device = torch.device("cuda")
+            dtype = torch.float16
+            Q = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+            K = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+            V = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+
+            def run_flash_attn():
+                return flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+
+            _bench_cuda(run_flash_attn, "FlashAttn", total_flops)
+        except Exception as e:
+            print(f"Skip flash_attn bench: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

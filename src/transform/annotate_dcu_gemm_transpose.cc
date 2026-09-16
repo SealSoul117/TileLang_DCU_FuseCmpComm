@@ -61,10 +61,20 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
  private:
   void VisitStmt_(const AttrStmtNode* op) final {
     if (op->attr_key == kDCUGemmTransAStmt) {
-      trans_a |= Downcast<Bool>(op->value)->value;
+      const bool value = Downcast<Bool>(op->value)->value;
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.gemm_trans_a[name] = value ? 1 : 0;
+      }
+      trans_a |= value;
       found = true;
     } else if (op->attr_key == kDCUGemmTransBStmt) {
-      trans_b |= Downcast<Bool>(op->value)->value;
+      const bool value = Downcast<Bool>(op->value)->value;
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.gemm_trans_b[name] = value ? 1 : 0;
+      }
+      trans_b |= value;
       found = true;
     } else if (op->attr_key == kDCUCopyMajorStmt) {
       const std::string name = AttrStmtBufferName(op);
@@ -91,6 +101,18 @@ class DCUGemmTransposeCollector : public StmtExprVisitor {
       if (!name.empty()) {
         copy_maps.use_idxen[name] = AttrStmtIntValue(op->value) != 0;
       }
+    } else if (op->attr_key == kDCUShadowModeStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        copy_maps.shadow_mode[name] = AttrStmtIntValue(op->value);
+      }
+    } else if (op->attr_key == kDCUCopySrcGlobalStmt) {
+      const std::string name = AttrStmtBufferName(op);
+      if (!name.empty()) {
+        if (const auto* s = op->value.as<StringImmNode>()) {
+          copy_maps.src_global[name] = s->value;
+        }
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -102,7 +124,8 @@ class DCUGemmTransposeStmtRemover : public StmtMutator {
     if (op->attr_key == kDCUGemmTransAStmt || op->attr_key == kDCUGemmTransBStmt ||
         op->attr_key == kDCUCopyMajorStmt || op->attr_key == kDCUNeedLayoutStmt ||
         op->attr_key == kDCUNeedShadowStmt || op->attr_key == kDCUGemmOperandStmt ||
-        op->attr_key == kDCUUseIdxenStmt) {
+        op->attr_key == kDCUUseIdxenStmt || op->attr_key == kDCUShadowModeStmt ||
+        op->attr_key == kDCUCopySrcGlobalStmt) {
       return VisitStmt(op->body);
     }
     return StmtMutator::VisitStmt_(op);
@@ -140,6 +163,18 @@ void MergeCopyMaps(DCUCopyBufferMaps* dst, const DCUCopyBufferMaps& src) {
   }
   for (const auto& kv : src.use_idxen) {
     dst->use_idxen[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.shadow_mode) {
+    dst->shadow_mode[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.src_global) {
+    dst->src_global[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.gemm_trans_a) {
+    dst->gemm_trans_a[kv.first] = kv.second;
+  }
+  for (const auto& kv : src.gemm_trans_b) {
+    dst->gemm_trans_b[kv.first] = kv.second;
   }
 }
 
@@ -189,6 +224,22 @@ tvm::transform::Pass AnnotateDCUGemmTranspose() {
     }
     if (!copy_maps.use_idxen.empty()) {
       f = WithAttr(std::move(f), kDCUUseIdxenMap, NeedLayoutToIntegerMap(copy_maps.use_idxen));
+    }
+    if (!copy_maps.shadow_mode.empty()) {
+      f = WithAttr(std::move(f), kDCUShadowModeMap, ToIntegerMap(copy_maps.shadow_mode));
+    }
+    if (!copy_maps.gemm_trans_a.empty()) {
+      f = WithAttr(std::move(f), kDCUGemmTransAMap, ToIntegerMap(copy_maps.gemm_trans_a));
+    }
+    if (!copy_maps.gemm_trans_b.empty()) {
+      f = WithAttr(std::move(f), kDCUGemmTransBMap, ToIntegerMap(copy_maps.gemm_trans_b));
+    }
+    if (!copy_maps.src_global.empty()) {
+      Map<String, String> src_map;
+      for (const auto& kv : copy_maps.src_global) {
+        src_map.Set(String(kv.first), String(kv.second));
+      }
+      f = WithAttr(std::move(f), kDCUCopySrcGlobalMap, src_map);
     }
     return f;
   };

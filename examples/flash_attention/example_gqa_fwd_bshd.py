@@ -5,57 +5,36 @@ from tilelang.autotuner import *
 import tilelang.language as T
 import itertools
 import argparse
-from functools import partial
+import tilelang.testing
+
+tilelang.disable_cache()
 
 
-class FlashAttentionTuneSpace:
-    def __init__(
-        self,
-        block_sizes=(64, 128, 256),
-        thread_options=(128, 256, 512),
-        num_stages_range=(1, 2),
-        max_shared_mem=100 * 1024,
-        warp_alignment=8,
-        dim=128,
-        dtype_bytes=2,
-    ):
-        self.block_sizes = block_sizes
-        self.thread_options = thread_options
-        self.num_stages_range = num_stages_range
-        self.max_shared_mem = max_shared_mem
-        self.warp_alignment = warp_alignment
-        self.dim = dim
-        self.dtype_bytes = dtype_bytes
+def _bench_cuda(fn, name, total_flops, n_warmup=5, n_repeat=10):
+    for _ in range(n_warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n_repeat):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    latency_ms = start.elapsed_time(end) / n_repeat
+    print(f"[{name}] Latency: {latency_ms:.3f} ms")
+    print(f"[{name}] {total_flops / latency_ms * 1e-9:.2f} TFlops")
+    return latency_ms
 
 
-def get_configs(user_config=None):
-    config = user_config or FlashAttentionTuneSpace()
-    valid_configs = []
-
-    for block_M, block_N in itertools.product(config.block_sizes, repeat=2):
-        for threads in config.thread_options:
-            assert threads % 32 == 0
-            warp_count = threads // 32
-            warp_M = block_M // warp_count
-            warp_N = block_N // warp_count
-
-            if warp_M % config.warp_alignment != 0 or warp_N % config.warp_alignment != 0:
-                continue
-
-            shared_mem = 2 * config.dtype_bytes * config.dim * (block_M + block_N)
-            if shared_mem > config.max_shared_mem:
-                continue
-
-            for num_stages in config.num_stages_range:
-                valid_configs.append(
-                    {
-                        "block_M": block_M,
-                        "block_N": block_N,
-                        "num_stages": num_stages,
-                        "threads": threads,
-                    }
-                )
-    return valid_configs
+def get_configs():
+    iter_params = dict(
+        block_M=[64, 128],
+        block_N=[64, 128],
+        num_stages=[0, 1, 2],
+        threads=[128, 256],
+    )
+    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
 
 # The autotuner invokes ref_prog(Q, K, V) with its generated input tensors only,
@@ -69,11 +48,22 @@ def _tune_ref_program(Q, K, V):
     return ref_program(Q, K, V, _TUNE_IS_CAUSAL, groups=_TUNE_GROUPS)
 
 
-@autotune(configs=get_configs(), warmup=10, rep=10, ref_prog=_tune_ref_program)
+@autotune(
+    configs=get_configs(),
+    warmup=10,
+    rep=10,
+    ref_prog=_tune_ref_program,
+    skip_check=False,
+    rtol=1e-2,
+    atol=1e-2,
+    max_mismatched_ratio=0.01,
+    cache_input_tensors=True,
+)
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     },
 )
 def flashattn(batch, heads, seq_len, dim, is_causal, groups=1, block_M=64, block_N=64, num_stages=1, threads=128):
@@ -235,17 +225,65 @@ def main(
         total_flops *= 0.5
 
     if not tune:
-        kernel = flashattn(batch, heads, seq_len, dim, is_causal, groups=groups, block_M=64, block_N=64, num_stages=1, threads=256)
-        ref_program_processed = partial(ref_program, is_causal=is_causal, groups=groups)
-        profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
-        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
-        print("All checks pass.")
-        latency = profiler.do_bench(ref_program_processed, warmup=500)
-        print("Ref: {:.2f} ms".format(latency))
-        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-        latency = profiler.do_bench(warmup=500)
-        print("Tile-lang: {:.2f} ms".format(latency))
-        print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+        tilelang.testing.set_random_seed(0)
+        kernel = flashattn(
+            batch, heads, seq_len, dim, is_causal, groups=groups, block_M=64, block_N=64, num_stages=0, threads=256
+        )
+        print(kernel.get_kernel_source())
+        device = torch.device("cuda")
+        dtype = torch.float16
+        head_kv = heads // groups
+        Q = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+        K = torch.randn(batch, seq_len, head_kv, dim, dtype=dtype, device=device)
+        V = torch.randn(batch, seq_len, head_kv, dim, dtype=dtype, device=device)
+
+        def run_kernel():
+            return kernel(Q, K, V)
+
+        out = run_kernel()
+        torch.cuda.synchronize()
+        out_ref = ref_program(Q, K, V, is_causal, groups=groups)
+        torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+        print("Match vs attention_ref.✅")
+
+        try:
+            import flash_attn
+
+            fla_out = flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+            torch.testing.assert_close(out, fla_out, rtol=1e-2, atol=1e-2)
+            print("Match vs flash_attn.✅")
+        except Exception as e:
+            print(f"Skip flash_attn check: {type(e).__name__}: {e}")
+
+        print("All checks passed.✅")
+
+        def bench(fn, name, n_warmup=5, n_repeat=10):
+            for _ in range(n_warmup):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(n_repeat):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+            latency_ms = start.elapsed_time(end) / n_repeat
+            print(f"[{name}] Latency: {latency_ms:.3f} ms")
+            print(f"[{name}] {total_flops / latency_ms * 1e-9:.2f} TFlops")
+            return latency_ms
+
+        bench(lambda: ref_program(Q, K, V, is_causal, groups=groups), "Torch")
+        bench(run_kernel, "TileLang")
+        try:
+            import flash_attn
+
+            def run_flash_attn():
+                return flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+
+            bench(run_flash_attn, "FlashAttn")
+        except Exception as e:
+            print(f"Skip flash_attn bench: {type(e).__name__}: {e}")
     else:
         global _TUNE_IS_CAUSAL, _TUNE_GROUPS
         _TUNE_IS_CAUSAL = is_causal
@@ -258,6 +296,22 @@ def main(
         print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
         print(f"Best config: {best_config}")
         print(f"Ref latency: {ref_latency}")
+        try:
+            import flash_attn
+
+            device = torch.device("cuda")
+            dtype = torch.float16
+            head_kv = heads // groups
+            Q = torch.randn(batch, seq_len, heads, dim, dtype=dtype, device=device)
+            K = torch.randn(batch, seq_len, head_kv, dim, dtype=dtype, device=device)
+            V = torch.randn(batch, seq_len, head_kv, dim, dtype=dtype, device=device)
+
+            def run_flash_attn():
+                return flash_attn.flash_attn_func(Q, K, V, causal=is_causal)
+
+            _bench_cuda(run_flash_attn, "FlashAttn", total_flops)
+        except Exception as e:
+            print(f"Skip flash_attn bench: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

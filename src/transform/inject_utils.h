@@ -116,6 +116,12 @@ struct DCUCopyBufferMaps {
   std::unordered_map<std::string, bool> need_shadow;
   std::unordered_map<std::string, int> gemm_operand;
   std::unordered_map<std::string, bool> use_idxen;
+  // 1 = row/former-A (NN-A, NT-B), 2 = col/former-B (NN-B, TN-A).
+  std::unordered_map<std::string, int> shadow_mode;
+  // Shared dst name -> T.copy source global buffer name.
+  std::unordered_map<std::string, std::string> src_global;
+  std::unordered_map<std::string, int> gemm_trans_a;
+  std::unordered_map<std::string, int> gemm_trans_b;
 };
 
 bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps);
@@ -144,6 +150,21 @@ std::optional<int> LookupDCUGemmOperand(const DCUCopyBufferMaps& maps,
 
 std::optional<bool> LookupDCUUseIdxen(const DCUCopyBufferMaps& maps,
                                       const std::string& name);
+
+int LookupDCUShadowMode(const DCUCopyBufferMaps& maps, const std::string& name,
+                        int default_value = 0);
+
+std::optional<std::string> MatchDCUCopyKeyForGlobal(const DCUCopyBufferMaps& maps,
+                                                    const std::string& global_name);
+
+/*!
+ * \brief Walk pointer expressions (Add/Cast/address_of) to the global handle name.
+ *        make_dcu_resource often takes `V_unpad + offset`, not a bare Var.
+ */
+std::string ExtractGlobalBufferName(const PrimExpr& expr);
+
+/*! Strip a trailing `_dcu_res` suffix from a resource Let name. */
+std::string StripDCUResSuffix(std::string name);
 
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
                                const DCUCopyBufferMaps& maps,

@@ -223,14 +223,12 @@ std::string GetAllocateStorageScope(const AllocateNode* op) {
   return "";
 }
 
-std::string GetGlobalBufferName(const PrimExpr& expr) {
-  if (const auto* var = expr.as<VarNode>()) {
-    return var->name_hint;
+std::string ResourceGlobalName(const CallNode* call, const Var& let_var) {
+  std::string name = ExtractGlobalBufferName(call->args[0]);
+  if (name.empty()) {
+    name = StripDCUResSuffix(let_var->name_hint);
   }
-  if (const auto* load = expr.as<BufferLoadNode>()) {
-    return load->buffer->name;
-  }
-  return "";
+  return name;
 }
 
 bool IsSameVar(const PrimExpr& expr, const Var& var) {
@@ -338,7 +336,7 @@ class InfoCollector : public StmtExprVisitor {
   void VisitStmt_(const LetStmtNode* op) final {
     if (const auto* call = op->value.as<CallNode>()) {
       if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
-        const std::string global_name = GetGlobalBufferName(call->args[0]);
+        const std::string global_name = ResourceGlobalName(call, op->var);
         pending_dcu_res.emplace_back(op->var.get(), global_name);
         if (IsABufferName(global_name)) {
           a_dcu_res_vars.insert(op->var.get());
@@ -768,7 +766,7 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
     return func;
   }
 
-  if (collector.a_dcu_res_vars.empty() && collector.b_dcu_res_vars.empty()) {
+  if (collector.pending_dcu_res.empty()) {
     return func;
   }
 
@@ -777,8 +775,8 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
 
   DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(func);
   std::vector<DcuResShadowSpec> res_specs;
-  bool used_a_tag = false;
-  bool used_b_tag = false;
+  bool used_mode1_tag = false;
+  bool used_mode2_tag = false;
   auto assign_tags = [](DcuResShadowSpec* spec, bool use_first, const char* first_addr,
                         const char* first_off) {
     if (use_first) {
@@ -794,24 +792,28 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
     }
   };
   for (const auto& item : collector.pending_dcu_res) {
-    const bool is_a = collector.a_dcu_res_vars.count(item.first) > 0;
-    const bool is_b = collector.b_dcu_res_vars.count(item.first) > 0;
-    if (!is_a && !is_b) {
+    const std::string& global_name = item.second;
+    auto shared_key = MatchDCUCopyKeyForGlobal(maps, global_name);
+    if (!shared_key.has_value()) {
+      continue;
+    }
+    const int mode = LookupDCUShadowMode(maps, *shared_key, /*default_value=*/0);
+    if (mode != 1 && mode != 2) {
       continue;
     }
     DcuResShadowSpec spec;
     spec.var = item.first;
-    spec.global_name = item.second;
-    spec.need_layout = LookupDCUNeedLayout(maps, item.second, /*default_value=*/true) &&
-                       LookupDCUNeedShadow(maps, item.second, /*default_value=*/true);
-    spec.copy_major = LookupDCUCopyMajor(maps, item.second, /*default_value=*/0);
-    spec.elem_bytes = is_a ? a_elem_bytes : b_elem_bytes;
-    if (is_a) {
-      assign_tags(&spec, !used_a_tag, "A", "a");
-      used_a_tag = true;
+    spec.global_name = global_name;
+    spec.need_layout = LookupDCUNeedLayout(maps, *shared_key, /*default_value=*/false) &&
+                       LookupDCUNeedShadow(maps, *shared_key, /*default_value=*/false);
+    spec.copy_major = LookupDCUCopyMajor(maps, *shared_key, /*default_value=*/mode == 2 ? 1 : 0);
+    spec.elem_bytes = (mode == 1) ? a_elem_bytes : b_elem_bytes;
+    if (mode == 1) {
+      assign_tags(&spec, !used_mode1_tag, "A", "a");
+      used_mode1_tag = true;
     } else {
-      assign_tags(&spec, !used_b_tag, "B", "b");
-      used_b_tag = true;
+      assign_tags(&spec, !used_mode2_tag, "B", "b");
+      used_mode2_tag = true;
     }
     res_specs.push_back(std::move(spec));
   }

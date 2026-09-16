@@ -374,23 +374,20 @@ def InjectDCUAsyncCopyShadowAddr():
     """Inject warp-dependent shadow shared-memory base addresses for DCU async copy.
 
     After ``InjectWarpIdx``, declares one shadow pointer per async-copy resource
-    (``A_shared_addr`` / ``B_shared_addr`` / ``V_shared_addr``, ...) by OR-ing
-    that resource's high shadow bits onto ``buf_dyn_shmem``. Physical LDS may be
-    reused across GEMMs; the shadow pointer and offset must not.
+    by OR-ing that resource's high shadow bits onto ``buf_dyn_shmem``. Physical
+    LDS may be reused across GEMMs; the shadow pointer and offset must not.
+
+    Shadow mode is derived from the consuming T.gemm, not buffer names:
+    - mode 1 (former A, row-major): NN-A or NT-B, ``(warp_idx & 3) << 16`` for half
+    - mode 2 (former B, col-major): NN-B or TN-A, ``(warp_idx & 1) << 18`` for half
 
     Tiles whose ``tl.dcu_need_layout`` map entry is 0 (fast sequential SIMT copy)
     use a separately declared ``plain_shared_addr`` that aliases the same LDS
-    allocation but without shadow bits. Mixed kernels must not reuse another
-    GEMM's ``*_shared_addr`` (e.g. K's ``B_shared_addr`` for a V copy).
+    allocation but without shadow bits.
 
     When ``LayoutConfig.slabs < 4``, LDS→register rewind padding is disabled;
     the matching global→shared copy also skips shadow bits
     (``tl.dcu_need_shadow`` = 0) even if the copy still uses the layout path.
-
-    Shadow offset style follows that buffer's T.copy ``major``
-    (via ``AnnotateDCUGemmTranspose``):
-    - row_major (half_t): ``(warp_idx & 3) << 16``
-    - col_major (half_t): ``(warp_idx & 1) << 18``
 
     Returns
     -------
@@ -403,9 +400,9 @@ def InjectDCUAsyncCopyShadowAddr():
 def InjectDCUAsyncCopyIdxen():
     """Convert ``tl.dcu_async_copy`` to ``tl.dcu_async_copy_idxen`` for DCU GEMM loads.
 
-    Uses T.gemm transpose flags (via ``AnnotateDCUGemmTranspose``):
-    - A-matrix idxen when A is not transposed
-    - B-matrix idxen when B is transposed
+    Uses T.gemm per operand (via copy annotations), not buffer names:
+    - idxen for mode 1 (NN-A or NT-B) when that copy needs shadow
+    - col-major ``cp_async_gs`` for mode 2 (NN-B or TN-A)
 
     Derives K from global buffer shapes, sets ``StructBit`` on ``tl.make_dcu_resource``,
     and splits the global source offset into idxen and remainder for ``cp_async_gs_idxen``.
@@ -437,6 +434,8 @@ def InjectDSRead():
 
     This pass replaces BufferLoad from shared memory with ds_read_b64 or
     ds_read_m32x16_b16 hardware instructions for AMD DCU (gfx936, gfx942, etc.).
+    Decision is per consuming T.gemm / shared buffer (mode 2: NN-B or TN-A).
+    A kernel that also has an NT QK GEMM does not disable ds_read on a later PV B.
 
     - ds_read_b64: loads 8 bytes (4 halfs or 2 floats) at once
     - ds_read_m32x16_b16: loads 32 bytes (16 half/bfloat16 elements) at once

@@ -61,11 +61,9 @@ bool TryGetConsecutiveVectorOffset(const PrimExpr& index, int expected_lanes,
 
 class DSReadInjector : public StmtExprMutator {
  public:
-  DSReadInjector(const DCUGemmTransposeFlags& flags, const DCUCopyBufferMaps& maps)
-      : flags_(flags), maps_(maps) {}
+  explicit DSReadInjector(const DCUCopyBufferMaps& maps) : maps_(maps) {}
 
  private:
-  DCUGemmTransposeFlags flags_;
   DCUCopyBufferMaps maps_;
 
   Stmt VisitStmt_(const BufferStoreNode* op) final {
@@ -83,7 +81,8 @@ class DSReadInjector : public StmtExprMutator {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    if (!NeedsDCULocalLayoutDSRead(flags_, maps_, std::string(buffer->name),
+    DCUGemmTransposeFlags unused_flags;
+    if (!NeedsDCULocalLayoutDSRead(unused_flags, maps_, std::string(buffer->name),
                                    std::string(load->buffer->name))) {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -92,11 +91,11 @@ class DSReadInjector : public StmtExprMutator {
     if (elem_bytes != 1 && elem_bytes != 2) {
       return StmtExprMutator::VisitStmt_(op);
     }
-    // Per-thread destination is float32x4 = 16 bytes.
     const int expected_lanes = 16 / elem_bytes;
 
-    ICHECK(op->indices.size() == 1);
-    ICHECK(load->indices.size() == 1);
+    if (op->indices.size() != 1 || load->indices.size() != 1) {
+      return StmtExprMutator::VisitStmt_(op);
+    }
 
     PrimExpr local_offset;
     PrimExpr lds_offset;
@@ -120,15 +119,13 @@ tvm::transform::Pass InjectDSRead() {
       return f;
     }
 
-    DCUGemmTransposeFlags flags = GetDCUGemmTransposeFlags(f);
-    if (!flags.defined || (!flags.trans_a && flags.trans_b)) {
+    DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(f);
+    if (DCUCopyBufferMapsEmpty(maps)) {
       return f;
     }
 
-    DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(f);
-
     auto *n = f.CopyOnWrite();
-    n->body = DSReadInjector(flags, maps)(n->body);
+    n->body = DSReadInjector(maps)(n->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectDSRead", {});

@@ -42,14 +42,12 @@ bool IsBBufferName(const std::string& name) {
   return name == "B" || name == "B_1";
 }
 
-std::string GetGlobalBufferName(const PrimExpr& expr) {
-  if (const auto* var = expr.as<VarNode>()) {
-    return var->name_hint;
+std::string ResourceGlobalName(const CallNode* call, const Var& let_var) {
+  std::string name = ExtractGlobalBufferName(call->args[0]);
+  if (name.empty()) {
+    name = StripDCUResSuffix(let_var->name_hint);
   }
-  if (const auto* load = expr.as<BufferLoadNode>()) {
-    return load->buffer->name;
-  }
-  return "";
+  return name;
 }
 
 // Maximum pattern width (tile_width): 2^13 = 8192 bytes.
@@ -168,6 +166,16 @@ class InfoCollector : public StmtExprVisitor {
 
  private:
   std::optional<int> OperandForGlobal(const std::string& global_name) const {
+    if (auto key = MatchDCUCopyKeyForGlobal(maps_, global_name)) {
+      if (auto use = LookupDCUUseIdxen(maps_, *key)) {
+        if (!*use) {
+          return std::nullopt;
+        }
+      }
+      if (auto op = LookupDCUGemmOperand(maps_, *key)) {
+        return op;
+      }
+    }
     if (auto use = LookupDCUUseIdxen(maps_, global_name)) {
       if (!*use) {
         return std::nullopt;
@@ -176,29 +184,13 @@ class InfoCollector : public StmtExprVisitor {
     if (auto op = LookupDCUGemmOperand(maps_, global_name)) {
       return op;
     }
-    for (const auto& kv : maps_.use_idxen) {
-      if (!kv.second) {
-        continue;
-      }
-      if (SharedNameMatchesGlobal(kv.first, global_name) || kv.first == global_name) {
-        if (auto op = LookupDCUGemmOperand(maps_, kv.first)) {
-          return op;
-        }
-      }
-    }
-    if (IsABufferName(global_name)) {
-      return 0;
-    }
-    if (IsBBufferName(global_name)) {
-      return 1;
-    }
     return std::nullopt;
   }
 
   void VisitStmt_(const LetStmtNode* op) final {
     if (const auto* call = op->value.as<CallNode>()) {
       if (call->op.same_as(MakeDCUResourceOp()) && call->args.size() >= 1) {
-        const std::string global_name = GetGlobalBufferName(call->args[0]);
+        const std::string global_name = ResourceGlobalName(call, op->var);
         if (auto operand = OperandForGlobal(global_name)) {
           if (*operand == 0) {
             a_dcu_res_vars.insert(op->var.get());
@@ -441,7 +433,7 @@ class IdxenInjector : public StmtExprMutator {
     if (call->args.size() >= 3) {
       return GetRef<PrimExpr>(call);
     }
-    const std::string global_name = GetGlobalBufferName(call->args[0]);
+    const std::string global_name = ExtractGlobalBufferName(call->args[0]);
     const IdxenMatrixParams* params = nullptr;
     if (auto use = LookupDCUUseIdxen(maps_, global_name)) {
       if (*use) {

@@ -2188,15 +2188,20 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   result = AttrStmt(dst_name_node, kDCUNeedLayoutStmt, Bool(need_layout), result);
   result = AttrStmt(dst_name_node, kDCUCopyMajorStmt,
                     IntImm(DataType::Int(32), copy_major), result);
+  result = AttrStmt(dst_name_node, kDCUCopySrcGlobalStmt, StringImm(src->name), result);
   if (gemm_operand.has_value()) {
     result = AttrStmt(dst_name_node, kDCUGemmOperandStmt,
                       IntImm(DataType::Int(32), gemm_operand.value()), result);
+    result = AttrStmt(dst_name_node, kDCUGemmTransAStmt, Bool(gemm_trans_a), result);
+    result = AttrStmt(dst_name_node, kDCUGemmTransBStmt, Bool(gemm_trans_b), result);
+    const int shadow_mode =
+        DCUShadowModeFromGemm(gemm_operand.value(), gemm_trans_a, gemm_trans_b);
+    result = AttrStmt(dst_name_node, kDCUShadowModeStmt,
+                      IntImm(DataType::Int(32), shadow_mode), result);
     // Idxen is SLAB structured-buffer gather only (needs shadow). SWIZZLE
     // uses per-lane offen on a linear LDS dest and must stay cp_async_gs.
-    const bool use_idxen =
-        need_shadow && need_layout &&
-        ((gemm_operand.value() == 0 && !gemm_trans_a) ||
-         (gemm_operand.value() == 1 && gemm_trans_b));
+    // Mode 1 (NN-A / NT-B) uses idxen; mode 2 (NN-B / TN-A) uses col-major gs.
+    const bool use_idxen = need_shadow && need_layout && shadow_mode == 1;
     result = AttrStmt(dst_name_node, kDCUUseIdxenStmt, Bool(use_idxen), result);
   }
   return result;

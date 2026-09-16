@@ -635,31 +635,44 @@ private:
 
     // Making stages and orders
     int order_idx = 0;
-    // Stage 1. Create pipeline stages and assign order
-    for (auto &pinfo : pipeline_stage_infos) {
-      // Skip elements that must be in first stage:
-      // 1. Copy stages (with active last_use_stmt_index) - these need special
-      // handling
-      //    because they have consumers that depend on their data
-      // 2. All Producer stages for copy stages.
-      if (pinfo.is_first_stage() && pinfo.is_last_use_stmt_index_valid()) {
-        continue;
+    if (num_stages == 1) {
+      // num_stages==1 is async prefetch in program order, not double-buffering.
+      // Copy@0 + compute@1 would run next K/V copies beside current QK, so
+      // MergeSharedMemoryAllocations cannot overlay K onto V and FA tiles like
+      // Q=16KB+K=32KB+V=32KB overflow 64KB even though each buffer still has
+      // one bank (see inject_pipeline cap at pipeline_num_stages).
+      for (size_t i = 0; i < pipeline_stage_infos.size(); ++i) {
+        pipeline_stage_infos[i].order = static_cast<int>(i);
+        pipeline_stage_infos[i].stage = 0;
       }
+      order_idx = static_cast<int>(pipeline_stage_infos.size());
+    } else {
+      // Stage 1. Create pipeline stages and assign order
+      for (auto &pinfo : pipeline_stage_infos) {
+        // Skip elements that must be in first stage:
+        // 1. Copy stages (with active last_use_stmt_index) - these need special
+        // handling
+        //    because they have consumers that depend on their data
+        // 2. All Producer stages for copy stages.
+        if (pinfo.is_first_stage() && pinfo.is_last_use_stmt_index_valid()) {
+          continue;
+        }
 
-      // Main logic stage assignment:
-      // - Increment order index
-      // - Assign to new stage (current num_stages)
-      pinfo.order = order_idx++;
-      pinfo.stage = num_stages;
+        // Main logic stage assignment:
+        // - Increment order index
+        // - Assign to new stage (current num_stages)
+        pinfo.order = order_idx++;
+        pinfo.stage = num_stages;
 
-      // Schedule copy stages that have this stage as their last consumer
-      // This ensures copy operations are placed right before their final
-      // consumer for optimal pipeline efficiency
-      for (auto &pinfo_1 : pipeline_stage_infos) {
-        if ((pinfo_1.is_first_stage() &&
-             pinfo_1.last_use_stmt_index == pinfo.original_stmt_index)) {
-          pinfo_1.order = order_idx++;
-          pinfo_1.stage = 0; // Copy stages are typically assigned to stage 0
+        // Schedule copy stages that have this stage as their last consumer
+        // This ensures copy operations are placed right before their final
+        // consumer for optimal pipeline efficiency
+        for (auto &pinfo_1 : pipeline_stage_infos) {
+          if ((pinfo_1.is_first_stage() &&
+               pinfo_1.last_use_stmt_index == pinfo.original_stmt_index)) {
+            pinfo_1.order = order_idx++;
+            pinfo_1.stage = 0; // Copy stages are typically assigned to stage 0
+          }
         }
       }
     }

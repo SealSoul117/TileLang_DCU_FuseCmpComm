@@ -13,6 +13,23 @@ from varlen_utils import generate_random_padding_mask, generate_qkv
 tilelang.disable_cache()
 
 
+def _bench_cuda(fn, name, total_flops, n_warmup=5, n_repeat=10):
+    for _ in range(n_warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n_repeat):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    latency_ms = start.elapsed_time(end) / n_repeat
+    print(f"[{name}] Latency: {latency_ms:.3f} ms")
+    print(f"[{name}] {total_flops / latency_ms * 1e-9:.2f} TFlops")
+    return latency_ms
+
+
 def get_configs():
     iter_params = dict(
         block_M=[64, 128],
@@ -128,6 +145,8 @@ def attention_ref(
     out_idx=[5],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        # Let MergeSharedMemoryAllocations overlay K_shared onto V_shared after QK.
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     },
 )
 def flashattn(
@@ -416,6 +435,27 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, t
         print(f"Best latency: {best_latency}")
         print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
         print(f"Best config: {best_config}")
+        try:
+            import flash_attn
+
+            def run_flash_attn():
+                return output_pad_fn(
+                    flash_attn.flash_attn_varlen_func(
+                        q_unpad,
+                        k_unpad,
+                        v_unpad,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        0.0,
+                        causal=causal,
+                    )
+                )
+
+            _bench_cuda(run_flash_attn, "FlashAttn", total_flops)
+        except Exception as e:
+            print(f"Skip flash_attn bench: {type(e).__name__}: {e}")
         return
 
     kernel = flashattn(
@@ -427,7 +467,7 @@ def main(batch: int = 8, heads: int = 64, seq_len: int = 2048, dim: int = 128, t
         causal,
         int(max_seqlen_q),
         int(max_seqlen_k),
-        block_M=128,
+        block_M=64,
         block_N=64,
         num_stages=0,
         threads=256,  # BM=128 + threads=256 is incorrect on DCU; use 128

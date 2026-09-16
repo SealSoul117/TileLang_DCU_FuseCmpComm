@@ -264,7 +264,8 @@ DCUGemmTransposeFlags GetDCUGemmTransposeFlags(const PrimFunc& func) {
 
 bool DCUCopyBufferMapsEmpty(const DCUCopyBufferMaps& maps) {
   return maps.copy_major.empty() && maps.need_layout.empty() && maps.need_shadow.empty() &&
-         maps.gemm_operand.empty() && maps.use_idxen.empty();
+         maps.gemm_operand.empty() && maps.use_idxen.empty() && maps.shadow_mode.empty() &&
+         maps.src_global.empty();
 }
 
 namespace {
@@ -301,6 +302,26 @@ DCUCopyBufferMaps GetDCUCopyBufferMaps(const PrimFunc& func) {
     if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUUseIdxenMap)) {
       for (const auto& kv : m.value()) {
         maps.use_idxen[std::string(kv.first)] = kv.second->value != 0;
+      }
+    }
+    if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUShadowModeMap)) {
+      for (const auto& kv : m.value()) {
+        maps.shadow_mode[std::string(kv.first)] = static_cast<int>(kv.second->value);
+      }
+    }
+    if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUGemmTransAMap)) {
+      for (const auto& kv : m.value()) {
+        maps.gemm_trans_a[std::string(kv.first)] = static_cast<int>(kv.second->value);
+      }
+    }
+    if (auto m = func->attrs.GetAttr<Map<String, Integer>>(kDCUGemmTransBMap)) {
+      for (const auto& kv : m.value()) {
+        maps.gemm_trans_b[std::string(kv.first)] = static_cast<int>(kv.second->value);
+      }
+    }
+    if (auto m = func->attrs.GetAttr<Map<String, String>>(kDCUCopySrcGlobalMap)) {
+      for (const auto& kv : m.value()) {
+        maps.src_global[std::string(kv.first)] = std::string(kv.second);
       }
     }
   }
@@ -368,6 +389,12 @@ std::optional<std::string> MatchDCUCopyBufferKey(const DCUCopyBufferMaps& maps,
     return key;
   }
   if (auto key = find_in(maps.use_idxen)) {
+    return key;
+  }
+  if (auto key = find_in(maps.shadow_mode)) {
+    return key;
+  }
+  if (auto key = find_in(maps.src_global)) {
     return key;
   }
   return find_in(maps.gemm_operand);
@@ -448,28 +475,115 @@ std::optional<bool> LookupDCUUseIdxen(const DCUCopyBufferMaps& maps,
   return it->second;
 }
 
+int LookupDCUShadowMode(const DCUCopyBufferMaps& maps, const std::string& name, int default_value) {
+  auto key = MatchDCUCopyBufferKey(maps, name);
+  if (!key.has_value()) {
+    return default_value;
+  }
+  auto it = maps.shadow_mode.find(*key);
+  if (it != maps.shadow_mode.end()) {
+    return it->second;
+  }
+  auto operand = maps.gemm_operand.find(*key);
+  if (operand == maps.gemm_operand.end()) {
+    return default_value;
+  }
+  const bool trans_a = maps.gemm_trans_a.count(*key) ? maps.gemm_trans_a.at(*key) != 0 : false;
+  const bool trans_b = maps.gemm_trans_b.count(*key) ? maps.gemm_trans_b.at(*key) != 0 : false;
+  const int mode = DCUShadowModeFromGemm(operand->second, trans_a, trans_b);
+  return mode != 0 ? mode : default_value;
+}
+
+std::string ExtractGlobalBufferName(const PrimExpr& expr) {
+  if (!expr.defined()) {
+    return "";
+  }
+  if (const auto* var = expr.as<VarNode>()) {
+    return var->name_hint;
+  }
+  if (const auto* load = expr.as<BufferLoadNode>()) {
+    return load->buffer->name;
+  }
+  if (const auto* add = expr.as<AddNode>()) {
+    const std::string a = ExtractGlobalBufferName(add->a);
+    if (!a.empty()) {
+      return a;
+    }
+    return ExtractGlobalBufferName(add->b);
+  }
+  if (const auto* sub = expr.as<SubNode>()) {
+    return ExtractGlobalBufferName(sub->a);
+  }
+  if (const auto* cast = expr.as<CastNode>()) {
+    return ExtractGlobalBufferName(cast->value);
+  }
+  if (const auto* call = expr.as<CallNode>()) {
+    if ((call->op.same_as(builtin::address_of()) || call->op.same_as(builtin::reinterpret()) ||
+         call->op.same_as(builtin::tvm_access_ptr())) &&
+        !call->args.empty()) {
+      const size_t idx = call->op.same_as(builtin::tvm_access_ptr()) && call->args.size() >= 2
+                             ? 1
+                             : 0;
+      return ExtractGlobalBufferName(call->args[idx]);
+    }
+    for (const auto& arg : call->args) {
+      const std::string name = ExtractGlobalBufferName(arg);
+      if (!name.empty()) {
+        return name;
+      }
+    }
+  }
+  return "";
+}
+
+std::string StripDCUResSuffix(std::string name) {
+  static constexpr const char kSuffix[] = "_dcu_res";
+  constexpr size_t n = sizeof(kSuffix) - 1;
+  if (name.size() > n && name.compare(name.size() - n, n, kSuffix) == 0) {
+    name.resize(name.size() - n);
+  }
+  return name;
+}
+
+std::optional<std::string> MatchDCUCopyKeyForGlobal(const DCUCopyBufferMaps& maps,
+                                                    const std::string& global_name) {
+  if (global_name.empty()) {
+    return std::nullopt;
+  }
+  for (const auto& kv : maps.src_global) {
+    if (kv.second == global_name || NamesRelated(kv.second, global_name)) {
+      return kv.first;
+    }
+  }
+  return MatchDCUCopyBufferKey(maps, global_name);
+}
+
 bool NeedsDCULocalLayoutDSRead(const DCUGemmTransposeFlags& flags,
                                const DCUCopyBufferMaps& maps,
                                const std::string& local_name,
                                const std::string& shared_name) {
-  if (!flags.defined) {
+  const std::string lookup = !shared_name.empty() ? shared_name : local_name;
+  const bool need_layout = LookupDCUNeedLayout(maps, lookup, /*default_value=*/false);
+  if (!need_layout) {
     return false;
   }
-  const std::string lookup = !shared_name.empty() ? shared_name : local_name;
-  const bool need_layout = LookupDCUNeedLayout(maps, lookup, /*default_value=*/true);
+  const int mode = LookupDCUShadowMode(maps, lookup, /*default_value=*/0);
+  if (mode != 0) {
+    // ds_read_m32x16 is the col-major / former-B family (mode 2).
+    return mode == 2;
+  }
   if (auto operand = LookupDCUGemmOperand(maps, lookup)) {
-    if (*operand == 0) {
-      return flags.trans_a && need_layout;
+    auto key = MatchDCUCopyBufferKey(maps, lookup);
+    bool trans_a = false;
+    bool trans_b = false;
+    if (key.has_value()) {
+      trans_a = maps.gemm_trans_a.count(*key) ? maps.gemm_trans_a.at(*key) != 0 : false;
+      trans_b = maps.gemm_trans_b.count(*key) ? maps.gemm_trans_b.at(*key) != 0 : false;
+    } else if (flags.defined) {
+      trans_a = flags.trans_a;
+      trans_b = flags.trans_b;
     }
-    if (*operand == 1) {
-      return !flags.trans_b && need_layout;
-    }
-  }
-  if (local_name.find("A_local") != std::string::npos) {
-    return flags.trans_a && need_layout;
-  }
-  if (local_name.find("B_local") != std::string::npos) {
-    return !flags.trans_b && need_layout;
+    return DCUShadowModeFromGemm(*operand, trans_a, trans_b) == 2;
   }
   return false;
 }

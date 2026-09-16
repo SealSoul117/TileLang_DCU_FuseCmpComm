@@ -74,10 +74,16 @@ static constexpr const char *kDCUGemmTransBStmt = "tl.dcu_gemm_trans_b_stmt";
 // need_layout: 0 = fast sequential SIMT (no shadow / ds_read remap), 1 = remapped.
 // need_shadow: 0 = skip warp shadow bits (LayoutConfig.slabs < 4, no rewind).
 // gemm_operand: 0 = left (A-side) of T.gemm, 1 = right (B-side).
+// shadow_mode: 1 = row/former-A (NN-A or NT-B), 2 = col/former-B (NN-B or TN-A).
+// src_global: T.copy source global buffer name for the shared dst.
 static constexpr const char *kDCUCopyMajorMap = "tl.dcu_copy_major";
 static constexpr const char *kDCUNeedLayoutMap = "tl.dcu_need_layout";
 static constexpr const char *kDCUNeedShadowMap = "tl.dcu_need_shadow";
 static constexpr const char *kDCUGemmOperandMap = "tl.dcu_gemm_operand";
+static constexpr const char *kDCUShadowModeMap = "tl.dcu_shadow_mode";
+static constexpr const char *kDCUCopySrcGlobalMap = "tl.dcu_copy_src_global";
+static constexpr const char *kDCUGemmTransAMap = "tl.dcu_gemm_trans_a_map";
+static constexpr const char *kDCUGemmTransBMap = "tl.dcu_gemm_trans_b_map";
 // Explicit T.copy(enable_async=True) / is_async_copy annotation.
 static constexpr const char *kIsAsyncCopy = "is_async_copy";
 // Per-shared-buffer: rewrite tl.dcu_async_copy → idxen (from Copy.Lower).
@@ -88,6 +94,20 @@ static constexpr const char *kDCUCopyMajorStmt = "tl.dcu_copy_major_stmt";
 static constexpr const char *kDCUNeedLayoutStmt = "tl.dcu_need_layout_stmt";
 static constexpr const char *kDCUNeedShadowStmt = "tl.dcu_need_shadow_stmt";
 static constexpr const char *kDCUGemmOperandStmt = "tl.dcu_gemm_operand_stmt";
+static constexpr const char *kDCUShadowModeStmt = "tl.dcu_shadow_mode_stmt";
+static constexpr const char *kDCUCopySrcGlobalStmt = "tl.dcu_copy_src_global_stmt";
+
+// LDS shadow / ds_read family from the consuming T.gemm, not buffer names.
+// Mode 1 (row, former A): NN-A or NT-B. Mode 2 (col, former B): NN-B or TN-A.
+inline int DCUShadowModeFromGemm(int operand, bool trans_a, bool trans_b) {
+  if (operand == 0) {
+    return trans_a ? 2 : 1;
+  }
+  if (operand == 1) {
+    return trans_b ? 1 : 2;
+  }
+  return 0;
+}
 
 /*!
  * \brief Whether to disable thread storage synchronization

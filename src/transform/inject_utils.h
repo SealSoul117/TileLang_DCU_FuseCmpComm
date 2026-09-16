@@ -154,8 +154,11 @@ bool NeedsDCUAsyncCopyIdxenForOperand(const DCUGemmTransposeFlags& flags, int ge
                                       bool need_layout);
 
 /*!
- * \brief Whether a global→shared BufferStore is a consecutive vector copy of
- *        exactly 16 element-bytes (the width of tl::cp_async_gs<16>).
+ * \brief Whether a global→shared BufferStore is a consecutive LDS vector write
+ *        of exactly 16 element-bytes (the width of tl::cp_async_gs<16>).
+ *
+ *        Only the destination index must be a consecutive Ramp; the global
+ *        source may gather (XOR swizzle / idxen).
  */
 bool IsDCUCpAsyncVectorCopy(const tir::BufferStoreNode* store,
                             const tir::BufferLoadNode* load);

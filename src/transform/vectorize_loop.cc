@@ -419,9 +419,20 @@ public:
       return std::move(var);
     }
   }
+  // Lane-uniform predicates often become Broadcast(scalar, lanes) after
+  // substituting the vectorized loop var (e.g. OOB check on row while
+  // vectorizing columns). Treat Broadcast as scalar so we keep Ramp g2s
+  // and DCU can lower them to predicated cp_async.
+  static PrimExpr PeelBroadcastCondition(PrimExpr cond) {
+    while (const auto *b = cond.as<BroadcastNode>()) {
+      cond = b->value;
+    }
+    return cond;
+  }
+
   // IfThenElse expr
   PrimExpr MutateIfThenElseExpr_(const CallNode *op) {
-    PrimExpr cond = this->VisitExpr(op->args[0]);
+    PrimExpr cond = PeelBroadcastCondition(this->VisitExpr(op->args[0]));
     if (cond.dtype().is_scalable_or_fixed_length_vector()) {
       need_scalarize_ = true;
       return tvm::ffi::GetRef<PrimExpr>(op);
@@ -642,7 +653,7 @@ public:
   // IfThenElse
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     ICHECK(!op->condition.dtype().is_scalable_or_fixed_length_vector());
-    PrimExpr condition = this->VisitExpr(op->condition);
+    PrimExpr condition = PeelBroadcastCondition(this->VisitExpr(op->condition));
     if (condition.dtype().is_scalable_or_fixed_length_vector()) {
       return Scalarize(tvm::ffi::GetRef<Stmt>(op));
     }

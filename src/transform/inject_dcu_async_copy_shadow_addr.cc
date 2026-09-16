@@ -623,6 +623,11 @@ class ShadowAddrInjector : public StmtExprMutator {
     Stmt new_body = seq.size() == 1 ? seq[0] : SeqStmt(seq);
     new_body = VisitStmt(new_body);
     const int64_t new_extent = *extent_imm / split_factor;
+    // Do not wrap a dummy extent-1 loop: it looks like the tile is loaded once
+    // while the body already contains `split_factor` copies (A 128-thread case).
+    if (new_extent == 1) {
+      return new_body;
+    }
     return For(op->loop_var, op->min, make_const(op->extent.dtype(), new_extent), op->kind,
                new_body, op->thread_binding, op->annotations);
   }

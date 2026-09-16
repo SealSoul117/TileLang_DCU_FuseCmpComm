@@ -23,6 +23,7 @@ namespace tl {
 
 using namespace tir;
 using arith::IRMutatorWithAnalyzer;
+using tvm::ffi::GetRef;
 
 // GlobalMemChecker for a BufferLoad/BufferStore node:
 // 1. Identify BufferLoad and BufferStore nodes.
@@ -158,6 +159,19 @@ private:
       return load;
     }
 
+    // Global→shared: do not pad with if_then_else(..., 0). That form kills
+    // VectorizeLoop (Broadcast predicate → Scalarize) so DCU never sees a
+    // Ramp store and cannot emit cp_async. Defer OOB to an If around the
+    // shared store (VisitStmt_ BufferStore) — same shape as gemm divergence.
+    if (in_shared_store_value_) {
+      for (const auto &cond : conditions) {
+        ICHECK(cond.dtype() == DataType::Bool(1))
+            << "condition is not a boolean: " << cond;
+        shared_store_oob_conds_.push_back(cond);
+      }
+      return load;
+    }
+
     // For loading, we can always use safe value if the access is out of
     // bounds
     PrimExpr value = load;
@@ -169,16 +183,111 @@ private:
     return value;
   }
 
+  static bool IsZeroPadValue(const PrimExpr &value) {
+    if (const auto *broadcast = value.as<BroadcastNode>()) {
+      return IsZeroPadValue(broadcast->value);
+    }
+    if (const auto *cast = value.as<CastNode>()) {
+      return IsZeroPadValue(cast->value);
+    }
+    if (const auto *f = value.as<FloatImmNode>()) {
+      return f->value == 0.0;
+    }
+    if (const auto *i = value.as<IntImmNode>()) {
+      return i->value == 0;
+    }
+    return false;
+  }
+
+  // Fallback rewrite if an earlier pass already produced if_then_else pad.
+  static Stmt RewritePredicatedGlobalToShared(const BufferStore &store) {
+    String scope = store->buffer.scope();
+    if (scope != "shared" && scope != "shared.dyn") {
+      return store;
+    }
+
+    DataType store_dtype = store->value.dtype();
+    PrimExpr value = store->value;
+    if (const auto *cast = value.as<CastNode>()) {
+      value = cast->value;
+    }
+
+    PrimExpr cond;
+    bool saw_pred = false;
+    while (const auto *call = value.as<CallNode>()) {
+      if (!call->op.same_as(builtin::if_then_else()) || call->args.size() != 3 ||
+          !IsZeroPadValue(call->args[2])) {
+        break;
+      }
+      PrimExpr piece = call->args[0];
+      cond = saw_pred ? And(cond, piece) : piece;
+      saw_pred = true;
+      value = call->args[1];
+      if (const auto *cast = value.as<CastNode>()) {
+        value = cast->value;
+      }
+    }
+    if (!saw_pred) {
+      return store;
+    }
+
+    const BufferLoadNode *load = value.as<BufferLoadNode>();
+    if (load == nullptr) {
+      return store;
+    }
+    {
+      String src_scope = load->buffer.scope();
+      if (src_scope != "global" && src_scope != "") {
+        return store;
+      }
+    }
+
+    PrimExpr raw = GetRef<PrimExpr>(load);
+    if (raw.dtype() != store_dtype) {
+      raw = Cast(store_dtype, raw);
+    }
+    Stmt naked = BufferStore(store->buffer, raw, store->indices);
+    return IfThenElse(cond, naked);
+  }
+
   Stmt VisitStmt_(const BufferStoreNode *op) final {
-    // Check if the buffer is in global scope
+    const bool to_shared = isSharedBuffer(op->buffer);
+    Array<PrimExpr> saved_conds;
+    bool saved_flag = in_shared_store_value_;
+    if (to_shared) {
+      saved_conds = shared_store_oob_conds_;
+      shared_store_oob_conds_ = {};
+      in_shared_store_value_ = true;
+    }
+
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
+
+    if (to_shared) {
+      in_shared_store_value_ = saved_flag;
+      Array<PrimExpr> oob = shared_store_oob_conds_;
+      shared_store_oob_conds_ = saved_conds;
+
+      Stmt rewritten = RewritePredicatedGlobalToShared(store);
+      if (!rewritten.same_as(store)) {
+        return rewritten;
+      }
+
+      if (!oob.empty()) {
+        Stmt guarded = store;
+        for (const auto &cond : oob) {
+          guarded = IfThenElse(cond, guarded);
+        }
+        return guarded;
+      }
+      return store;
+    }
 
     GlobalMemChecker checker(analyzer_, /*recursively_collect_conds=*/false);
     checker(store);
     Array<PrimExpr> conditions = checker.GetConditions();
 
     // Skip boundary check if the store value is an IfThenElse
-    if (const IfThenElseNode *if_node = store->value.as<IfThenElseNode>()) {
+    if (store->value.as<IfThenElseNode>()) {
       if (!conditions.empty()) {
         LOG(WARNING)
             << "Skipping boundary check for store with IfThenElse value: "
@@ -287,6 +396,10 @@ private:
 
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, PrimExpr> annotated_safe_value_map_;
+  // When rewriting a shared BufferStore, skip if_then_else padding on the
+  // global load and collect OOB predicates here for an outer IfThenElse.
+  bool in_shared_store_value_{false};
+  Array<PrimExpr> shared_store_oob_conds_;
 };
 
 // Create a pass that legalizes vectorized loops in the IRModule

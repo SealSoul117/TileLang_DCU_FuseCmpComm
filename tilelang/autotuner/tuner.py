@@ -528,6 +528,12 @@ class AutoTuner:
             future_to_index[future] = i
 
         results_with_configs = []
+        compile_failed = []
+        timeout_failed = []
+        correctness_failed = []
+        runtime_failed = []
+        passed_configs = []
+
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Compiling configurations"):
             idx = future_to_index[future]
             config = config_args[idx]
@@ -535,7 +541,9 @@ class AutoTuner:
                 result = future.result()
                 results_with_configs.append((result, config))
             except Exception as e:
-                logger.debug(f"Compilation failed for config {config} at index {idx} with error: {e}")
+                compile_failed.append((config, f"{type(e).__name__}: {e}"))
+                logger.warning(f"Compilation failed for config {config} at index {idx}: {e}")
+                tqdm.write(f"COMPILE FAIL config {config}: {e}")
                 continue
 
         ref_latency = None
@@ -548,22 +556,57 @@ class AutoTuner:
                 # latency, ref_latency = target_fn(jit_kernel)
                 latency, ref_latency = run_with_timeout(target_fn, timeout, jit_kernel)
             except TimeoutException:
-                logger.warning(f"A timeout occurred while testing config {config}, checkout autotuner.log for more details")
+                timeout_failed.append(config)
+                logger.warning(f"TIMEOUT config {config}")
+                tqdm.write(f"TIMEOUT config {config}")
                 continue
-            except Exception:
-                logger.warning(f"An error occurred while testing config {config}, checkout autotuner.log for more details")
+            except Exception as e:
                 logger.debug(f"Error: {traceback.format_exc()}")
+                msg = str(e).split("\n", 1)[0][:400]
+                is_correctness = isinstance(e, AssertionError) or "mismatch" in str(e).lower()
+                if is_correctness:
+                    correctness_failed.append((config, msg))
+                    logger.warning(f"CORRECTNESS FAIL config {config}: {msg}")
+                    tqdm.write(f"CORRECTNESS FAIL config {config}: {msg}")
+                else:
+                    runtime_failed.append((config, f"{type(e).__name__}: {msg}"))
+                    logger.warning(f"RUNTIME FAIL config {config}: {type(e).__name__}: {msg}")
+                    tqdm.write(f"RUNTIME FAIL config {config}: {type(e).__name__}: {msg}")
                 continue
 
+            passed_configs.append((config, latency))
             if latency < best_latency:
                 best_latency = latency
                 best_config = config
                 best_kernel = jit_kernel
 
             progress_bar.set_postfix({"best_latency": best_latency})
-            tqdm.write(f"Tuned Latency {latency} with config {config} at index {i}")
+            tqdm.write(f"PASS latency {latency} with config {config} at index {i}")
 
         pool.shutdown()
+
+        summary_lines = [
+            "=== Autotune config check summary ===",
+            f"total: {len(config_args)}",
+            f"passed: {len(passed_configs)}",
+            f"correctness_fail: {len(correctness_failed)}",
+            f"compile_fail: {len(compile_failed)}",
+            f"timeout: {len(timeout_failed)}",
+            f"runtime_fail: {len(runtime_failed)}",
+        ]
+        for cfg, msg in correctness_failed:
+            summary_lines.append(f"  CORRECTNESS {cfg}: {msg}")
+        for cfg, msg in compile_failed:
+            summary_lines.append(f"  COMPILE {cfg}: {msg}")
+        for cfg in timeout_failed:
+            summary_lines.append(f"  TIMEOUT {cfg}")
+        for cfg, msg in runtime_failed:
+            summary_lines.append(f"  RUNTIME {cfg}: {msg}")
+        for cfg, lat in passed_configs:
+            summary_lines.append(f"  PASS {cfg}: latency={lat}")
+        summary = "\n".join(summary_lines)
+        logger.info(summary)
+        print(summary)
 
         if best_kernel is None:
             error_msg = "Auto-tuning failed: No configuration successfully compiled and passed benchmarking/validation."

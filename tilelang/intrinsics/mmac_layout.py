@@ -117,7 +117,6 @@ class LayoutConfig():
         self.intra_iter_num = self.slab_num * 4 // (self.warp_num * self.micro_m * self.micro_n * self.k_pack)
         self.row_per_4slab = self.slab_num * 4 // (self.micro_n * self.k_pack)
         self.row_per_slab = self.slab_num // (self.micro_n * self.k_pack)
-        self.slabs = self.micro_m * self.micro_n * self.k_pack * self.iter_num * self.warp_num // self.slab_num
         if is_B:
             self.padding_bytes = 64
         else:
@@ -133,6 +132,11 @@ class LayoutConfig():
             self.row_num = self.element_per_row * self.iter_num * self.warp_num
             self.row_per_slab = self.slab_num // self.row_num
             self.row_per_2slab = self.row_per_slab * 2
+            mn_dim = self.row_num
+        else:
+            mn_dim = self.micro_m * self.iter_num * self.warp_num
+        # Match copy.cc / compute_dcu_lds_slabs: mn_dim * 16 * k_pack / slab_num.
+        self.slabs = mn_dim * 16 * self.k_pack // self.slab_num
             
             
         
@@ -210,18 +214,14 @@ def dtype_elem_bytes(dtype):
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def compute_dcu_lds_slabs(mn_dim, k_pack, type_size, k_axis):
-    """Match copy.cc slab count: k_axis 0 uses 32-wide B NT tiles, else 16-wide."""
+def compute_dcu_lds_slabs(mn_dim, k_pack, type_size):
+    """Match copy.cc: slabs = mn_dim * 16 * k_pack / slab_num."""
     if type_size <= 0 or mn_dim <= 0:
         return 0
     slab_num = 1024 // type_size
     if slab_num <= 0:
         return 0
-    mn_per_iter_warp = 32 if k_axis == 0 else 16
-    if mn_dim < mn_per_iter_warp:
-        return 0
-    iter_times_warp = mn_dim // mn_per_iter_warp
-    return 16 * 16 * k_pack * iter_times_warp // slab_num
+    return mn_dim * 16 * k_pack // slab_num
 
 
 def xor_swizzle_col(row, col, inner_dim, type_size, vec_bytes=16):
@@ -246,13 +246,13 @@ def xor_swizzle_col(row, col, inner_dim, type_size, vec_bytes=16):
     return row, col_off
 
 
-def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1):
+def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1, warp_num=1):
     """Select SIMPLE / SWIZZLE / SLAB / REWIND. ``user_mode`` 0 means AUTO.
 
     SIMPLE when the operand cannot use ds_read_m32x16:
       B NT (k_axis=0): N < 32;  A / B-T (k_axis=1): MN <= 16.
-    Forced SWIZZLE/SLAB on a too-small tile degrades (SLAB also degrades
-    when slabs < 4). REWIND is opt-in and keeps the hygon AT/BN + AN/BT map.
+    SLAB degrades to SWIZZLE when slabs < 4 or block warp_num < 4
+    (SLAB shadow needs 4 warps). REWIND is opt-in.
     """
     too_small = (mn_dim < 32) if k_axis == 0 else (mn_dim * k_pack <= 16)
     if user_mode == LDS_SIMPLE:
@@ -263,9 +263,7 @@ def pick_dcu_lds_layout(user_mode, slabs, mn_dim, k_axis, k_pack=1):
         return LDS_SWIZZLE
     if user_mode == LDS_REWIND:
         return LDS_REWIND
-    if user_mode == LDS_SLAB:
-        return LDS_SWIZZLE if slabs < 4 else LDS_SLAB
-    if slabs < 4:
+    if warp_num < 4 or slabs < 4:
         return LDS_SWIZZLE
     return LDS_SLAB
 
@@ -395,9 +393,14 @@ def shared_to_local_layout_B(tx, local_id, warp_n, idx, layout_config):
     row = row - layout_config.row_per_slab * cond
     return row, new_col
 
-def shared_to_local_layout_B_simple(tx, local_id, warp_n=0, idx=0, micro_n=16):
+def shared_to_local_layout_B_simple(tx, local_id, warp_n=0, idx=0, micro_n=16, block_col_warps=1):
+    """NT-style 16-wide B tiles, interleaved the same way as ``make_mmac_store_layout``.
+
+    C stores tile ``j`` at ``N = j * micro_n * n_warp + warp_n * micro_n``.
+    Using ``idx * micro_n`` (no ``n_warp``) overlaps warps when ``n_warp > 1``.
+    """
     row = local_id + (tx // 16) * 4
-    col = tx % 16 + warp_n * micro_n + idx * micro_n
+    col = tx % 16 + warp_n * micro_n + idx * micro_n * block_col_warps
     return row, col
 
 

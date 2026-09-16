@@ -88,6 +88,17 @@ bool StmtIsDCUAsyncCopyRoot(const Stmt& stmt) {
             return StmtIsDCUAsyncCopyRoot(attr->body);
         }
     }
+    // Bounds-check If around an async A-copy must still count as one async
+    // root so AB pairing / consecutive-run logic is not broken.
+    if (const auto* iff = stmt.as<IfThenElseNode>()) {
+        if (StmtIsDCUAsyncCopyRoot(iff->then_case)) {
+            return true;
+        }
+        if (iff->else_case.defined() && StmtIsDCUAsyncCopyRoot(iff->else_case.value())) {
+            return true;
+        }
+        return false;
+    }
     if (const auto* seq = stmt.as<SeqStmtNode>()) {
         for (const Stmt& child : seq->seq) {
             if (StmtIsDCUAsyncCopyRoot(child)) {
@@ -720,14 +731,22 @@ public:
             if (ContainsMMA(stmt)) {
                 emit_pending_g2s_barrier();
                 if (pending_load_count > 0) {
-                    int fence_val = pending_load_count;
-                    if (phase_ == PipelinePhase::kAfterMainLoop) {
-                        if (last_sld_fence_val_ > 0) {
-                            fence_val = last_sld_fence_val_;
+                    // lgkmcnt(N) waits until <=N LGKM ops are still outstanding.
+                    // pending_load_count is LDS loads in this A+B cluster
+                    // (e.g. 4 A + 8 B = 12). Using that as N is only valid for
+                    // register-pipeline overlap. With num_stages=0 it becomes
+                    // lgkmcnt(12) right after 12 loads — wait for nothing.
+                    int fence_val = 0;
+                    if (register_pipeline_) {
+                        fence_val = pending_load_count;
+                        if (phase_ == PipelinePhase::kAfterMainLoop) {
+                            if (last_sld_fence_val_ > 0) {
+                                fence_val = last_sld_fence_val_;
+                            }
+                        } else if (global_last_fence_mma_.defined() &&
+                                   stmt.same_as(global_last_fence_mma_)) {
+                            fence_val = 0;
                         }
-                    } else if (global_last_fence_mma_.defined() &&
-                               stmt.same_as(global_last_fence_mma_)) {
-                        fence_val = 0;
                     }
 
                     new_seq.push_back(MakeSldFenceStmt(fence_val));

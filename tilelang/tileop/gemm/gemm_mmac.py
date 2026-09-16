@@ -23,19 +23,22 @@ def _resolve_dcu_lds_layouts(gemm, thread_nums: int):
     elem = dtype_elem_bytes(gemm.in_dtype)
     a_k_axis = 0 if gemm.trans_A else 1
     b_k_axis = 1 if gemm.trans_B else 0
+    warp_num = max(1, int(thread_nums) // 64)
     a_mode = pick_dcu_lds_layout(
         user_mode,
-        compute_dcu_lds_slabs(int(gemm.M), k_pack, elem, a_k_axis),
+        compute_dcu_lds_slabs(int(gemm.M), k_pack, elem),
         int(gemm.M),
         a_k_axis,
         k_pack,
+        warp_num,
     )
     b_mode = pick_dcu_lds_layout(
         user_mode,
-        compute_dcu_lds_slabs(int(gemm.N), k_pack, elem, b_k_axis),
+        compute_dcu_lds_slabs(int(gemm.N), k_pack, elem),
         int(gemm.N),
         b_k_axis,
         k_pack,
+        warp_num,
     )
     return a_mode, b_mode
 

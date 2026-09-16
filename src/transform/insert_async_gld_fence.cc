@@ -86,6 +86,45 @@ bool IsPrologueCommitStmt(const Stmt& stmt) {
   return false;
 }
 
+/*!
+ * \brief Count prologue async-commit markers, including those nested under
+ *        IfThenElse / SeqStmt.
+ *
+ * LegalizeSafeMemoryAccess may wrap an A-copy (+ its commit) in a bounds-check
+ * If. Counting only top-level commits then sees only the unconditional B
+ * commits, so a wave_barrier is emitted every two AB pairs (four cp_asyncs)
+ * instead of after each AB pair.
+ */
+int CountPrologueCommits(const Stmt& stmt) {
+  if (IsPrologueCommitStmt(stmt)) {
+    return 1;
+  }
+  if (const auto* attr = stmt.as<AttrStmtNode>()) {
+    return CountPrologueCommits(attr->body);
+  }
+  if (const auto* iff = stmt.as<IfThenElseNode>()) {
+    int then_n = CountPrologueCommits(iff->then_case);
+    int else_n = 0;
+    if (iff->else_case.defined()) {
+      else_n = CountPrologueCommits(iff->else_case.value());
+    }
+    // Divergent sides are the same AB stage; take max so we neither miss a
+    // barrier nor double-count when both branches commit.
+    return then_n > else_n ? then_n : else_n;
+  }
+  if (const auto* seq = stmt.as<SeqStmtNode>()) {
+    int n = 0;
+    for (const Stmt& child : seq->seq) {
+      n += CountPrologueCommits(child);
+    }
+    return n;
+  }
+  if (const auto* let = stmt.as<LetStmtNode>()) {
+    return CountPrologueCommits(let->body);
+  }
+  return 0;
+}
+
 bool ShouldTransform(const PipelinePhase phase) {
   return phase == PipelinePhase::kInMainLoop || phase == PipelinePhase::kAfterMainLoop;
 }
@@ -256,16 +295,16 @@ class InsertAsyncGldFenceMutator : public StmtMutator {
     int prologue_stage_commits = 0;
     auto append_leaf = [&](const Stmt& leaf) {
       result.push_back(leaf);
-      if (!emit_prologue_pair_barriers || !IsPrologueCommitStmt(leaf)) {
+      if (!emit_prologue_pair_barriers) {
         return;
       }
-      prologue_stage_commits += 1;
+      prologue_stage_commits += CountPrologueCommits(leaf);
       // Reference gemm.log: wave_barrier after each A+B pair.
-      if (prologue_stage_commits >= 2) {
+      while (prologue_stage_commits >= 2) {
         if (result.empty() || !IsWaveBarrierStmt(result.back())) {
           result.push_back(MakeWaveBarrierStmt());
         }
-        prologue_stage_commits = 0;
+        prologue_stage_commits -= 2;
       }
     };
     auto append_stmt = [&](const Stmt& stmt) {

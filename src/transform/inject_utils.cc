@@ -508,6 +508,8 @@ bool IsDCUCpAsyncVectorCopy(const BufferStoreNode* store, const BufferLoadNode* 
   if (store == nullptr || load == nullptr) {
     return false;
   }
+  // Dest must be a flat 1-D index for cp_async_gs M0 + lane*N.
+  // Source may gather (XOR swizzle / idxen); only require a single flat index.
   if (store->indices.size() != 1 || load->indices.size() != 1) {
     return false;
   }
@@ -522,8 +524,7 @@ bool IsDCUCpAsyncVectorCopy(const BufferStoreNode* store, const BufferLoadNode* 
     return false;
   }
   const int expected_lanes = 16 / elem_bytes;
-  return IsConsecutiveRamp(store->indices[0], expected_lanes) &&
-         IsConsecutiveRamp(load->indices[0], expected_lanes);
+  return IsConsecutiveRamp(store->indices[0], expected_lanes);
 }
 
 }  // namespace tl

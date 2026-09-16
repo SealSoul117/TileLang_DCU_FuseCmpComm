@@ -11,27 +11,27 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4, enable_register_pipeline=True, enable_warp_divergence=True):
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0): #enable_register_pipeline=True, enable_warp_divergence=True):
                 T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
                 T.copy(B[k * block_K, bx * block_N], B_shared, major="col_major")
-                T.gemm(A_shared, B_shared, C_local, k_pack=block_K//16, transpose_C=True)
+                T.gemm(A_shared, B_shared, C_local, k_pack=1, transpose_C=True, policy=T.GemmWarpPolicy.FullRow,)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return gemm
 
 import torch
-torch.cuda.set_device(7)
+torch.cuda.set_device(1)
 def main():
-    M = 19440
-    N = 5120
-    K = 5120
-    kernel = matmul(M, N, K, 256, 256, 16)
+    M = 64
+    N = 128
+    K = 64
+    kernel = matmul(M, N, K, 64, 128, 64)
 
     import torch
 

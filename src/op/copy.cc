@@ -672,6 +672,8 @@ For CopyNode::MakeDCUColAsyncSIMTLoop(arith::Analyzer *analyzer,
 
 For CopyNode::MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
                                         const DCUAsyncCopyParams &params) const {
+  // Bank XOR on the inner dim. Store linearly so G→S can lower to
+  // tl::cp_async_gs<16, smem_offset> (wave-uniform M0); gather global with XOR.
   Array<IterVar> loop_vars = MakeIterVars();
   for (const auto &iv : loop_vars) analyzer->Bind(iv->var, iv->dom);
 
@@ -699,23 +701,26 @@ For CopyNode::MakeDCUXorSwizzleSIMTLoop(arith::Analyzer *analyzer,
     j_mapped = analyzer->Simplify(j_mapped);
   }
 
-  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
-  Array<PrimExpr> dst_indices;
+  // XOR is involutive: LDS[i, xor(j)] = G[i, j]  <=>  LDS[i, j] = G[i, xor(j)].
+  // Write LDS linearly so cp_async_gs can use wave-uniform M0 + lane*N; gather G.
+  Array<PrimExpr> src_indices;
   size_t idx_in_vars = 0;
-  for (size_t i = 0; i < dst_range.size(); ++i) {
-    if (is_one(dst_range[i]->extent)) {
-      dst_indices.push_back(dst_range[i]->min);
+  for (size_t i = 0; i < src_range.size(); ++i) {
+    if (is_one(src_range[i]->extent)) {
+      src_indices.push_back(src_range[i]->min);
     } else {
       if (idx_in_vars == 0) {
-        dst_indices.push_back(dst_range[i]->min + i_raw);
+        src_indices.push_back(src_range[i]->min + i_raw);
       } else if (idx_in_vars == 1) {
-        dst_indices.push_back(dst_range[i]->min + j_mapped);
+        src_indices.push_back(src_range[i]->min + j_mapped);
       } else {
-        dst_indices.push_back(dst_range[i]->min + loop_vars[idx_in_vars]->var);
+        src_indices.push_back(src_range[i]->min + loop_vars[idx_in_vars]->var);
       }
       idx_in_vars++;
     }
   }
+
+  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
 
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) value = Cast(dst->dtype, value);
@@ -2065,30 +2070,37 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
         copy_params.k_dim = (copy_params.k_axis == 0) ? dim0_i : dim1_i;
       }
       
+      // Layout-mode pick only. Must not feed row/col gather or copy trip count.
+      // slabs = mn_dim * 16 * k_pack / slab_num  (16 = MFMA K, not B's 32-wide step).
       const int slabs = [&]() {
         const int elem_bytes = copy_params.dtype.bytes();
         ICHECK_GT(elem_bytes, 0);
         const int slab_num = 1024 / elem_bytes;
         ICHECK_GT(slab_num, 0);
-        constexpr int micro_m = 16;
-        constexpr int micro_n = 16;
-        const int mn_per_iter_warp = (copy_params.k_axis == 0) ? (micro_n * 2) : micro_m;
-        const int iter_times_warp = copy_params.mn_dim / mn_per_iter_warp;
-        return micro_m * micro_n * copy_params.k_pack * iter_times_warp / slab_num;
+        constexpr int micro_k = 16;
+        return copy_params.mn_dim * micro_k * copy_params.k_pack / slab_num;
       }();
 
       // Match pick_dcu_lds_layout: 16-wide A / <32-wide B NT cannot use
-      // ds_read_m32x16. Forced slab with slabs<4 degrades to XOR swizzle.
+      // ds_read_m32x16. SLAB needs >=4 warps (shadow slots); otherwise XOR swizzle.
+      int block_warps = 1;
+      if (copy_params.block_threads > 0) {
+        block_warps = std::max(1, copy_params.block_threads / 64);
+      } else if (const auto *wn = analyzer->Simplify(warp_num).as<IntImmNode>()) {
+        block_warps = std::max(1, static_cast<int>(wn->value));
+      }
       const bool too_small = (copy_params.k_axis == 0)
                                  ? (copy_params.mn_dim < 32)
                                  : (copy_params.mn_dim * copy_params.k_pack <= 16);
       int lds_mode = gemm_lds_layout;
       if (lds_mode == 1 || too_small) {
         lds_mode = 1;
-      } else if (lds_mode == 3 && slabs < 4) {
+      } else if (lds_mode == 4) {
+        // REWIND is opt-in; leave as-is.
+      } else if (lds_mode == 3 && (slabs < 4 || block_warps < 4)) {
         lds_mode = 2;
       } else if (lds_mode == 0) {
-        lds_mode = (slabs >= 4) ? 3 : 2;
+        lds_mode = (slabs >= 4 && block_warps >= 4) ? 3 : 2;
       }
 
       if (lds_mode == 1) {
@@ -2179,10 +2191,12 @@ Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,
   if (gemm_operand.has_value()) {
     result = AttrStmt(dst_name_node, kDCUGemmOperandStmt,
                       IntImm(DataType::Int(32), gemm_operand.value()), result);
-    // Same rule as NeedsDCUAsyncCopyIdxenForOperand: A not-transposed / B transposed.
+    // Idxen is SLAB structured-buffer gather only (needs shadow). SWIZZLE
+    // uses per-lane offen on a linear LDS dest and must stay cp_async_gs.
     const bool use_idxen =
-        need_layout && ((gemm_operand.value() == 0 && !gemm_trans_a) ||
-                        (gemm_operand.value() == 1 && gemm_trans_b));
+        need_shadow && need_layout &&
+        ((gemm_operand.value() == 0 && !gemm_trans_a) ||
+         (gemm_operand.value() == 1 && gemm_trans_b));
     result = AttrStmt(dst_name_node, kDCUUseIdxenStmt, Bool(use_idxen), result);
   }
   return result;

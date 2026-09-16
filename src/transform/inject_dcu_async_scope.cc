@@ -1,32 +1,26 @@
 /*!
  * \file inject_dcu_async_scope.cc
- * \brief Wrap non-pipelined global→shared BufferStores in tir::attr::async_scope
- *        AttrStmt so that LowerSharedGlobalCopy can rewrite them into
- *        tl.dcu_async_copy calls (which codegen lowers to tl::cp_async_gs<...>).
+ * \brief Synchronize global→shared copies for DCU/HIP.
  *
- *        When a For loop already carries a ``num_stages`` annotation,
- *        pipeline_planning / InjectSoftwarePipeline already wrap those
- *        in-loop g2s stores in async_scope, so this pass leaves them
- *        alone. Prologue copies that sit *outside* such a loop (e.g. Q
- *        loaded once before a pipelined K loop) are still wrapped: the
- *        presence of an existing async_scope on the K copies must not
- *        skip the whole function.
+ *        1. Wrap *vectorized* 16B g2s BufferStores in tir::attr::async_scope so
+ *           LowerSharedGlobalCopy can rewrite them to tl.dcu_async_copy
+ *           (codegen: tl::cp_async_gs) + ptx_commit_group.
  *
- *        The scan covers the whole function body, not just For bodies: with
- *        num_stages == 0 an extent-1 pipelined loop is collapsed by earlier
- *        passes (Simplify/VectorizeLoop/StorageRewrite), leaving the g2s
- *        stores at the top level of the kernel body where a For-only scan
- *        would miss them.
+ *        2. After every consecutive g2s cluster — whether lowered to cp_async
+ *           or left as scalar predicated stores — emit
+ *             ptx_commit_group + tl.cp_async_wait<0> + tl.wave_barrier
+ *           so later shared→reg / mmac sees the data across waves.
  *
- *        When num_stages == 0 the InjectSoftwarePipeline pass is bypassed,
- *        so the pipeline-style async_commit / async_wait AttrStmts that drive
- *        cp_async_wait<N> emission are never produced. To keep semantics
- *        correct, after every g2s copy we also emit an explicit
- *        tl.cp_async_wait<0>() + tl.wave_barrier() pair so the subsequent
- *        s2r reads from shared memory observe the loaded data. Mirrors the
- *        MakeWaveBarrierStmt / MakeAsyncGldFenceStmt helpers used in
- *        insert_async_gld_fence.cc.
+ *           Scalar g2s still needs wait/barrier: LDS writes are not
+ *           cross-wave visible without s_barrier, and vmcnt(0) drains any
+ *           outstanding global loads. Commit is a HIP no-op but keeps the
+ *           same commit/wait pairing as the async path.
+ *
+ *        When a For already carries num_stages, software pipeline owns those
+ *        in-loop copies; this pass skips them. Prologue copies outside such
+ *        loops are still handled.
  */
+
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/tir/op.h>
@@ -42,6 +36,7 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+using ffi::Array;
 
 namespace {
 
@@ -60,32 +55,37 @@ const BufferLoadNode *PeelBufferLoad(const PrimExpr &value) {
     return load;
   }
   if (const auto *cast = value.as<CastNode>()) {
-    return cast->value.as<BufferLoadNode>();
+    return PeelBufferLoad(cast->value);
+  }
+  if (const auto *call = value.as<CallNode>()) {
+    if (call->op.same_as(builtin::if_then_else()) && call->args.size() == 3) {
+      return PeelBufferLoad(call->args[1]);
+    }
   }
   return nullptr;
 }
 
+bool IsGlobalToSharedStore(const BufferStoreNode *op) {
+  if (!IsSharedScope(op->buffer.scope())) {
+    return false;
+  }
+  const BufferLoadNode *load = PeelBufferLoad(op->value);
+  return load != nullptr && IsGlobalScope(load->buffer);
+}
+
+bool IsAsyncEligibleG2S(const BufferStoreNode *op) {
+  const BufferLoadNode *load = PeelBufferLoad(op->value);
+  return load != nullptr && IsDCUCpAsyncVectorCopy(op, load);
+}
+
 /*!
- * \brief Collect BufferStore nodes that copy from a global Buffer into a
- *        shared/shared.dyn Buffer. Only direct BufferLoad / Cast<BufferLoad>
- *        values are matched (mirrors the predicate inside
- *        LowerSharedGlobalCopy::CollectResources).
- *
- *        Stores inside For loops annotated with num_stages are skipped: those
- *        belong to the software-pipeline path, which already emits its own
- *        async_scope wrappers and must not be wrapped twice. Stores already
- *        nested under attr::async_scope are likewise skipped.
- *
- *        Note that g2s stores may appear outside any For loop entirely: with
- *        num_stages == 0 the pipelined loop is bypassed and, when its extent
- *        is 1 (or it gets unrolled by earlier passes), earlier passes collapse
- *        it so the copies sit directly in the kernel body. Scanning the whole
- *        body (not just For bodies) is what makes those top-level copies
- *        visible to this pass.
+ * \brief Collect all global→shared BufferStores (scalar or vector).
+ *        Also record which of them are eligible for cp_async lowering.
  */
 class GlobalToSharedStoreCollector : public StmtExprVisitor {
  public:
   std::vector<const BufferStoreNode *> stores;
+  std::vector<const BufferStoreNode *> async_stores;
 
  private:
   int async_scope_depth_{0};
@@ -108,24 +108,16 @@ class GlobalToSharedStoreCollector : public StmtExprVisitor {
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (async_scope_depth_ == 0 && IsSharedScope(op->buffer.scope())) {
-      const BufferLoadNode *load = PeelBufferLoad(op->value);
-      // Only wrap vectorized 16-byte g2s; scalar copies must not become
-      // tl.dcu_async_copy / cp_async_gs<16>.
-      if (load != nullptr && IsGlobalScope(load->buffer) &&
-          IsDCUCpAsyncVectorCopy(op, load)) {
-        stores.push_back(op);
+    if (async_scope_depth_ == 0 && IsGlobalToSharedStore(op)) {
+      stores.push_back(op);
+      if (IsAsyncEligibleG2S(op)) {
+        async_stores.push_back(op);
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 };
 
-/*!
- * \brief Cheap outer scan: returns true iff the function body contains at
- *        least one global→shared BufferStore that is neither inside a
- *        num_stages-annotated For nor already wrapped in async_scope.
- */
 class NeedsInjectionScanner : public StmtVisitor {
  public:
   bool needs_injection{false};
@@ -151,68 +143,179 @@ class NeedsInjectionScanner : public StmtVisitor {
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (async_scope_depth_ == 0 && IsSharedScope(op->buffer.scope())) {
-      const BufferLoadNode *load = PeelBufferLoad(op->value);
-      if (load != nullptr && IsGlobalScope(load->buffer) &&
-          IsDCUCpAsyncVectorCopy(op, load)) {
-        needs_injection = true;
-      }
+    if (async_scope_depth_ == 0 && IsGlobalToSharedStore(op)) {
+      needs_injection = true;
     }
     StmtVisitor::VisitStmt_(op);
   }
 };
 
-/*!
- * \brief Build a tl.cp_async_wait<N> Evaluate statement.
- *        Mirrors MakeAsyncGldFenceStmt in insert_async_gld_fence.cc.
- */
+Stmt MakeCpAsyncCommitStmt() {
+  return Evaluate(Call(DataType::Handle(), builtin::ptx_commit_group(), {}));
+}
+
 Stmt MakeCpAsyncWaitStmt(int wait_count = 0) {
   auto wait_call =
       Call(DataType::Void(), Op::Get("tl.cp_async_wait"), {Integer(wait_count)});
   return Evaluate(wait_call);
 }
 
-/*!
- * \brief Build a tl.wave_barrier Evaluate statement.
- *        Mirrors MakeWaveBarrierStmt in insert_async_gld_fence.cc.
- */
 Stmt MakeWaveBarrierStmt() {
   auto barrier_call = Call(DataType::Void(), Op::Get("tl.wave_barrier"), {});
   return Evaluate(barrier_call);
 }
 
 /*!
- * \brief Wrap each collected BufferStore in its own AttrStmt with attr_key =
- *        tir::attr::async_scope. The downstream LowerSharedGlobalCopy pass
- *        recognizes this AttrStmt and consumes it (strips it and replaces the
- *        BufferStore with a tl.dcu_async_copy call). Wrapping each store
- *        individually is sufficient because LowerSharedGlobalCopy's
- *        CollectResources is gated by in_async and visits children of the
- *        AttrStmt before stripping it.
- *
- *        In addition, emit an explicit tl.cp_async_wait<0>() + tl.wave_barrier()
- *        pair immediately after every async copy. The HIP codegen already
- *        lowers tl.cp_async_wait and tl.wave_barrier to the matching
- *        tl::cp_async_wait<N>() / tl::wave_barrier() calls (see
- *        src/target/codegen_hip.cc).
+ * \brief Wrap async-eligible stores in async_scope. After every g2s cluster
+ *        (async or scalar), emit commit (scalar only) + wait<0> + wave_barrier.
  */
 class AsyncScopeInjector : public StmtExprMutator {
  public:
-  explicit AsyncScopeInjector(std::unordered_set<const BufferStoreNode *> targets)
-      : targets_(std::move(targets)) {}
+  explicit AsyncScopeInjector(
+      std::unordered_set<const BufferStoreNode *> async_targets)
+      : async_targets_(std::move(async_targets)) {}
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     Stmt new_stmt = StmtExprMutator::VisitStmt_(op);
-    if (targets_.count(op)) {
-      Stmt async_store =
-          AttrStmt(ObjectRef(), tir::attr::async_scope, Integer(0), new_stmt);
-      return SeqStmt({async_store, MakeCpAsyncWaitStmt(0), MakeWaveBarrierStmt()});
+    if (async_targets_.count(op)) {
+      return AttrStmt(ObjectRef(), tir::attr::async_scope, Integer(0), new_stmt);
     }
     return new_stmt;
   }
 
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> visited;
+    visited.reserve(op->seq.size());
+    for (const Stmt &child : op->seq) {
+      visited.push_back(VisitStmt(child));
+    }
+    Stmt flattened = SeqStmt::Flatten(visited);
+    const auto *seq = flattened.as<SeqStmtNode>();
+    if (seq == nullptr) {
+      return flattened;
+    }
+
+    bool all_g2s = !seq->seq.empty();
+    for (const Stmt &s : seq->seq) {
+      if (!IsG2SCluster(s)) {
+        all_g2s = false;
+        break;
+      }
+    }
+    // Pure g2s cluster: parent SeqStmt emits the single commit/wait/barrier.
+    if (all_g2s) {
+      return flattened;
+    }
+
+    Array<Stmt> out;
+    bool in_g2s = false;
+    bool cluster_is_async = false;
+    auto flush_sync = [&]() {
+      if (!in_g2s) {
+        return;
+      }
+      // Async g2s: LowerSharedGlobalCopy already emits ptx_commit_group per
+      // cp_async. Scalar g2s has no Lower rewrite, so emit commit here.
+      // Both paths need wait<0> + wave_barrier for LDS cross-wave visibility.
+      if (!cluster_is_async) {
+        out.push_back(MakeCpAsyncCommitStmt());
+      }
+      out.push_back(MakeCpAsyncWaitStmt(0));
+      out.push_back(MakeWaveBarrierStmt());
+      in_g2s = false;
+      cluster_is_async = false;
+    };
+    for (const Stmt &s : seq->seq) {
+      if (IsG2SCluster(s)) {
+        out.push_back(s);
+        in_g2s = true;
+        if (ContainsAsyncScope(s)) {
+          cluster_is_async = true;
+        }
+      } else {
+        flush_sync();
+        out.push_back(s);
+      }
+    }
+    flush_sync();
+    return SeqStmt::Flatten(out);
+  }
+
  private:
-  std::unordered_set<const BufferStoreNode *> targets_;
+  static bool ContainsAsyncScope(const Stmt &stmt) {
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      if (attr->attr_key == tir::attr::async_scope ||
+          attr->attr_key == "async_scope") {
+        return true;
+      }
+      return ContainsAsyncScope(attr->body);
+    }
+    if (const auto *for_op = stmt.as<ForNode>()) {
+      return ContainsAsyncScope(for_op->body);
+    }
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      return ContainsAsyncScope(let->body);
+    }
+    if (const auto *iff = stmt.as<IfThenElseNode>()) {
+      if (ContainsAsyncScope(iff->then_case)) {
+        return true;
+      }
+      return iff->else_case.defined() &&
+             ContainsAsyncScope(iff->else_case.value());
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &s : seq->seq) {
+        if (ContainsAsyncScope(s)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Identify g2s by shape, not by pre-collected pointers: StmtExprMutator may
+  // rebuild BufferStore nodes so pointer identity is unreliable after Visit.
+  static bool IsG2SCluster(const Stmt &stmt) {
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      if (attr->attr_key == tir::attr::async_scope ||
+          attr->attr_key == "async_scope") {
+        return true;
+      }
+      return IsG2SCluster(attr->body);
+    }
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      return IsGlobalToSharedStore(store);
+    }
+    if (const auto *for_op = stmt.as<ForNode>()) {
+      return IsG2SCluster(for_op->body);
+    }
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      return IsG2SCluster(let->body);
+    }
+    if (const auto *iff = stmt.as<IfThenElseNode>()) {
+      if (!IsG2SCluster(iff->then_case)) {
+        return false;
+      }
+      if (!iff->else_case.defined()) {
+        return true;
+      }
+      return IsG2SCluster(iff->else_case.value());
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      if (seq->seq.empty()) {
+        return false;
+      }
+      for (const Stmt &s : seq->seq) {
+        if (!IsG2SCluster(s)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  std::unordered_set<const BufferStoreNode *> async_targets_;
 };
 
 PrimFunc InjectDCUAsyncScopeToFunc(PrimFunc func) {
@@ -224,10 +327,10 @@ PrimFunc InjectDCUAsyncScopeToFunc(PrimFunc func) {
 
   GlobalToSharedStoreCollector collector;
   collector(func->body);
-  std::unordered_set<const BufferStoreNode *> targets(collector.stores.begin(),
-                                                     collector.stores.end());
+  std::unordered_set<const BufferStoreNode *> async_targets(
+      collector.async_stores.begin(), collector.async_stores.end());
 
-  AsyncScopeInjector mutator(std::move(targets));
+  AsyncScopeInjector mutator(std::move(async_targets));
   auto *n = func.CopyOnWrite();
   n->body = mutator(std::move(n->body));
   return func;

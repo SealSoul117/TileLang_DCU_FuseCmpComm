@@ -167,8 +167,6 @@ CollectResult CollectResources(const Stmt& body) {
 
     private:
         bool in_async{false};
-        bool in_need_layout_{false};
-        bool skip_async_{false};
         std::unordered_set<const tvm::tir::VarNode*> loop_vars_;
         std::unordered_set<const tvm::tir::VarNode*> thread_vars_;
         bool IsSharedScope(const Buffer& buf) {
@@ -198,18 +196,9 @@ CollectResult CollectResources(const Stmt& body) {
                     StmtExprVisitor::VisitStmt_(attr);
                 }
 
-            } else if (attr->attr_key == kDCUNeedLayoutStmt) {
-                bool old = in_need_layout_;
-                in_need_layout_ = !is_zero(attr->value);
+            } else if (attr->attr_key == kDCUNeedLayoutStmt ||
+                       attr->attr_key == kDCUNeedShadowStmt) {
                 StmtExprVisitor::VisitStmt_(attr);
-                in_need_layout_ = old;
-            } else if (attr->attr_key == kDCUNeedShadowStmt) {
-                bool old_skip = skip_async_;
-                // XOR-swizzle copies (need_layout, no shadow): per-thread LDS
-                // destinations cannot use cp_async_gs, which takes lane-0 M0.
-                skip_async_ = in_need_layout_ && is_zero(attr->value);
-                StmtExprVisitor::VisitStmt_(attr);
-                skip_async_ = old_skip;
             } else if (attr->attr_key == tir::attr::async_scope) {
                 ICHECK(in_async == false) << "Nested async scopes not supported";
                 in_async = true;
@@ -247,24 +236,8 @@ CollectResult CollectResources(const Stmt& body) {
             if (!IsGlobalScope(src)) {
                 return false;
             }
-            if (skip_async_) {
-                return false;
-            }
-            for (const auto& idx : op->indices) {
-                bool has_xor = false;
-                tir::PostOrderVisit(idx, [&](const ObjectRef& n) {
-                    const auto* call = n.as<CallNode>();
-                    if (call && call->op.same_as(builtin::bitwise_xor())) {
-                        has_xor = true;
-                    }
-                });
-                if (has_xor) {
-                    return false;
-                }
-            }
-            // cp_async_gs<16> always transfers 16 consecutive bytes; skip scalar /
-            // non-vectorized g2s (e.g. B_shared[tid] = B[...]) so they stay as
-            // ordinary BufferStore.
+            // LDS dest must be a consecutive 16B vector (cp_async_gs M0 + lane*N).
+            // Source may gather (XOR swizzle / idxen); do not reject XOR on src.
             if (!IsDCUCpAsyncVectorCopy(op, load)) {
                 return false;
             }
@@ -449,19 +422,98 @@ class DCUAsyncCopySmemOffsetFixer : public StmtExprMutator {
   }
 };
 
+class UsedVarCollector : public ExprVisitor {
+ public:
+  std::unordered_set<const VarNode*> vars;
+  void VisitExpr_(const VarNode* op) final { vars.insert(op); }
+};
+
+class LetVarCollector : public StmtVisitor {
+ public:
+  std::unordered_set<const VarNode*> vars;
+  void VisitStmt_(const LetStmtNode* op) final {
+    vars.insert(op->var.get());
+    StmtVisitor::VisitStmt_(op);
+  }
+};
+
+Stmt WrapWithDCUResourceLets(
+    Stmt body, const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings) {
+  Stmt new_stmt = std::move(body);
+  for (const auto& item : bindings) {
+    new_stmt = LetStmt(item.second.first, item.second.second, new_stmt);
+  }
+  return new_stmt;
+}
+
+// Insert *_dcu_res Lets after LetStmts they depend on (e.g. q_start_idx / k_start_idx).
+Stmt InsertDCUResourceLetsAfterDeps(
+    Stmt stmt, std::unordered_set<const VarNode*> pending,
+    const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings) {
+  if (const auto* let = stmt.as<LetStmtNode>()) {
+    pending.erase(let->var.get());
+    Stmt new_body = InsertDCUResourceLetsAfterDeps(let->body, std::move(pending), bindings);
+    if (new_body.same_as(let->body)) {
+      return stmt;
+    }
+    return LetStmt(let->var, let->value, new_body);
+  }
+  if (pending.empty()) {
+    return WrapWithDCUResourceLets(std::move(stmt), bindings);
+  }
+  if (const auto* alloc = stmt.as<AllocateNode>()) {
+    Stmt new_body = InsertDCUResourceLetsAfterDeps(alloc->body, std::move(pending), bindings);
+    if (new_body.same_as(alloc->body)) {
+      return stmt;
+    }
+    return Allocate(alloc->buffer_var, alloc->dtype, alloc->extents, alloc->condition, new_body,
+                    alloc->annotations);
+  }
+  if (const auto* decl = stmt.as<DeclBufferNode>()) {
+    Stmt new_body = InsertDCUResourceLetsAfterDeps(decl->body, std::move(pending), bindings);
+    if (new_body.same_as(decl->body)) {
+      return stmt;
+    }
+    return DeclBuffer(decl->buffer, new_body);
+  }
+  if (const auto* attr = stmt.as<AttrStmtNode>()) {
+    Stmt new_body = InsertDCUResourceLetsAfterDeps(attr->body, std::move(pending), bindings);
+    if (new_body.same_as(attr->body)) {
+      return stmt;
+    }
+    return AttrStmt(attr->node, attr->attr_key, attr->value, new_body);
+  }
+  if (const auto* asrt = stmt.as<AssertStmtNode>()) {
+    Stmt new_body = InsertDCUResourceLetsAfterDeps(asrt->body, std::move(pending), bindings);
+    if (new_body.same_as(asrt->body)) {
+      return stmt;
+    }
+    return AssertStmt(asrt->condition, asrt->message, new_body);
+  }
+  return WrapWithDCUResourceLets(std::move(stmt), bindings);
+}
+
 Stmt InjectDCUResources(Stmt body,
                         const std::unordered_map<String, std::pair<Var, PrimExpr>>& bindings) {
     if (bindings.empty()) {
         return body;
     }
+
+    UsedVarCollector used;
+    for (const auto& item : bindings) {
+      used(item.second.second);
+    }
+    LetVarCollector lets;
+    lets(body);
+    std::unordered_set<const VarNode*> pending;
+    for (const VarNode* v : used.vars) {
+      if (lets.vars.count(v)) {
+        pending.insert(v);
+      }
+    }
+
     return InjectAtDCUTarget(body, [&](const Stmt& target_body) {
-        Stmt new_stmt = target_body;
-        for (const auto& item : bindings) {
-            Var res_var = item.second.first;
-            PrimExpr init_expr = item.second.second;
-            new_stmt = LetStmt(res_var, init_expr, new_stmt);
-        }
-        return new_stmt;
+        return InsertDCUResourceLetsAfterDeps(target_body, pending, bindings);
     });
 }
 

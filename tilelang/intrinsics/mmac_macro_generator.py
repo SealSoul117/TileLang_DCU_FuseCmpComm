@@ -502,7 +502,7 @@ class MatrixCoreIntrinEmitter:
                     for j in T.serial(warp_cols):
                         for local_id in T.vectorized(k_pack * local_size_b):
                             row, col = shared_to_local_layout_B_simple(
-                                tx, local_id, warp_n, j, micro_size_y)
+                                tx, local_id, warp_n, j, micro_size_y, self.block_col_warps)
                             row, col = xor_swizzle_col(
                                 row + ki * micro_size_k,
                                 col, inner_dim, layout_config.type_size)
@@ -530,7 +530,7 @@ class MatrixCoreIntrinEmitter:
                     for j in T.serial(warp_cols):
                         for local_id in T.vectorized(k_pack * local_size_b):
                             row, col = shared_to_local_layout_B_simple(
-                                tx, local_id, warp_n, j, micro_size_y)
+                                tx, local_id, warp_n, j, micro_size_y, self.block_col_warps)
                             B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + row + ki * micro_size_k, B_base1 + col]
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, kp, thread_binding, rk)
 
@@ -927,17 +927,18 @@ class MatrixCoreIntrinEmitter:
             micro_size_dcu_x = raw_slab4 * 16
         n_extent = self.block_col_warps * self.warp_col_tiles
         raw_slab4_b = (n_extent * self.micro_size_k * self.k_pack) // slab4_elems
-        # 32-wide C grouping is only valid once a full 4-slab (N>=128) exists.
-        # N=64 still has n_extent>=32 but raw_slab4_b==0; using y=32 makes
-        # forward_index_nt permute 16-col tiles (0,8,4,12) while mmac writes
-        # them linearly (0,4,8,12), which breaks softmax on BM=BN=64.
-        if n_extent < 32 or raw_slab4_b < 1:
+        # 16-wide B (SWIZZLE / SIMPLE) cannot use ds_read_m32x16, so C must keep
+        # 16-col tiles. NT store packing (forward_index_nt) is not that layout:
+        # at N=64 it is identical to NN, and at N>=128 it permutes 16-col groups.
+        # SLAB/REWIND may group N in 32 for ds_read once a 4-slab exists.
+        b_16wide = self.b_lds_layout in (LDS_SWIZZLE, LDS_SIMPLE)
+        if b_16wide or n_extent < 32 or raw_slab4_b < 1:
             slab4_num_b = 1
             micro_size_dcu_y = micro_size_y
         else:
             slab4_num_b = max(1, raw_slab4_b)
             micro_size_dcu_y = 32
-        if self.b_transposed and raw_slab4_b >= 1:
+        if (not b_16wide) and self.b_transposed and raw_slab4_b >= 1:
             micro_size_dcu_y = slab4_num_b * 16
         def forward_thread(i: int, j: int) -> int:
             """
@@ -1041,17 +1042,11 @@ class MatrixCoreIntrinEmitter:
                 forward_thread_fn=forward_thread,
                 forward_index_fn=forward_index,
             )
-        else:
-            # For NT/TN/TT cases the C register layout is the same as the NN case.
-            # The MMA intrinsic transpose flags only affect how A/B inputs are
-            # interpreted; the output C is always stored in the same register
-            # layout. Use forward_index (not forward_index_nt) to avoid index
-            # collisions and ensure the per-thread buffer size is correct.
-            return T.Fragment(
-                shape,
-                forward_thread_fn=forward_thread_nt,
-                forward_index_fn=forward_index_nt,
-            )
+        return T.Fragment(
+            shape,
+            forward_thread_fn=forward_thread_nt,
+            forward_index_fn=forward_index_nt,
+        )
 
     @staticmethod
     def _legalize_to_buffer_region(obj: Buffer | BufferLoad | BufferRegion) -> BufferRegion:

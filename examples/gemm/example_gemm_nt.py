@@ -11,16 +11,15 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
-            T.use_warp_divergence(enable=False)
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=0):
                 T.copy(A[by * block_M, k * block_K], A_shared, major="row_major")
                 T.copy(B[bx * block_N, k * block_K], B_shared, major="row_major")
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
 
             T.copy(C_local, C[by * block_M, bx * block_N])
 
@@ -28,10 +27,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    M = 4096
-    N = 4096
-    K = 4096
-    kernel = matmul(M, N, K, 256, 256, 16)
+    M = 128
+    N = 64
+    K = 128
+    kernel = matmul(M, N, K, 128, 64, 128)
 
     import torch
 

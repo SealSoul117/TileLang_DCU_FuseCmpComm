@@ -13,7 +13,7 @@ from tilelang.transform.simplify import _Simplify
 
 
 class GemmMMASm70(GemmBase):
-    def infer_layout(self, target: Target, thread_nums: int):
+    def infer_layout(self, target: Target, thread_nums: int, layout_map=None):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, False)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)

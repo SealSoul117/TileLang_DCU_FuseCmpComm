@@ -16,10 +16,9 @@ from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
 
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
-def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range):
+def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range, layout_map=None):
     thread_nums = thread_bounds.extent
-    t = gemm_py.infer_layout(target, thread_nums)
-    return gemm_py.infer_layout(target, thread_nums)
+    return gemm_py.infer_layout(target, thread_nums, layout_map)
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.lower")
@@ -142,11 +141,11 @@ class GemmPy(Node, Scriptable):
     def wg_wait(self):
         return self.wgWait
 
-    def infer_layout(self, target: Target, thread_nums: int):
+    def infer_layout(self, target: Target, thread_nums: int, layout_map=None):
         """Infer the layout for the GEMM operation based on target architecture."""
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
-        return impl_class(self).infer_layout(target, thread_nums)
+        return impl_class(self).infer_layout(target, thread_nums, layout_map)
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
         """Lower the GEMM operation to TIR statements based on target architecture."""

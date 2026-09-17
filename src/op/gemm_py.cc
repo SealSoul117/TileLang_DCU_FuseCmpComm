@@ -311,7 +311,8 @@ LayoutMap GemmPyNode::InferLayout(const LayoutInferArgs &T,
 
   if (const auto f = ffi::Function::GetGlobal("tl.gemm_py.infer_layout")) {
     results = Downcast<LayoutMap>(
-        (*f)(tvm::ffi::GetRef<GemmPy>(this), T.target, T.thread_bounds));
+        (*f)(tvm::ffi::GetRef<GemmPy>(this), T.target, T.thread_bounds,
+             T.layout_map));
     // Bind all fragment layouts with the provided thread range
     for (auto kv : results) {
       const Buffer &buf = kv.first;

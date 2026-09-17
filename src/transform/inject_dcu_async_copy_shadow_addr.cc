@@ -3,6 +3,7 @@
  * \brief Remap shared.dyn base pointers for tl.dcu_async_copy with warp-dependent
  *        shadow offsets, and replace buf_dyn_shmem with per-buffer shadow addresses.
  */
+#include <tvm/ir/type.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/builtin.h>
@@ -32,7 +33,13 @@ using namespace tir;
 namespace {
 
 const Op& DCUAsyncCopyOp() { return Op::Get("tl.dcu_async_copy"); }
+const Op& DCUAsyncCopyIdxenOp() { return Op::Get("tl.dcu_async_copy_idxen"); }
 const Op& MakeDCUResourceOp() { return Op::Get("tl.make_dcu_resource"); }
+
+bool IsDCUAsyncCopyCall(const CallNode* call) {
+  return call != nullptr && (call->op.same_as(DCUAsyncCopyOp()) ||
+                             call->op.same_as(DCUAsyncCopyIdxenOp()));
+}
 
 bool IsABufferName(const std::string& name) { return name == "A" || name == "A_1"; }
 
@@ -176,7 +183,7 @@ struct DcuResShadowSpec {
 const CallNode* ExtractDCUAsyncCopyFromStmt(const Stmt& stmt) {
   if (const auto* eval = stmt.as<EvaluateNode>()) {
     if (const auto* call = eval->value.as<CallNode>()) {
-      if (call->op.same_as(DCUAsyncCopyOp())) {
+      if (IsDCUAsyncCopyCall(call)) {
         return call;
       }
     }
@@ -231,6 +238,23 @@ std::string ResourceGlobalName(const CallNode* call, const Var& let_var) {
   return name;
 }
 
+bool IsPointerLike(const PrimExpr& value) {
+  if (value.dtype().is_handle()) {
+    return true;
+  }
+  if (const auto* var = value.as<VarNode>()) {
+    return var->type_annotation.as<PointerTypeNode>() != nullptr;
+  }
+  return false;
+}
+
+Var MakeSharedPtrVar(const std::string& name, const Var& like) {
+  if (like.defined() && like->type_annotation.defined()) {
+    return Var(name, like->type_annotation);
+  }
+  return Var(name, PointerType(PrimType(DataType::UInt(8)), String("shared.dyn")));
+}
+
 bool IsSameVar(const PrimExpr& expr, const Var& var) {
   if (!var.defined()) {
     return false;
@@ -244,6 +268,7 @@ bool IsSameVar(const PrimExpr& expr, const Var& var) {
 class InfoCollector : public StmtExprVisitor {
  public:
   Var buf_dyn_shmem;
+  Var async_copy_dst;
   PrimExpr thread_extent;
   std::unordered_set<const VarNode*> a_dcu_res_vars;
   std::unordered_set<const VarNode*> b_dcu_res_vars;
@@ -304,7 +329,8 @@ class InfoCollector : public StmtExprVisitor {
   }
 
   void VisitStmt_(const DeclBufferNode* op) final {
-    if (op->buffer.scope() == "shared.dyn" && !buf_dyn_shmem.defined()) {
+    if (op->buffer.scope() == "shared.dyn" && !buf_dyn_shmem.defined() &&
+        IsPointerLike(op->buffer->data)) {
       buf_dyn_shmem = op->buffer->data;
     }
     if (IsBBufferName(op->buffer->name) || b_shared_names.count(op->buffer->name) > 0) {
@@ -349,12 +375,19 @@ class InfoCollector : public StmtExprVisitor {
   }
 
   void VisitExpr_(const CallNode* op) final {
-    if (op->op.same_as(DCUAsyncCopyOp()) && op->args.size() >= 6) {
-      if (const auto* var = op->args[2].as<VarNode>()) {
-        if (b_dcu_res_vars.count(var) > 0) {
-          if (const auto* dtype_str = op->args[5].as<StringImmNode>()) {
-            DataType elem_dtype = DataType(ffi::StringToDLDataType(dtype_str->value));
-            b_elem_bytes = GetBElemBytesFromDType(elem_dtype);
+    if (IsDCUAsyncCopyCall(op) && op->args.size() >= 3) {
+      if (const auto* dst = op->args[0].as<VarNode>()) {
+        if (IsPointerLike(GetRef<Var>(dst))) {
+          async_copy_dst = GetRef<Var>(dst);
+        }
+      }
+      if (op->args.size() >= 6) {
+        if (const auto* var = op->args[2].as<VarNode>()) {
+          if (b_dcu_res_vars.count(var) > 0) {
+            if (const auto* dtype_str = op->args[5].as<StringImmNode>()) {
+              DataType elem_dtype = DataType(ffi::StringToDLDataType(dtype_str->value));
+              b_elem_bytes = GetBElemBytesFromDType(elem_dtype);
+            }
           }
         }
       }
@@ -365,25 +398,29 @@ class InfoCollector : public StmtExprVisitor {
 
 PrimExpr ToUIntPtr(const PrimExpr& value) {
   const DataType u64 = DataType::UInt(64);
-  if (value.dtype().is_handle()) {
+  if (IsPointerLike(value)) {
     return Call(u64, builtin::reinterpret(), {value});
   }
   return Cast(u64, value);
 }
 
-PrimExpr FromUIntPtr(const DataType& target_dtype, const PrimExpr& value) {
-  if (target_dtype.is_handle()) {
-    return Call(target_dtype, builtin::reinterpret(), {value});
+PrimExpr FromUIntPtr(const DataType& target_dtype, const Type& type_annotation,
+                     const PrimExpr& value) {
+  if (target_dtype.is_handle() || type_annotation.as<PointerTypeNode>()) {
+    return Call(DataType::Handle(), builtin::reinterpret(), {value});
   }
   return Cast(target_dtype, value);
 }
 
 PrimExpr MakeShadowAddr(const PrimExpr& base, const PrimExpr& shadow_bits) {
-  const DataType ptr_type = base.dtype();
   PrimExpr addr_uint = ToUIntPtr(base);
   PrimExpr shadow = Cast(DataType::UInt(64), shadow_bits);
   PrimExpr combined = bitwise_or(addr_uint, shadow);
-  return FromUIntPtr(ptr_type, combined);
+  Type annot;
+  if (const auto* var = base.as<VarNode>()) {
+    annot = var->type_annotation;
+  }
+  return FromUIntPtr(base.dtype(), annot, combined);
 }
 
 class ShadowAddrInjector : public StmtExprMutator {
@@ -424,7 +461,13 @@ class ShadowAddrInjector : public StmtExprMutator {
     const int64_t thread_extent = GetConstInt(info.thread_extent).value_or(0);
     ICHECK_GT(thread_extent, 0) << "thread_extent must be positive for shadow addr injection";
     const int warp_num = std::max(1, static_cast<int>(thread_extent / kDCUWarpSize));
-    ShadowAddrInjector mutator(info.buf_dyn_shmem, std::move(res_specs), warp_num);
+    Var shmem = info.buf_dyn_shmem;
+    if (info.async_copy_dst.defined() && IsPointerLike(info.async_copy_dst)) {
+      shmem = info.async_copy_dst;
+    }
+    ICHECK(shmem.defined() && IsPointerLike(shmem))
+        << "DCU shadow injection needs a handle-typed shared.dyn base";
+    ShadowAddrInjector mutator(shmem, std::move(res_specs), warp_num);
     auto* n = func.CopyOnWrite();
     n->body = mutator(std::move(n->body));
     return func;
@@ -450,6 +493,19 @@ class ShadowAddrInjector : public StmtExprMutator {
       if (it != res_index_.end()) {
         return &res_entries_[it->second];
       }
+    }
+    // gemm_rs: a single LDS async copy; the resource Let var identity can
+    // change across inject passes, but there is only one shadow entry.
+    const ResEntry* only = nullptr;
+    int n_layout = 0;
+    for (const auto& entry : res_entries_) {
+      if (entry.need_layout) {
+        ++n_layout;
+        only = &entry;
+      }
+    }
+    if (n_layout == 1) {
+      return only;
     }
     return nullptr;
   }
@@ -482,9 +538,9 @@ class ShadowAddrInjector : public StmtExprMutator {
     const int split_factor = entry->split_factor;
     if (split_factor == 1) {
       Var shadow_offset_var = Var("shadow_offset_" + entry->offset_tag, u32);
-      Var shared_addr_var = Var(entry->addr_tag + "_shared_addr", ptr_type);
+      Var shared_addr_var = MakeSharedPtrVar(entry->addr_tag + "_shared_addr", buf_dyn_shmem_);
       entry->addr_vars.push_back(shared_addr_var);
-      body = LetStmt(shared_addr_var, MakeShadowAddr(shmem_base_var_, shadow_offset_var), body);
+      body = LetStmt(shared_addr_var, MakeShadowAddr(buf_dyn_shmem_, shadow_offset_var), body);
       body = LetStmt(shadow_offset_var,
                      BuildShadowOffset(entry->copy_major, entry->elem_bytes, 0), body);
       return;
@@ -493,11 +549,12 @@ class ShadowAddrInjector : public StmtExprMutator {
     for (int sub_idx = 0; sub_idx < split_factor; ++sub_idx) {
       const std::string suffix = std::to_string(sub_idx);
       Var shadow_offset_var = Var("shadow_offset_" + entry->offset_tag + "_" + suffix, u32);
-      Var shared_addr_var = Var(entry->addr_tag + "_shared_addr_" + suffix, ptr_type);
+      Var shared_addr_var =
+          MakeSharedPtrVar(entry->addr_tag + "_shared_addr_" + suffix, buf_dyn_shmem_);
       entry->addr_vars.push_back(shared_addr_var);
       PrimExpr shadow_offset =
           BuildShadowOffset(entry->copy_major, entry->elem_bytes, sub_idx);
-      body = LetStmt(shared_addr_var, MakeShadowAddr(shmem_base_var_, shadow_offset_var), body);
+      body = LetStmt(shared_addr_var, MakeShadowAddr(buf_dyn_shmem_, shadow_offset_var), body);
       body = LetStmt(shadow_offset_var, shadow_offset, body);
     }
   }
@@ -508,7 +565,6 @@ class ShadowAddrInjector : public StmtExprMutator {
     ICHECK(warp_idx_var_.defined()) << "warp_idx must be defined before shadow addr injection";
     const DataType ptr_type = buf_dyn_shmem_->dtype;
     const DataType u32 = DataType::UInt(32);
-    shmem_base_var_ = Var("shmem_base", ptr_type);
     bool any_shadow = false;
     bool any_plain = false;
     for (auto& entry : res_entries_) {
@@ -521,18 +577,15 @@ class ShadowAddrInjector : public StmtExprMutator {
     }
     // Fast-copy tiles (need_layout=0) alias the same LDS without shadow bits.
     if (any_plain && any_shadow) {
-      plain_shared_addr_var_ = Var("plain_shared_addr", ptr_type);
-      body = LetStmt(plain_shared_addr_var_, shmem_base_var_, body);
-    }
-    if (any_shadow) {
-      body = LetStmt(shmem_base_var_, buf_dyn_shmem_, body);
+      plain_shared_addr_var_ = MakeSharedPtrVar("plain_shared_addr", buf_dyn_shmem_);
+      body = LetStmt(plain_shared_addr_var_, buf_dyn_shmem_, body);
     }
     shadow_injected_ = true;
     return body;
   }
 
   const ResEntry* GetSplitResForCopy(const CallNode* call) const {
-    if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 3) {
+    if (!IsDCUAsyncCopyCall(call) || call->args.size() < 3) {
       return nullptr;
     }
     // Already remapped to a per-sub shadow pointer; do not split again.
@@ -585,7 +638,7 @@ class ShadowAddrInjector : public StmtExprMutator {
     PrimExpr VisitExpr_(const CallNode* op) final {
       PrimExpr rewritten = StmtExprMutator::VisitExpr_(op);
       const auto* call = rewritten.as<CallNode>();
-      if (call == nullptr || !call->op.same_as(DCUAsyncCopyOp()) || call->args.size() < 3) {
+      if (!IsDCUAsyncCopyCall(call) || call->args.size() < 3) {
         return rewritten;
       }
       Array<PrimExpr> args = call->args;
@@ -630,9 +683,30 @@ class ShadowAddrInjector : public StmtExprMutator {
                new_body, op->thread_binding, op->annotations);
   }
 
+  bool IsAlreadyShadowAddr(const PrimExpr& expr) const {
+    if (const auto* var = expr.as<VarNode>()) {
+      for (const auto& entry : res_entries_) {
+        for (const auto& addr : entry.addr_vars) {
+          if (var == addr.get()) {
+            return true;
+          }
+        }
+      }
+      if (plain_shared_addr_var_.defined() && var == plain_shared_addr_var_.get()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   PrimExpr RewriteDCUAsyncCopy(const CallNode* op) {
-    if (!op->op.same_as(DCUAsyncCopyOp()) || !shadow_injected_ || op->args.size() < 3 ||
-        !IsBufDynShmem(op->args[0])) {
+    // gemm_rs: only the LDS operand has an async copy. Remap that dst to the
+    // shadow pointer even if args[0] is the allocate name (B_shared) rather
+    // than a merged buf_dyn_shmem.
+    if (!IsDCUAsyncCopyCall(op) || !shadow_injected_ || op->args.size() < 3) {
+      return GetRef<PrimExpr>(op);
+    }
+    if (IsAlreadyShadowAddr(op->args[0])) {
       return GetRef<PrimExpr>(op);
     }
     const ResEntry* entry = FindRes(op->args[2]);
@@ -708,7 +782,6 @@ class ShadowAddrInjector : public StmtExprMutator {
   std::vector<ResEntry> res_entries_;
   std::unordered_map<const VarNode*, size_t> res_index_;
   Var warp_idx_var_;
-  Var shmem_base_var_;
   Var plain_shared_addr_var_;
   Var split_loop_var_;
   bool shadow_injected_{false};
@@ -755,7 +828,7 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
 
    private:
     void VisitExpr_(const CallNode* op) final {
-      if (op->op.same_as(DCUAsyncCopyOp())) {
+      if (IsDCUAsyncCopyCall(op)) {
         has_copy = true;
       }
       StmtExprVisitor::VisitExpr_(op);
@@ -775,8 +848,8 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
 
   DCUCopyBufferMaps maps = GetDCUCopyBufferMaps(func);
   std::vector<DcuResShadowSpec> res_specs;
-  bool used_mode1_tag = false;
-  bool used_mode2_tag = false;
+  bool used_a_tag = false;
+  bool used_b_tag = false;
   auto assign_tags = [](DcuResShadowSpec* spec, bool use_first, const char* first_addr,
                         const char* first_off) {
     if (use_first) {
@@ -807,13 +880,19 @@ PrimFunc InjectDCUAsyncCopyShadowAddrToFunc(PrimFunc func) {
     spec.need_layout = LookupDCUNeedLayout(maps, *shared_key, /*default_value=*/false) &&
                        LookupDCUNeedShadow(maps, *shared_key, /*default_value=*/false);
     spec.copy_major = LookupDCUCopyMajor(maps, *shared_key, /*default_value=*/mode == 2 ? 1 : 0);
-    spec.elem_bytes = (mode == 1) ? a_elem_bytes : b_elem_bytes;
-    if (mode == 1) {
-      assign_tags(&spec, !used_mode1_tag, "A", "a");
-      used_mode1_tag = true;
+    // Name the pointer after the GEMM operand (A vs B), not after shadow
+    // family. NT-B is mode 1 (row / former-A slots) but it is still B's LDS
+    // copy; gemm_rs has no A LDS so tagging by mode produced a stray
+    // shadow_offset_a and dropped B's addr.
+    const int operand =
+        LookupDCUGemmOperand(maps, *shared_key).value_or(mode == 2 ? 1 : 0);
+    spec.elem_bytes = (operand == 0) ? a_elem_bytes : b_elem_bytes;
+    if (operand == 0) {
+      assign_tags(&spec, !used_a_tag, "A", "a");
+      used_a_tag = true;
     } else {
-      assign_tags(&spec, !used_mode2_tag, "B", "b");
-      used_mode2_tag = true;
+      assign_tags(&spec, !used_b_tag, "B", "b");
+      used_b_tag = true;
     }
     res_specs.push_back(std::move(spec));
   }

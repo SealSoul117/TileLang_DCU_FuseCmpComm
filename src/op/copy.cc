@@ -1656,6 +1656,11 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else if (copy_inst == CopyInst::kDCUAsyncCopy){
     return LowerDCUAsyncCopy(T, analyzer);
   } else if (copy_inst == CopyInst::kNormal) {
+    if (TargetIsDCU(T.target) && dst.scope() == "local.fragment" &&
+        dst->shape.size() == 2 &&
+        (src.scope().empty() || src.scope() == "global")) {
+      return LowerDCUGlobalToFragmentCopy(T, analyzer);
+    }
     if (TargetIsDCU(T.target) && src.scope() == "local.fragment" &&
         dst.scope() == "local.fragment" && src->shape.size() == 2 &&
         dst->shape.size() == 2 && T.layout_map.count(src) &&
@@ -1986,6 +1991,118 @@ static DCUAsyncCopyGemmInfo ComputeWarpNForDCUAsyncCopy(
       gemm.M, gemm.N, block_size, target, GemmInst::KMMAC);
   result.warp_count = is_a ? m_warp : n_warp;
   return result;
+}
+
+Stmt CopyNode::LowerDCUGlobalToFragmentCopy(const LowerArgs &T,
+                                            arith::Analyzer *analyzer) const {
+  // k_pack=1 keeps the existing SIMT + fragment-layout path.
+  int k_pack = 1;
+  int m_warp = 1;
+  bool trans_a = false;
+  std::optional<int> gemm_operand;
+  if (T.func_body.defined()) {
+    DCUAsyncCopyGemmInfo gemm_info = ComputeWarpNForDCUAsyncCopy(
+        T.func_body.value(), src, dst, T.thread_bounds, T.target);
+    k_pack = gemm_info.k_pack;
+    trans_a = gemm_info.trans_a;
+    gemm_operand = gemm_info.gemm_operand;
+    if (gemm_info.warp_count.has_value()) {
+      m_warp = gemm_info.warp_count.value();
+    }
+  }
+  if (k_pack <= 1 || trans_a || !gemm_operand.has_value() ||
+      gemm_operand.value() != 0) {
+    return LowerNormalCopy(T, analyzer);
+  }
+  if (m_warp <= 0) {
+    if (const auto *n = as_const_int(T.thread_bounds->extent)) {
+      m_warp = std::max(1, static_cast<int>(*n) / 64);
+    } else {
+      return LowerNormalCopy(T, analyzer);
+    }
+  }
+
+  const int micro_m = 16;
+  const int micro_k = 16;
+  const int tile_k = micro_k * k_pack;
+  const int vec = 4 * k_pack; // fp16: k_pack=2 → 8 elems = 16 bytes
+  const int warp_size = 64;
+  ICHECK_EQ(dst->shape.size(), 2);
+  const auto *m_imm = as_const_int(dst->shape[0]);
+  const auto *k_imm = as_const_int(dst->shape[1]);
+  if (!m_imm || !k_imm || *k_imm % tile_k != 0 ||
+      *m_imm % (micro_m * m_warp) != 0) {
+    return LowerNormalCopy(T, analyzer);
+  }
+  const int K = static_cast<int>(*k_imm);
+  const int warp_rows = static_cast<int>(*m_imm) / (micro_m * m_warp);
+  const int n_k_tiles = K / tile_k;
+  ICHECK_GT(warp_rows, 0);
+  ICHECK_GT(n_k_tiles, 0);
+  ICHECK_GT(vec, 0);
+
+  // C store (make_mmac_store_layout) groups 16-row MMA tiles into
+  // micro_dcu_x-row strips per warp when k_pack>1. For this FA tile
+  // (M=128, k_pack=2, fp16) that is 32 rows/warp — not 16-row interleave.
+  const int elem_bytes = std::max(1, dst->dtype.bytes());
+  const int slab4_elems = (1024 / elem_bytes) * 4;
+  const int warp_row_tiles = static_cast<int>(*m_imm) / m_warp;
+  int raw_slab4 = 0;
+  if (slab4_elems > 0) {
+    raw_slab4 = (m_warp * warp_row_tiles * micro_k * k_pack) / slab4_elems;
+  }
+  const int micro_dcu_x = raw_slab4 < 1 ? micro_m : raw_slab4 * micro_m;
+  const int x_group = std::max(1, micro_dcu_x / micro_m);
+
+  PrimExpr thread = T.thread_var;
+  if (T.thread_bounds.defined()) {
+    thread = thread - T.thread_bounds->min;
+  }
+  PrimExpr tx = FloorMod(thread, Integer(warp_size));
+  // Match MatrixCoreIntrinEmitter extract_thread_binding (is_m_first=false).
+  PrimExpr warp_m = FloorMod(FloorDiv(thread, Integer(warp_size)), Integer(m_warp));
+
+  Var i("i", DataType::Int(32));
+  Var kt("kt", DataType::Int(32));
+  Var lid("local_id", DataType::Int(32));
+
+  // 16x32 primitive is unchanged (vec=8). Warp/iter follow C:
+  //   row = tx%16 + (i%x_group)*16 + warp_m*micro_dcu_x + (i/x_group)*micro_dcu_x*m_warp
+  //   col = (tx//16)*4*k_pack + local_id + kt*(16*k_pack)
+  PrimExpr row = analyzer->Simplify(
+      FloorMod(tx, Integer(micro_m)) +
+      FloorMod(i, Integer(x_group)) * Integer(micro_m) +
+      warp_m * Integer(micro_dcu_x) +
+      FloorDiv(i, Integer(x_group)) * Integer(micro_dcu_x * m_warp));
+  PrimExpr col = analyzer->Simplify(FloorDiv(tx, Integer(micro_m)) * Integer(vec) +
+                                    lid + kt * Integer(tile_k));
+
+  auto make_access = [&](int src_dst, PrimExpr r, PrimExpr c) {
+    Array<Range> ranges = src_dst == 0 ? src_range : dst_range;
+    Array<PrimExpr> indices;
+    int seen = 0;
+    for (size_t d = 0; d < ranges.size(); ++d) {
+      if (is_one(ranges[d]->extent)) {
+        indices.push_back(ranges[d]->min);
+      } else {
+        indices.push_back(ranges[d]->min + (seen == 0 ? r : c));
+        ++seen;
+      }
+    }
+    return indices;
+  };
+
+  Array<PrimExpr> src_indices = make_access(0, row, col);
+  Array<PrimExpr> dst_indices = make_access(1, row, col);
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) {
+    value = Cast(dst->dtype, value);
+  }
+  Stmt body = BufferStore(dst, value, dst_indices);
+  body = For(lid, 0, vec, ForKind::kVectorized, body);
+  body = For(kt, 0, n_k_tiles, ForKind::kSerial, body);
+  body = For(i, 0, warp_rows, ForKind::kSerial, body);
+  return body;
 }
 
 Stmt CopyNode::LowerDCUAsyncCopy(const LowerArgs &T,

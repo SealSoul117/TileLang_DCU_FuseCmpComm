@@ -250,6 +250,17 @@ protected:
   Stmt LowerDCUFragmentPermuteCopy(const LowerArgs &T,
                                     arith::Analyzer *analyzer) const;
 
+  /*!
+   * \brief DCU global → fragment load for gemm_rs A.
+   *
+   * k_pack is taken from the consuming T.gemm (same lookup as G→LDS).
+   * k_pack=2 widens the inner atom from 16x16 to 16x32: same 4 threads per
+   * row, 16-byte vector per thread, half as many K tiles. Outer warp / iter
+   * offsets match ldmatrix_a SIMPLE (and G→LDS k_pack=2 tile_k).
+   */
+  Stmt LowerDCUGlobalToFragmentCopy(const LowerArgs &T,
+                                    arith::Analyzer *analyzer) const;
+
   Stmt LowerDCUAsyncCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
   /*!
    * \brief Generate SIMT (thread-level) loop for copying.

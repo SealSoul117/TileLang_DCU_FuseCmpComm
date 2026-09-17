@@ -13,7 +13,7 @@ from tvm.ir import PrimExpr
 class GemmBase:
     gemm_node: Node
 
-    def infer_layout(self, target: Target, thread_nums: int):
+    def infer_layout(self, target: Target, thread_nums: int, layout_map=None):
         raise NotImplementedError("infer_layout is not implemented")
 
     def lower(self, target: Target, thread_nums: int, thread_var: tir.Var):

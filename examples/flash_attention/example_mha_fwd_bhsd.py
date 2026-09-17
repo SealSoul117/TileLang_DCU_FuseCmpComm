@@ -91,6 +91,7 @@ def flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=256, block_N=
             transpose_B=True,
             policy=T.GemmWarpPolicy.FullRow,
             transpose_C=False,
+            k_pack=2,
         )
         if is_causal:
             for i, j in T.Parallel(block_M, block_N):
@@ -114,7 +115,7 @@ def flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, block_M=256, block_N=
         bz: T.int32,
     ):
         T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared, major="col_major")
-        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow, transpose_C=False)
+        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow, transpose_C=False,)
 
     @T.macro
     def Softmax(
@@ -233,7 +234,7 @@ def main(
     if not tune:
         tilelang.testing.set_random_seed(0)
         kernel = flashattn(
-            batch, heads, seq_q, seq_kv, dim, is_causal, block_M=64, block_N=64, num_stages=0, threads=256
+            batch, heads, seq_q, seq_kv, dim, is_causal, block_M=128, block_N=64, num_stages=0, threads=256
         )
         print(kernel.get_kernel_source())
         device = torch.device("cuda")
@@ -330,10 +331,10 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=1, help="batch size")
-    parser.add_argument("--heads", type=int, default=1, help="heads")
-    parser.add_argument("--seq_q", type=int, default=4096, help="query sequence length")
-    parser.add_argument("--seq_kv", type=int, default=4096, help="key/value sequence length")
+    parser.add_argument("--batch", type=int, default=8, help="batch size")
+    parser.add_argument("--heads", type=int, default=64, help="heads")
+    parser.add_argument("--seq_q", type=int, default=2048, help="query sequence length")
+    parser.add_argument("--seq_kv", type=int, default=2048, help="key/value sequence length")
     parser.add_argument("--dim", type=int, default=128, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal", default=False)
     parser.add_argument("--tune", action="store_true", help="tune configs")

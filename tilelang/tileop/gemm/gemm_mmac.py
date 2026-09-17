@@ -1,5 +1,6 @@
 from .gemm_base import GemmBase
 from tilelang.layout import make_swizzled_layout, make_linear_layout
+from tilelang.layout.fragment import Fragment
 from tilelang.intrinsics.mmac_macro_generator import (
     MatrixCoreIntrinEmitter,
 )
@@ -14,6 +15,91 @@ from tvm.target import Target
 from tvm import tir
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
+
+
+# Producer GEMM C fragment -> M-side pack. LayoutMap probing is unreliable
+# (C++ may not pass it; BindThreadRange makes ForwardThread non-const).
+# InferLayout visits gemms in program order, so GEMM1 registers before GEMM2.
+_FRAGMENT_M_PACK = {}
+
+
+def _buf_data(buf):
+    return getattr(buf, "data", buf)
+
+
+def _register_fragment_m_pack(buf, m_extent: int, m_pack: int):
+    if buf is None or not is_fragment(buf):
+        return
+    _FRAGMENT_M_PACK[_buf_data(buf)] = (int(m_extent), int(m_pack))
+
+
+def _lookup_fragment_m_pack(buf, m_extent: int):
+    if buf is None:
+        return None
+    key = _buf_data(buf)
+    if key in _FRAGMENT_M_PACK:
+        stored_m, stored_pack = _FRAGMENT_M_PACK[key]
+        if stored_m == int(m_extent):
+            return stored_pack
+    packs = [pack for (stored_m, pack) in _FRAGMENT_M_PACK.values() if stored_m == int(m_extent)]
+    return max(packs) if packs else None
+
+
+def _expr_const_int(expr):
+    if expr is None:
+        return None
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, tir.IntImm):
+        return int(expr.value)
+    try:
+        simplified = tvm.arith.Analyzer().simplify(expr)
+        if isinstance(simplified, tir.IntImm):
+            return int(simplified.value)
+    except Exception:
+        return None
+    return None
+
+
+def _recover_m_pack_from_fragment(layout, m_extent: int):
+    if not isinstance(layout, Fragment):
+        return None
+    shape = [int(x) for x in layout.get_input_shape()]
+    if len(shape) < 2 or shape[0] != m_extent:
+        return None
+    t0 = _expr_const_int(layout.map_forward_thread([0, 0]))
+    if t0 is None:
+        return None
+    warp0 = t0 // 64
+    group = 16
+    while group * 2 <= shape[0]:
+        t = _expr_const_int(layout.map_forward_thread([group, 0]))
+        if t is None or (t // 64) != warp0:
+            break
+        group *= 2
+    return max(1, group // 16)
+
+
+def _inherit_m_pack_from_layout_map(layout_map, m_extent: int, a_buf=None):
+    if layout_map is None:
+        return None
+    packs = []
+    candidates = []
+    if a_buf is not None:
+        try:
+            if a_buf in layout_map:
+                candidates.append(layout_map[a_buf])
+        except Exception:
+            pass
+    try:
+        candidates.extend(layout for _buf, layout in layout_map.items())
+    except Exception:
+        pass
+    for layout in candidates:
+        recovered = _recover_m_pack_from_fragment(layout, m_extent)
+        if recovered is not None:
+            packs.append(recovered)
+    return max(packs) if packs else None
 
 
 def _resolve_dcu_lds_layouts(gemm, thread_nums: int):
@@ -43,12 +129,31 @@ def _resolve_dcu_lds_layouts(gemm, thread_nums: int):
     return a_mode, b_mode
 
 
+def _resolve_m_pack(gemm, layout_map):
+    k_pack = int(gemm.k_pack or 1)
+    m_extent = int(gemm.M)
+    # Shared-A GEMMs originate a new C fragment ABI. Drop leftover packs from
+    # the previous kernel so a k_pack=1 compile cannot inherit k_pack=2.
+    if gemm.is_gemm_ss() or gemm.is_gemm_sr():
+        _FRAGMENT_M_PACK.clear()
+        _register_fragment_m_pack(gemm.C, m_extent, k_pack)
+        return k_pack
+    inherited = _lookup_fragment_m_pack(gemm.A, m_extent)
+    probed = _inherit_m_pack_from_layout_map(layout_map, m_extent, gemm.A)
+    candidates = [p for p in (inherited, probed) if p is not None]
+    m_pack = max(candidates) if candidates else k_pack
+    _register_fragment_m_pack(gemm.C, m_extent, m_pack)
+    _register_fragment_m_pack(gemm.A, m_extent, m_pack)
+    return m_pack
+
+
 class GemmMMAC(GemmBase):
-    def infer_layout(self, target: Target, thread_nums: int):
+    def infer_layout(self, target: Target, thread_nums: int, layout_map=None):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, False)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         a_lds_layout, b_lds_layout = _resolve_dcu_lds_layouts(self, thread_nums)
+        m_pack = _resolve_m_pack(self, layout_map)
         
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
@@ -62,6 +167,7 @@ class GemmMMAC(GemmBase):
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
             k_pack=self.k_pack,
+            m_pack=m_pack,
             a_lds_layout=a_lds_layout,
             b_lds_layout=b_lds_layout,
             transpose_C=self.trans_C,
@@ -99,6 +205,7 @@ class GemmMMAC(GemmBase):
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         a_lds_layout, b_lds_layout = _resolve_dcu_lds_layouts(self, thread_nums)
+        m_pack = _resolve_m_pack(self, layout_map)
         mmac_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
             b_dtype=self.in_dtype,
@@ -112,6 +219,7 @@ class GemmMMAC(GemmBase):
             chunk=self.chunk,
             thread_var=thread_var,
             k_pack=self.k_pack,
+            m_pack=m_pack,
             a_lds_layout=a_lds_layout,
             b_lds_layout=b_lds_layout,
             transpose_C=self.trans_C,

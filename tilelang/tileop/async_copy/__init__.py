@@ -2,9 +2,9 @@ import tvm
 from tvm import tir, target
 from .node import Node, Scriptable
 from . import _ffi_api
-import tvm._ffi as tvm_ffi
+from tilelang._ffi_compat import register_object
 
-@tvm_ffi.register_object("tl.AsyncCopyPy")
+@register_object("tl.AsyncCopyPy")
 class AsyncCopyPy(Node, Scriptable):
     """
     AsyncCopyPy represents an asynchronous copy operation (e.g., Global to Shared).

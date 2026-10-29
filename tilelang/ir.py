@@ -1,28 +1,28 @@
 from tilelang import tvm as tvm
 from tvm.ir.base import Node
 from tvm.runtime import Scriptable
-import tvm_ffi
+from tilelang._ffi_compat import register_object
 from tvm.target import Target
 from tilelang import _ffi_api
 
 
-@tvm_ffi.register_object("tl.Fill")
+@register_object("tl.Fill")
 class Fill(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.AtomicAdd")
+@register_object("tl.AtomicAdd")
 class AtomicAdd(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.Copy")
+@register_object("tl.Copy")
 class Copy(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.Conv2DIm2Col")
+@register_object("tl.Conv2DIm2Col")
 class Conv2DIm2ColOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.GemmWarpPolicy")
+@register_object("tl.GemmWarpPolicy")
 class GemmWarpPolicy(Node, Scriptable):
     policy_type: int
     m_warp: int
@@ -33,7 +33,7 @@ class GemmWarpPolicy(Node, Scriptable):
         return self.m_warp, self.n_warp
 
 
-@tvm_ffi.register_object("tl.GemmSPWarpPolicy")
+@register_object("tl.GemmSPWarpPolicy")
 class GemmSPWarpPolicy(Node, Scriptable):
     policy_type: int
     m_warp: int
@@ -44,33 +44,33 @@ class GemmSPWarpPolicy(Node, Scriptable):
         return self.m_warp, self.n_warp
 
 
-@tvm_ffi.register_object("tl.Gemm")
+@register_object("tl.Gemm")
 class Gemm(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.GemmSP")
+@register_object("tl.GemmSP")
 class GemmSP(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.FinalizeReducerOp")
+@register_object("tl.FinalizeReducerOp")
 class FinalizeReducerOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.ParallelOp")
+@register_object("tl.ParallelOp")
 class ParallelOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.ReduceOp")
+@register_object("tl.ReduceOp")
 class ReduceOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.CumSumOp")
+@register_object("tl.CumSumOp")
 class CumSumOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.RegionOp")
+@register_object("tl.RegionOp")
 class RegionOp(Node, Scriptable): ...
 
 
-@tvm_ffi.register_object("tl.ReduceType")
+@register_object("tl.ReduceType")
 class ReduceType(Node, Scriptable): ...

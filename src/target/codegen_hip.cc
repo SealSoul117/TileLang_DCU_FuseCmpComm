@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <string>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -158,6 +159,9 @@ std::string CodeGenTileLangHIP::Finish() {
   decl_stream << "#include <tl_templates/dcu_hip/ldsm.h>\n";
   decl_stream << "#include <tl_templates/dcu_hip/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/dcu_hip/debug.h>\n";
+  if (need_ipc_h_) {
+    decl_stream << "#include <tl_templates/dcu_hip/ipc.hpp>\n";
+  }
   decl_stream << "\n";
   return CodeGenC::Finish();
 }
@@ -496,8 +500,11 @@ void CodeGenTileLangHIP::PrintVecElemLoad(const std::string &vec, DataType t,
     os << "((half2*)(&(" << vec << "." << access[i / 2] << ")))->"
        << access[i % 2];
   } else if (t.is_bfloat16()) {
-    os << "((bfloat16x2*)(&(" << vec << "." << access[i / 2] << ")))->"
-       << access[i % 2];
+    // dcu_hip's bfloat16x2 is a compiler vector, not a struct with .x/.y.
+    // Match the proven store spelling below and load its scalar lane through
+    // a bfloat16_t pointer instead of forming an invalid member reference.
+    os << "((bfloat16_t*)(&(" << vec << "." << access[i / 2] << ")))["
+       << (i % 2) << "]";
   } else if (t.lanes() > 4 && t.lanes() <= 8) {
     std::string type_name;
     if (t.bits() == 16) {
@@ -796,6 +803,205 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   };
+
+  const auto op_name = [&]() -> std::string {
+    if (const auto* node = op->op.as<OpNode>()) return node->name;
+    return "";
+  }();
+  auto type_name = [&](DataType type) {
+    std::ostringstream result; PrintType(type, result); return result.str();
+  };
+  // A tl.region always retains its BufferLoad as arg0.  By this point buffers
+  // have been flattened, so its index is allocation-relative elements.
+  auto region_pointer = [&](const PrimExpr& region, const PrimExpr& peer,
+                            bool apply_peer) -> std::string {
+    const auto* region_call = region.as<CallNode>();
+    ICHECK(region_call && !region_call->args.empty()) << "IPC operation needs tl.region";
+    const auto* load = region_call->args[0].as<BufferLoadNode>();
+    ICHECK(load) << "IPC region must start at BufferLoad";
+    const VarNode* data = load->buffer->data.get();
+    std::ostringstream local;
+    local << "&(" << GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]) << ")";
+    if (!apply_peer || ipc_remote_data_.count(data)) return local.str();
+    const auto peer_text = PrintExpr(peer);
+    if (const auto* immediate = peer.as<IntImmNode>(); immediate && immediate->value == -1)
+      return local.str();
+    auto descriptor = ipc_descriptor_for_data_.find(data);
+    const VarNode* descriptor_data = descriptor == ipc_descriptor_for_data_.end() ? nullptr : descriptor->second;
+    if (!descriptor_data) {
+      auto named = ipc_descriptor_for_buffer_name_.find(load->buffer->name);
+      if (named != ipc_descriptor_for_buffer_name_.end()) descriptor_data = named->second;
+    }
+    ICHECK(descriptor_data) << "IPC peer operation has no explicit DeviceView binding for " << data->name_hint;
+    ICHECK(ipc_rank_ && ipc_world_) << "IPC ABI rank/world arguments missing";
+    const auto byte_offset = "(size_t)(" + PrintExpr(load->indices[0]) + ") * sizeof(" + type_name(load->dtype) + ")";
+    return "tl::ipc::peer<" + type_name(load->dtype) + ">(" + GetVarID(descriptor_data) + ", " +
+           peer_text + ", " + GetVarID(ipc_rank_) + ", " + GetVarID(ipc_world_) + ", " + byte_offset + ")";
+  };
+  // The pre-Split M2 form explicitly carries its descriptor and context.  Do
+  // not consult function attributes here: SplitHostDevice retains only values
+  // used by the device function, which is exactly why this separate form
+  // exists.  A remote-view pointer has already been materialized by its
+  // tl.ipc.remote_address producer, so it is not addressed a second time.
+  auto explicit_region_pointer = [&](const PrimExpr& region, const PrimExpr& peer,
+                                     bool apply_peer, const PrimExpr& descriptor,
+                                     const PrimExpr& rank, const PrimExpr& world) -> std::string {
+    const auto* region_call = region.as<CallNode>();
+    ICHECK(region_call && !region_call->args.empty()) << "IPC operation needs tl.region";
+    const auto* load = region_call->args[0].as<BufferLoadNode>();
+    ICHECK(load) << "IPC region must start at BufferLoad";
+    std::ostringstream local;
+    local << "&( " << GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]) << ")";
+    if (!apply_peer || ipc_remote_data_.count(load->buffer->data.get())) return local.str();
+    if (const auto* immediate = peer.as<IntImmNode>(); immediate && immediate->value == -1)
+      return local.str();
+    const auto byte_offset = "(size_t)(" + PrintExpr(load->indices[0]) + ") * sizeof(" + type_name(load->dtype) + ")";
+    return "tl::ipc::peer<" + type_name(load->dtype) + ">(" + PrintExpr(descriptor) + ", " +
+           PrintExpr(peer) + ", " + PrintExpr(rank) + ", " + PrintExpr(world) + ", " + byte_offset + ")";
+  };
+  if (op_name == "tl.get_rank") {
+    ICHECK(ipc_rank_) << "tl.get_rank requires bind_ipc"; os << GetVarID(ipc_rank_); return;
+  } else if (op_name == "tl.get_num_ranks") {
+    ICHECK(ipc_world_) << "tl.get_num_ranks requires bind_ipc"; os << GetVarID(ipc_world_); return;
+  } else if (op_name == "tl.remote_address") {
+    const auto* provenance = op->args[0].as<CallNode>();
+    ICHECK(provenance && !provenance->args.empty());
+    const auto* load = provenance->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    auto descriptor = ipc_descriptor_for_data_.find(load->buffer->data.get());
+    const VarNode* descriptor_data = descriptor == ipc_descriptor_for_data_.end() ? nullptr : descriptor->second;
+    if (!descriptor_data) {
+      auto named = ipc_descriptor_for_buffer_name_.find(load->buffer->name);
+      if (named != ipc_descriptor_for_buffer_name_.end()) descriptor_data = named->second;
+    }
+    ICHECK(descriptor_data) << "remote_view provenance has no explicit DeviceView binding; buffer="
+                            << load->buffer->name << " data=" << load->buffer->data->name_hint;
+    ICHECK(ipc_rank_ && ipc_world_);
+    need_ipc_h_ = true;
+    os << "tl::ipc::peer<std::byte>(" << GetVarID(descriptor_data) << ", "
+       << PrintExpr(op->args[1]) << ", " << GetVarID(ipc_rank_) << ", "
+       << GetVarID(ipc_world_) << ", 0)";
+    return;
+  } else if (op_name == "tl.ipc.remote_address") {
+    need_ipc_h_ = true;
+    // PrintExpr may materialize a dynamic arithmetic temporary in `stream`.
+    // Evaluate all operands before emitting even the opening delimiter of the
+    // enclosing expression, otherwise that declaration lands inside C++.
+    const auto descriptor = PrintExpr(op->args[0]);
+    const auto peer = PrintExpr(op->args[1]);
+    const auto rank = PrintExpr(op->args[2]);
+    const auto world = PrintExpr(op->args[3]);
+    os << "tl::ipc::peer<std::byte>(" << descriptor << ", " << peer << ", "
+       << rank << ", " << world << ", 0)";
+    return;
+  } else if (op_name == "tl.ipc.fence_sys") {
+    need_ipc_h_ = true; stream << "tl::ipc::fence_sys();\n"; return;
+  } else if (op_name == "tl.ipc.block_barrier") {
+    // This op is emitted by LowerDCUIPC only.  Do not alter the pre-existing
+    // generic shared-storage synchronization policy used by GEMM kernels.
+    stream << "__syncthreads();\n"; return;
+  } else if (op_name == "tl.ipc.signal_set") {
+    need_ipc_h_ = true;
+    const auto dst = explicit_region_pointer(op->args[0], op->args[2], true,
+                                             op->args[3], op->args[4], op->args[5]);
+    const auto value = PrintExpr(op->args[1]);
+    stream << "tl::ipc::store_release(reinterpret_cast<uint32_t*>(" << dst
+           << "), (uint32_t)(" << value << "), __HIP_MEMORY_SCOPE_SYSTEM);\n";
+    return;
+  } else if (op_name == "tl.ipc.wait") {
+    need_ipc_h_ = true;
+    const char* wait_name = Downcast<IntImm>(op->args[0])->value == 0 ? "wait_eq_acquire" : "wait_ge_acquire";
+    const auto flag = explicit_region_pointer(op->args[1], op->args[3], true,
+                                              op->args[6], op->args[7], op->args[8]);
+    const auto expected = PrintExpr(op->args[2]);
+    stream << "dcu_ipc::" << wait_name << "(reinterpret_cast<const uint32_t*>("
+           << flag << "), (uint32_t)(" << expected << "));\n";
+    return;
+  } else if (op_name == "tl.ipc.put_block" || op_name == "tl.ipc.get_block") {
+    need_ipc_h_ = true;
+    const auto* r = op->args[0].as<CallNode>(); const auto* l = r->args[0].as<BufferLoadNode>();
+    const auto type = type_name(l->dtype);
+    const bool put = op_name == "tl.ipc.put_block";
+    const auto src = explicit_region_pointer(op->args[0], op->args[3], !put, op->args[4], op->args[5], op->args[6]);
+    const auto dst = explicit_region_pointer(op->args[1], op->args[3], put, op->args[4], op->args[5], op->args[6]);
+    const auto count = PrintExpr(op->args[2]);
+    stream << "tl::ipc::" << (put ? "put_block" : "get_block") << "<" << type << ">(" << src << ", " << dst
+           << ", (size_t)(" << count << "));\n";
+    return;
+  } else if (op_name == "tl.ipc.ld" || op_name == "tl.ipc.st") {
+    need_ipc_h_ = true;
+    const bool load = op_name == "tl.ipc.ld";
+    const auto* r = op->args[0].as<CallNode>(); const auto* l = r->args[0].as<BufferLoadNode>();
+    const std::string ty = type_name(l->dtype);
+    const auto sem = Downcast<IntImm>(op->args[load ? 2 : 2])->value;
+    const auto scope = Downcast<IntImm>(op->args[load ? 3 : 3])->value;
+    const std::string scope_name = scope == 2 ? "__HIP_MEMORY_SCOPE_SYSTEM" : "__HIP_MEMORY_SCOPE_AGENT";
+    if (load) {
+      const auto src = explicit_region_pointer(op->args[0], op->args[4], true, op->args[5], op->args[6], op->args[7]);
+      const auto dst = explicit_region_pointer(op->args[1], Integer(-1), false, op->args[5], op->args[6], op->args[7]);
+      const char* fn = sem == 0 ? "load_weak" : sem == 1 ? "load_volatile" : sem == 2 ? "load_acquire" : "load_relaxed";
+      stream << "*reinterpret_cast<" << ty << "*>(" << dst << ") = tl::ipc::" << fn << "<" << ty
+             << ">(reinterpret_cast<const " << ty << "*>(" << src << ")";
+      if (sem == 2 || sem == 4) stream << ", " << scope_name;
+      stream << ");\n";
+    } else {
+      const auto dst = explicit_region_pointer(op->args[0], op->args[4], true, op->args[5], op->args[6], op->args[7]);
+      const auto value = PrintExpr(op->args[1]);
+      const char* fn = sem == 0 ? "store_weak" : sem == 1 ? "store_volatile" : sem == 3 ? "store_release" : "store_relaxed";
+      stream << "tl::ipc::" << fn << "<" << ty << ">(reinterpret_cast<" << ty << "*>(" << dst << "), ("
+             << ty << ")(" << value << ")";
+      if (sem == 3 || sem == 4) stream << ", " << scope_name;
+      stream << ");\n";
+    }
+    return;
+  } else if (op_name == "tl.fence_sys") {
+    need_ipc_h_ = true; stream << "tl::ipc::fence_sys();\n"; return;
+  } else if (op_name == "tl.signal_set") {
+    need_ipc_h_ = true;
+    const auto dst = region_pointer(op->args[0], op->args[2], true);
+    const auto value = PrintExpr(op->args[1]);
+    stream << "tl::ipc::store_release(reinterpret_cast<uint32_t*>(" << dst
+           << "), (uint32_t)(" << value << "), __HIP_MEMORY_SCOPE_SYSTEM);\n"; return;
+  } else if (op_name == "tl.tileop.wait") {
+    need_ipc_h_ = true;
+    const char* wait_name = Downcast<IntImm>(op->args[0])->value == 0 ? "wait_eq_acquire" : "wait_ge_acquire";
+    const auto flag = region_pointer(op->args[1], op->args[3], true);
+    const auto expected = PrintExpr(op->args[2]);
+    stream << "dcu_ipc::" << wait_name << "(reinterpret_cast<const uint32_t*>("
+           << flag << "), (uint32_t)(" << expected << "));\n"; return;
+  } else if (op_name == "tl.tileop.put_block" || op_name == "tl.tileop.get_block") {
+    need_ipc_h_ = true;
+    const auto type = [&]() { const auto* r = op->args[0].as<CallNode>(); const auto* l = r->args[0].as<BufferLoadNode>(); return type_name(l->dtype); }();
+    const bool put = op_name == "tl.tileop.put_block";
+    const auto src = region_pointer(op->args[0], op->args[3], !put);
+    const auto dst = region_pointer(op->args[1], op->args[3], put);
+    const auto count = PrintExpr(op->args[2]);
+    stream << "tl::ipc::" << (put ? "put_block" : "get_block") << "<" << type << ">(" << src << ", " << dst << ", (size_t)(" << count << "));\n"; return;
+  } else if (op_name == "tl.tileop.ld" || op_name == "tl.tileop.st") {
+    need_ipc_h_ = true;
+    const bool load = op_name == "tl.tileop.ld";
+    const auto* r = op->args[0].as<CallNode>(); const auto* l = r->args[0].as<BufferLoadNode>();
+    const std::string ty = type_name(l->dtype);
+    const auto sem = Downcast<IntImm>(op->args[load ? 2 : 2])->value;
+    const auto scope = Downcast<IntImm>(op->args[load ? 3 : 3])->value;
+    const std::string scope_name = scope == 2 ? "__HIP_MEMORY_SCOPE_SYSTEM" : "__HIP_MEMORY_SCOPE_AGENT";
+    if (load) {
+      const auto src = region_pointer(op->args[0], op->args[4], true);
+      const auto dst = region_pointer(op->args[1], Integer(-1), false);
+      const char* fn = sem == 0 ? "load_weak" : sem == 1 ? "load_volatile" : sem == 2 ? "load_acquire" : "load_relaxed";
+      stream << "*reinterpret_cast<" << ty << "*>(" << dst << ") = tl::ipc::" << fn << "<" << ty << ">(reinterpret_cast<const " << ty << "*>(" << src << ")";
+      if (sem == 2 || sem == 4) stream << ", " << scope_name;
+      stream << ");\n";
+    } else {
+      const auto dst = region_pointer(op->args[0], op->args[4], true);
+      const auto value = PrintExpr(op->args[1]);
+      const char* fn = sem == 0 ? "store_weak" : sem == 1 ? "store_volatile" : sem == 3 ? "store_release" : "store_relaxed";
+      stream << "tl::ipc::" << fn << "<" << ty << ">(reinterpret_cast<" << ty << "*>(" << dst << "), (" << ty << ")(" << value << ")";
+      if (sem == 3 || sem == 4) stream << ", " << scope_name;
+      stream << ");\n";
+    }
+    return;
+  }
 
   if (op->op.same_as(builtin::ptx_cp_async())) {
     std::string dst = this->PrintExpr(op->args[0]);
@@ -1605,6 +1811,53 @@ void CodeGenTileLangHIP::PrintVecElemLoadExpr(DataType t, int i,
 void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   // clear previous generated state.
   this->InitFuncState(f);
+  ipc_descriptor_for_data_.clear();
+  ipc_descriptor_for_buffer_name_.clear();
+  ipc_remote_data_.clear();
+  ipc_rank_ = ipc_world_ = nullptr;
+  // LowerDCUIPC makes these ordinary live kernel arguments.  They survive
+  // SplitHostDevice even when the legacy attrs are no longer present.
+  for (const tir::Var& parameter : f->params) {
+    if (parameter->name_hint == "__tl_ipc_rank") ipc_rank_ = parameter.get();
+    if (parameter->name_hint == "__tl_ipc_world_size") ipc_world_ = parameter.get();
+  }
+  if (auto bindings = f->GetAttr<String>("tl.dcu_ipc.bindings")) {
+    std::unordered_map<std::string, const VarNode*> by_name;
+    for (const auto& item : f->buffer_map) {
+      by_name[item.second->data->name_hint] = item.second->data.get();
+      by_name[item.second->name] = item.second->data.get();
+    }
+    for (const tir::Var& parameter : f->params) {
+      by_name[parameter->name_hint] = parameter.get();
+    }
+    std::stringstream records(static_cast<std::string>(bindings.value()));
+    std::string record;
+    while (std::getline(records, record, ';')) {
+      const auto split = record.find('=');
+      ICHECK(split != std::string::npos) << "malformed IPC binding attr";
+      auto base = by_name.find(record.substr(0, split));
+      auto descriptor = by_name.find(record.substr(split + 1));
+      ICHECK(base != by_name.end() && descriptor != by_name.end()) << "missing IPC ABI parameter";
+      ipc_descriptor_for_data_[base->second] = descriptor->second;
+      ipc_descriptor_for_buffer_name_[record.substr(0, split)] = descriptor->second;
+    }
+    class RemoteDataCollector final : public tir::StmtVisitor {
+     public:
+      explicit RemoteDataCollector(std::unordered_map<const VarNode*, bool>* output) : out(output) {}
+      std::unordered_map<const VarNode*, bool>* out;
+      void VisitStmt_(const LetStmtNode* node) final {
+        if (const auto* call = node->value.as<CallNode>()) if (const auto* named = call->op.as<OpNode>())
+          // LowerDCUIPC rewrites the producer before SplitHostDevice.  Keep
+          // recognizing both spellings: an alias backed by either call is
+          // already a peer pointer and must not be peer-addressed again when
+          // a following IPC primitive references its region.
+          if (named->name == "tl.remote_address" || named->name == "tl.ipc.remote_address")
+            (*out)[node->var.get()] = true;
+        StmtVisitor::VisitStmt_(node);
+      }
+    } collector(&ipc_remote_data_);
+    collector(f->body);
+  }
   // reserve keywords
   ReserveKeywordsAsUnique();
 

@@ -359,8 +359,8 @@ def InjectWarpIdx():
     Declares ``warp_idx`` via ``tl.get_warp_idx_sync(64, thread_binding)`` (lowered with
     ``readfirstlane`` on DCU) and replaces expressions that use the high bits of
     ``threadIdx.x`` (e.g. ``thread_binding // 64``) with equivalent ``warp_idx``
-    operations, while preserving lane-only indexing and global-to-shared copy
-    destinations.
+    operations, while replacing wave64 sublane expressions with
+    ``tl.get_lane_idx(64)`` and preserving global-to-shared copy destinations.
 
     Returns
     -------
@@ -485,6 +485,25 @@ def FlattenBuffer():
         The result pass
     """
     return _ffi_api.FlattenBuffer()  # type: ignore
+
+
+def HoistDCUIPCPointers():
+    """Hoist verified loop-invariant M2 IPC remote-address Lets locally.
+
+    The native pass is a no-op unless ``bind_ipc`` has prepared the explicit
+    DeviceView ABI.  It is intentionally narrower than generic LICM.
+    """
+    return _ffi_api.HoistDCUIPCPointers()  # type: ignore
+
+
+def VectorizeDCUIPCCommunication():
+    """Vectorize only the verified scheduled-RS IPC pull/reduce/store loop.
+
+    The native pass emits eight FP16 lanes without a runtime guard/fallback.
+    The caller must provide valid, 16-byte-aligned allocation ranges and a
+    nonoverlapping output. Unproven or unmatched TIR is left unchanged.
+    """
+    return _ffi_api.VectorizeDCUIPCCommunication()  # type: ignore
 
 
 def EliminateStorageSyncForMBarrier():

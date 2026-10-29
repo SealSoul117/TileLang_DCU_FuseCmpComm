@@ -82,12 +82,17 @@ struct DCUMainLoopFeatures {
 DCUMainLoopFeatures AnalyzeDCUMainLoopBody(const tir::Stmt& body);
 
 /*!
- * \brief Whether \p loop is the DCU GEMM main loop.
+ * \brief Whether \p loop is the innermost qualifying DCU GEMM K-loop.
+ *
+ * A qualifying loop contains MMAC, memory traffic, and a global-memory
+ * source.  An enclosing tile/persistent For that only qualifies by recursively
+ * containing such a K-loop is deliberately excluded, so pipeline wait/barrier
+ * insertion remains scoped to the K pipeline.
  */
 bool IsDCUMainLoop(const tir::ForNode* loop);
 
 /*!
- * \brief Collect all for-loops in \p stmt that match DCU main-loop features.
+ * \brief Collect innermost qualifying DCU GEMM K-loops in \p stmt.
  */
 std::vector<const tir::ForNode*> CollectDCUMainLoops(const tir::Stmt& stmt);
 

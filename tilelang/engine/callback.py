@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable
-import tvm_ffi
+from tilelang._ffi_compat import register_global_func
 from tvm.target import Target
 
 
@@ -12,7 +12,7 @@ def register_cuda_postproc(func: Callable[[str, Target], str], override: bool = 
              and returns the processed code (str).
         override: Whether to override existing registered function. Defaults to True.
     """
-    tvm_ffi.register_global_func("tilelang_callback_cuda_postproc", f=func, override=override)
+    register_global_func("tilelang_callback_cuda_postproc", f=func, override=override)
 
 
 def register_hip_postproc(func: Callable[[str, Target], str], override: bool = True):
@@ -23,7 +23,7 @@ def register_hip_postproc(func: Callable[[str, Target], str], override: bool = T
              and returns the processed code (str).
         override: Whether to override existing registered function. Defaults to True.
     """
-    tvm_ffi.register_global_func("tilelang_callback_hip_postproc", f=func, override=override)
+    register_global_func("tilelang_callback_hip_postproc", f=func, override=override)
 
 
 def register_cuda_postproc_callback(func: Callable | bool = None, override: bool = True):

@@ -46,6 +46,11 @@ static constexpr const char *kDisableWarpSpecialized =
 static constexpr const char *kConfigIndexBitwidth = "tl.config_index_bitwidth";
 static constexpr const char *kEnableAggressiveSharedMemoryMerge =
     "tl.enable_aggressive_shared_memory_merge";
+// Controls only the conservative verified IPC remote-pointer hoist.  Default
+// behavior remains enabled; the ablation runner can disable it independently
+// of the optional communication vectorizer.
+static constexpr const char *kEnableDCUIPCHoist = "tl.enable_dcu_ipc_hoist";
+static constexpr const char *kEnableDCUIPCVectorize = "tl.enable_dcu_ipc_vectorize";
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
 static constexpr const char *kEnableFastMath = "tl.enable_fast_math";
 static constexpr const char *kPtxasRegisterUsageLevel =

@@ -99,7 +99,7 @@ class LibraryGenerator:
             ]
 
         elif is_hip_target(target):
-            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR
+            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".cpp", ".so")
@@ -120,6 +120,10 @@ class LibraryGenerator:
             ]
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
+                # M2's device-only IPC helpers are installed below the normal
+                # TileLang template root.  This is a source include, never an
+                # external dcu_ipc checkout or prebuilt communication library.
+                "-I" + os.path.join(TILELANG_TEMPLATE_PATH, "runtime/dcu_ipc/include"),
             ]  
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler

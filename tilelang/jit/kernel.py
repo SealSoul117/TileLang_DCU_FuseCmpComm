@@ -231,6 +231,13 @@ class JITKernel(Generic[_P, _T]):
 
         compile_flags = self.compile_flags
 
+        # IPC ABI arguments are real public kernel parameters.  Adapters must
+        # see the same prepared PrimFunc as engine.lower, otherwise wrapper
+        # launch argument synthesis observes the old signature.
+        from tilelang.distributed.ipc_binding import has_ipc_binding, prepare_ipc_primfunc
+        if has_ipc_binding(tilelang_func):
+            tilelang_func = prepare_ipc_primfunc(tilelang_func, target_kind=target.kind.name)
+
         if compile_flags is not None:
             compile_flags_cfg = pass_configs.get(PassConfigKey.TL_DEVICE_COMPILE_FLAGS)
             pass_configs[PassConfigKey.TL_DEVICE_COMPILE_FLAGS] = (

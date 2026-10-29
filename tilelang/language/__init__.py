@@ -100,7 +100,7 @@ from .logical import any_of, all_of  # noqa: F401
 from .builtin import *  # noqa: F401
 from .builtin import __ldg as __ldg  # noqa: F401
 
-from .utils import index_to_coordinates  # noqa: F401
+from .utils import index_to_coordinates, region  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401
@@ -115,6 +115,39 @@ from .annotations import (  # noqa: F401
 from .random import (
     rng_init,  # noqa: F401
     rng_rand,  # noqa: F401
+)
+
+# Distributed M1 primitives are explicit TIR operations, not Python-process
+# communication state.  Re-export them on the conventional `T.*` surface.
+from .distributed import (  # noqa: F401
+    DistributedIRError,
+    MultimemReduceOp,
+    WaitScope,
+    WaitSemantics,
+    assert_remote_views_normalized,
+    fence_sys,
+    get_block,
+    get_num_ranks,
+    get_rank,
+    ld,
+    normalize_remote_views,
+    multimem_ld_reduce,
+    multimem_red,
+    multimem_signal,
+    multimem_signal_add,
+    multimem_st,
+    multimem_tma_store,
+    put_block,
+    remote_address,
+    remote_view,
+    remote_view_token,
+    signal_set,
+    sm_specialize_scope,
+    st,
+    verify_distributed_ir,
+    wait,
+    wait_eq,
+    wait_ge,
 )
 
 

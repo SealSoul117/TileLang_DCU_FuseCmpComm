@@ -30,7 +30,15 @@ if not os.path.exists(THIRD_PARTY_ROOT):
     DEV = True
     tl_dev_root = os.path.dirname(TL_ROOT)
 
-    dev_lib_root = os.path.join(tl_dev_root, "build")
+    # 开发模式默认仍从仓库的 build/ 加载。若需并行使用隔离构建，可设置
+    # TILELANG_DEV_BUILD_ROOT=/绝对路径/build-m1；相对路径会被拒绝，避免
+    # 因当前工作目录不同而意外加载错误的原生库。
+    dev_lib_root = os.environ.get("TILELANG_DEV_BUILD_ROOT")
+    if dev_lib_root is not None:
+        if not os.path.isabs(dev_lib_root):
+            raise ValueError("TILELANG_DEV_BUILD_ROOT must be an absolute build directory path")
+    else:
+        dev_lib_root = os.path.join(tl_dev_root, "build")
     # In dev builds, place artifacts under build/lib and point search path there
     # to avoid adding the entire build root to sys.path.
     TL_LIBS = [os.path.join(dev_lib_root, "lib"), os.path.join(dev_lib_root, "tvm")]

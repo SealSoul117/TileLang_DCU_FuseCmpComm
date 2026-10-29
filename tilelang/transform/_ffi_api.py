@@ -1,6 +1,6 @@
 """FFI APIs for tilelang"""
 
-import tvm_ffi
+from tilelang._ffi_compat import init_ffi_api
 
 # TVM_REGISTER_GLOBAL("tl.name").set_body_typed(func);
-tvm_ffi.init_ffi_api("tl.transform", __name__)
+init_ffi_api("tl.transform", __name__)

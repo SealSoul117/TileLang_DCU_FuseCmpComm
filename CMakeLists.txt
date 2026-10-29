@@ -15,9 +15,20 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
+option(TILELANG_SKIP_SUBMODULE_UPDATE
+  "Do not run git submodule update during configuration (use the checked-out tree)"
+  OFF)
+
+option(TILELANG_ENABLE_DCU_IPC
+  "Build the embedded HIP-IPC runtime when the ROCm backend is enabled"
+  ON)
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-  find_package(Git QUIET)
-  if(Git_FOUND)
+  if(TILELANG_SKIP_SUBMODULE_UPDATE)
+    message(STATUS "Skipping git submodule update (TILELANG_SKIP_SUBMODULE_UPDATE=ON)")
+  else()
+    find_package(Git QUIET)
+    if(Git_FOUND)
     execute_process(
       COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -30,12 +41,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_
           "`git submodule update --init --recursive` and re-run CMake."
       )
     endif()
-  else()
-    message(
-      FATAL_ERROR
-        "Git is required to initialize TileLang submodules. "
-        "Please install git or fetch the submodules manually."
-    )
+    else()
+      message(
+        FATAL_ERROR
+          "Git is required to initialize TileLang submodules. "
+          "Please install git or fetch the submodules manually."
+      )
+    endif()
   endif()
 endif()
 
@@ -202,6 +214,42 @@ elseif(USE_ROCM)
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_HIP_SRCS})
   list(APPEND TILE_LANG_INCLUDES ${ROCM_INCLUDE_DIRS})
+
+  if(TILELANG_ENABLE_DCU_IPC)
+    # The caller supplies its system MPI; no external dcu_ipc project/library
+    # is referenced.  Runtime host code only uses HIP host APIs, so CXX is
+    # sufficient and avoids turning every TileLang target into a HIP language
+    # target.
+    # Link the caller-provided system MPI directly.  This avoids a FindMPI
+    # probe through HPC-X's wrapper (which can fail on login nodes merely
+    # while enumerating network interfaces), while retaining a clear CMake
+    # configuration error if the system prerequisite is absent.
+    find_path(TILELANG_MPI_INCLUDE_DIR mpi.h HINTS "$ENV{MPI_HOME}/include" REQUIRED)
+    find_library(TILELANG_MPI_LIBRARY mpi HINTS "$ENV{MPI_HOME}/lib" REQUIRED)
+    add_library(tilelang_dcu_ipc_runtime SHARED
+      src/runtime/dcu_ipc/src/bootstrap_mpi.cpp
+      src/runtime/dcu_ipc/src/context.cpp
+      src/runtime/dcu_ipc/src/allocation.cpp
+      src/runtime/dcu_ipc/src/metadata.cpp
+      src/runtime/dcu_ipc/src/runtime_bridge.cc)
+    target_compile_features(tilelang_dcu_ipc_runtime PUBLIC cxx_std_17)
+    target_compile_definitions(tilelang_dcu_ipc_runtime PRIVATE __HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
+    target_include_directories(tilelang_dcu_ipc_runtime PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dcu_ipc/include>
+      $<INSTALL_INTERFACE:tilelang/include>)
+    target_include_directories(tilelang_dcu_ipc_runtime PRIVATE
+      ${TILELANG_MPI_INCLUDE_DIR}
+      ${ROCM_INCLUDE_DIRS})
+    target_link_libraries(tilelang_dcu_ipc_runtime PRIVATE ${TILELANG_MPI_LIBRARY} ${ROCM_HIPHCC_LIBRARY})
+    set_target_properties(tilelang_dcu_ipc_runtime PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+    install(TARGETS tilelang_dcu_ipc_runtime
+      LIBRARY DESTINATION tilelang/lib COMPONENT dcu_ipc
+      RUNTIME DESTINATION tilelang/lib COMPONENT dcu_ipc)
+    install(DIRECTORY src/runtime/dcu_ipc/include/
+      DESTINATION tilelang/include COMPONENT dcu_ipc)
+  endif()
 elseif(USE_CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   find_package(CUDAToolkit REQUIRED)
@@ -325,6 +373,9 @@ set_target_properties(tilelang        PROPERTIES INSTALL_RPATH "${TILELANG_INSTA
 set_target_properties(tilelang_module PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
 set_target_properties(tvm             PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
 set_target_properties(tvm_runtime     PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
+if(TARGET tilelang_dcu_ipc_runtime)
+  set_target_properties(tilelang_dcu_ipc_runtime PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
+endif()
 
 install(
   TARGETS tvm tvm_runtime tilelang_module tilelang

@@ -18,6 +18,6 @@
 # which is part of the TVM project (https://tvm.apache.org/).
 """FFI APIs"""
 
-import tvm.ffi
+from tilelang._ffi_compat import init_ffi_api
 
-tvm.ffi._init_api("script.ir_builder.tir", __name__)  # pylint: disable=protected-access
+init_ffi_api("script.ir_builder.tir", __name__)

@@ -211,6 +211,48 @@ class DCUMainLoopFeatureChecker : public StmtExprVisitor {
   }
 };
 
+bool IsDCUMainLoopCandidate(const ForNode* loop) {
+  if (loop == nullptr) {
+    return false;
+  }
+  DCUMainLoopFeatures features = AnalyzeDCUMainLoopBody(loop->body);
+  return features.has_mmac && features.has_memory_access && features.has_global_src_memory;
+}
+
+/*! \brief Find a strictly nested loop that independently has K-loop features.
+ *
+ * A surrounding tile/persistent traversal recursively contains its GEMM K
+ * loop, so a whole-body feature scan also sees MMAC and global->shared traffic
+ * there.  Such a traversal must not become the DCU pipeline boundary: waits
+ * derive from a single K pipeline's static commit groups, while a traversal
+ * body aggregates its nested commits and produced the old 20/10 counts.
+ * Prologue barriers are likewise defined per K pipeline.  Stop at the first
+ * qualifying descendant; callers only need to know whether this loop is the
+ * innermost qualifying one, not its source spelling or trip count.
+ */
+class NestedDCUMainLoopCandidateFinder : public StmtVisitor {
+ public:
+  bool found{false};
+
+ private:
+  void VisitStmt_(const ForNode* op) final {
+    if (found) {
+      return;
+    }
+    if (IsDCUMainLoopCandidate(op)) {
+      found = true;
+      return;
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+};
+
+bool HasNestedDCUMainLoopCandidate(const ForNode* loop) {
+  NestedDCUMainLoopCandidateFinder finder;
+  finder(loop->body);
+  return finder.found;
+}
+
 class DCUMainLoopCollector : public StmtVisitor {
  public:
   std::vector<const ForNode*> loops;
@@ -233,11 +275,7 @@ DCUMainLoopFeatures AnalyzeDCUMainLoopBody(const Stmt& body) {
 }
 
 bool IsDCUMainLoop(const ForNode* loop) {
-  if (loop == nullptr) {
-    return false;
-  }
-  DCUMainLoopFeatures features = AnalyzeDCUMainLoopBody(loop->body);
-  return features.has_mmac && features.has_memory_access && features.has_global_src_memory;
+  return IsDCUMainLoopCandidate(loop) && !HasNestedDCUMainLoopCandidate(loop);
 }
 
 std::vector<const ForNode*> CollectDCUMainLoops(const Stmt& stmt) {

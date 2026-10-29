@@ -5,6 +5,7 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/target/target.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/builtin.h>
@@ -13,6 +14,7 @@
 #include <tvm/tir/utils.h>
 
 #include <optional>
+#include <limits>
 #include <utility>
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -25,6 +27,27 @@ namespace tl {
 using namespace tir;
 using namespace ffi;
 using namespace arith;
+
+namespace {
+
+constexpr const char* kIPCABIReadyAttr = "tl.dcu_ipc.abi_ready";
+constexpr const char* kIPCBindingsAttr = "tl.dcu_ipc.bindings";
+constexpr const char* kOpaqueThreadID = "tl::ipc::opaque_thread_id";
+
+// This is intentionally narrower than TargetIsDCU.  The communication index
+// proof below has only been validated for the gfx936 IPC profile, and must not
+// become a general range rule for the thread-id opaque helper.
+bool IsVerifiedGfx936IPCFunction(const PrimFunc& func) {
+  if (!func->HasNonzeroAttr(kIPCABIReadyAttr)) return false;
+  auto bindings = func->GetAttr<String>(kIPCBindingsAttr);
+  if (!bindings.has_value() || bindings.value().empty()) return false;
+  auto target = func->GetAttr<Target>(tvm::attr::kTarget);
+  if (!target.has_value() || target.value()->kind->name != "hip") return false;
+  auto mcpu = target.value()->GetAttr<String>("mcpu");
+  return mcpu.has_value() && mcpu.value() == "gfx936";
+}
+
+}  // namespace
 
 struct SimplifyConfigNode : public AttrsNodeReflAdapter<SimplifyConfigNode> {
   bool transitively_prove_inequalities{};
@@ -236,7 +259,8 @@ public:
     std::unordered_set<const VarNode *> used_in_buffer_def =
         CollectVarsUsedInBufferDefinition(func->body);
     StmtSimplifier simplifier(analyzer, config, std::move(touch_pattern),
-                              std::move(used_in_buffer_def));
+                              std::move(used_in_buffer_def),
+                              IsVerifiedGfx936IPCFunction(func));
     simplifier.MarkBufferMapShapes(func);
     func.CopyOnWrite()->body = simplifier(func->body);
 
@@ -279,13 +303,20 @@ public:
   }
 
 private:
+  struct ActiveThreadX {
+    Var var;
+    PrimExpr extent;
+  };
+
   explicit StmtSimplifier(
       Analyzer *analyzer, SimplifyConfig config,
       std::optional<ControlFlowGraph> touch_pattern,
-      std::unordered_set<const VarNode *> used_in_buffer_def)
+      std::unordered_set<const VarNode *> used_in_buffer_def,
+      bool enable_verified_ipc_thread_range)
       : IRMutatorWithAnalyzer(analyzer), config_(std::move(config)),
         touch_pattern_(std::move(touch_pattern)),
-        used_in_buffer_def_(std::move(used_in_buffer_def)) {}
+        used_in_buffer_def_(std::move(used_in_buffer_def)),
+        enable_verified_ipc_thread_range_(enable_verified_ipc_thread_range) {}
 
   using Parent = IRMutatorWithAnalyzer;
   using Parent::VisitExpr_;
@@ -312,11 +343,78 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-    With<ConstraintContext> ctx1(analyzer_, op->loop_var >= op->min);
-    With<ConstraintContext> ctx2(analyzer_,
-                                 op->loop_var < op->min + op->extent);
-    return Parent::VisitStmt_(op);
+    // Keep the established generic simplifier path byte-for-byte unchanged.
+    // Only the lexical body of a verified opaque IPC thread-id Let uses the
+    // local range proof below.
+    if (!active_opaque_thread_id_.has_value()) {
+      analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+      With<ConstraintContext> ctx1(analyzer_, op->loop_var >= op->min);
+      With<ConstraintContext> ctx2(analyzer_,
+                                   op->loop_var < op->min + op->extent);
+      return Parent::VisitStmt_(op);
+    }
+
+    PrimExpr min = this->VisitExpr(op->min);
+    PrimExpr extent = this->VisitExpr(op->extent);
+    // Analyzer's ordinary simplifier deliberately leaves some exact
+    // FloorDivs symbolic.  In this narrow scope, materialize a constant loop
+    // extent only after both the bound engine and equality prover agree.  This
+    // is not a division rewrite and never emits a range assumption into TIR.
+    if (op->kind == ForKind::kSerial &&
+        UsesVar(extent, [&](const VarNode* var) {
+          return var == active_opaque_thread_id_.value().get();
+        })) {
+      extent = FoldProvenConstantInteger(extent);
+    }
+    Range dom = Range::FromMinExtent(min, extent);
+    analyzer_->Bind(op->loop_var, dom);
+    iter_vars_.Set(op->loop_var, dom);
+    With<ConstraintContext> ctx1(analyzer_, op->loop_var >= min);
+    With<ConstraintContext> ctx2(analyzer_, op->loop_var < min + extent);
+    With<ConstraintContext> ctx3(analyzer_, extent > 0);
+    Stmt body = this->VisitStmt(op->body);
+    if (min.same_as(op->min) && extent.same_as(op->extent) &&
+        body.same_as(op->body)) {
+      return tvm::ffi::GetRef<Stmt>(op);
+    }
+    auto n = CopyOnWrite(op);
+    n->min = std::move(min);
+    n->extent = std::move(extent);
+    n->body = std::move(body);
+    return Stmt(n);
+  }
+
+  PrimExpr FoldProvenConstantInteger(const PrimExpr& expr) {
+    if (!expr.dtype().is_int() || expr.dtype().lanes() != 1 ||
+        SideEffect(expr) > CallEffectKind::kPure) {
+      return expr;
+    }
+    arith::ConstIntBound bound = analyzer_->const_int_bound(expr);
+    if (bound->min_value != bound->max_value ||
+        bound->min_value == arith::ConstIntBound::kNegInf ||
+        bound->min_value == arith::ConstIntBound::kPosInf) {
+      return expr;
+    }
+    IntImm constant(expr.dtype(), bound->min_value);
+    return analyzer_->CanProveEqual(expr, constant) ? PrimExpr(constant) : expr;
+  }
+
+  bool IsScopedOpaqueThreadIDLet(const LetStmtNode* op) const {
+    if (!enable_verified_ipc_thread_range_ || !active_thread_x_.has_value() ||
+        !op->var.dtype().is_int() || op->var.dtype().bits() != 32 ||
+        op->var.dtype().lanes() != 1) {
+      return false;
+    }
+    const auto* call = op->value.as<CallNode>();
+    if (!call || !call->op.same_as(builtin::call_extern()) ||
+        call->args.size() != 2 || call->dtype != op->var.dtype()) {
+      return false;
+    }
+    const auto* symbol = call->args[0].as<StringImmNode>();
+    const auto* thread_var = call->args[1].as<VarNode>();
+    return symbol && symbol->value == kOpaqueThreadID && thread_var &&
+           thread_var == active_thread_x_->var.get() &&
+           thread_var->dtype == op->var.dtype();
   }
 
   bool CanInlineLetStmt(const LetStmtNode *op) {
@@ -383,13 +481,27 @@ private:
       return body;
     }
 
+    const bool scoped_opaque_thread_id = IsScopedOpaqueThreadIDLet(op);
     bool can_inline = CanInlineLetStmt(op);
     if (can_inline) {
       analyzer_->Bind(op->var, value);
     } else if (SideEffect(op->value) <= CallEffectKind::kPure) {
       non_inlined_bindings_.Set(op->var, value);
     }
+    // `opaque_thread_id` deliberately remains an opaque call in TIR/HIP.  Its
+    // lexical result nevertheless has the same range as the exact active
+    // threadIdx.x argument.  Keep this Analyzer-only fact keyed by the Let
+    // Var identity; it is neither substituted into the call nor emitted as an
+    // assume/range annotation for downstream codegen.
+    std::optional<Var> saved_opaque_thread_id = active_opaque_thread_id_;
+    if (scoped_opaque_thread_id) {
+      analyzer_->Bind(op->var,
+                      Range::FromMinExtent(make_zero(op->var.dtype()),
+                                           active_thread_x_->extent));
+      active_opaque_thread_id_ = op->var;
+    }
     Stmt body = this->VisitStmt(op->body);
+    active_opaque_thread_id_ = std::move(saved_opaque_thread_id);
 
     bool used_in_buffer_def = used_in_buffer_def_.count(op->var.get());
 
@@ -466,6 +578,27 @@ private:
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) override {
+    if (enable_verified_ipc_thread_range_ &&
+        op->attr_key == tir::attr::thread_extent) {
+      const auto* iter_var = op->node.as<IterVarNode>();
+      const auto* extent = op->value.as<IntImmNode>();
+      if (iter_var && iter_var->thread_tag == "threadIdx.x") {
+        std::optional<ActiveThreadX> saved_thread_x = active_thread_x_;
+        // An inner dynamic or unsupported threadIdx.x scope must not inherit
+        // a surrounding range fact.  The first implementation deliberately
+        // supports only the concrete AttrStmt launch form emitted here.
+        active_thread_x_.reset();
+        if (extent && op->value.dtype().is_int() &&
+            op->value.dtype().bits() == 32 && op->value.dtype().lanes() == 1 &&
+            extent->value > 0 &&
+            extent->value <= std::numeric_limits<int32_t>::max()) {
+          active_thread_x_ = ActiveThreadX{iter_var->var, op->value};
+        }
+        Stmt result = Parent::VisitStmt_(op);
+        active_thread_x_ = std::move(saved_thread_x);
+        return result;
+      }
+    }
     if (op->attr_key == "tl.assume") {
       PrimExpr condition = this->VisitExpr(Downcast<PrimExpr>(op->node));
       auto n = CopyOnWrite(op);
@@ -523,6 +656,9 @@ private:
   std::unordered_set<const VarNode *> used_in_buffer_def_;
   std::unordered_set<const VarNode *> used_vars_;
   std::unordered_set<const BufferNode *> used_buffers_;
+  bool enable_verified_ipc_thread_range_{false};
+  std::optional<ActiveThreadX> active_thread_x_;
+  std::optional<Var> active_opaque_thread_id_;
 };
 
 using namespace tir::transform;

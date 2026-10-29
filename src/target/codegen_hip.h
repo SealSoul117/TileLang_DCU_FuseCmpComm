@@ -61,6 +61,15 @@ protected:
                        std::ostream &os) final; // NOLINT(*)
 
 private:
+  // Explicit M2 ABI mapping assembled from bind_ipc() function attributes.
+  // Keys are local or normalized-remote Buffer.data variables; values are the
+  // ordinary uint64[6] descriptor kernel parameter variables.
+  std::unordered_map<const VarNode*, const VarNode*> ipc_descriptor_for_data_;
+  std::unordered_map<std::string, const VarNode*> ipc_descriptor_for_buffer_name_;
+  std::unordered_map<const VarNode*, bool> ipc_remote_data_;
+  const VarNode* ipc_rank_ = nullptr;
+  const VarNode* ipc_world_ = nullptr;
+  bool need_ipc_h_ = false;
   // Handle volatile loads
   void HandleVolatileLoads(const std::string &value, const BufferLoadNode *op,
                            std::ostream &os) final;

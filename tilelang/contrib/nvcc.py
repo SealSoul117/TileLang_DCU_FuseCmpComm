@@ -11,7 +11,7 @@ import contextlib
 from tilelang.env import CUDA_HOME, CUTLASS_INCLUDE_DIR, TILELANG_TEMPLATE_PATH
 import shutil
 import tempfile
-import tvm_ffi
+from tilelang._ffi_compat import register_global_func
 from tilelang import tvm as tvm
 from tvm.target import Target
 
@@ -319,7 +319,7 @@ def get_cuda_version(cuda_path=None):
     raise RuntimeError("Cannot read cuda version file")
 
 
-@tvm_ffi.register_global_func("tilelang_callback_libdevice_path", override=True)
+@register_global_func("tilelang_callback_libdevice_path", override=True)
 def find_libdevice_path(arch):
     """Utility function to find libdevice
 
@@ -384,7 +384,7 @@ def callback_libdevice_path(arch):
         return ""
 
 
-@tvm_ffi.register_global_func("tvm.contrib.nvcc.get_compute_version", override=True)
+@register_global_func("tvm.contrib.nvcc.get_compute_version", override=True)
 def get_target_compute_version(target=None):
     """Utility function to get compute capability of compilation target.
 
@@ -530,7 +530,7 @@ def have_cudagraph():
         return False
 
 
-@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_bf16", override=True)
+@register_global_func("tvm.contrib.nvcc.supports_bf16", override=True)
 def have_bf16(compute_version):
     """Either bf16 support is provided in the compute capability or not
 
@@ -543,7 +543,7 @@ def have_bf16(compute_version):
     return major >= 8
 
 
-@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_fp8", override=True)
+@register_global_func("tvm.contrib.nvcc.supports_fp8", override=True)
 def have_fp8(compute_version):
     """Whether fp8 support is provided in the specified compute capability or not
 
@@ -560,7 +560,7 @@ def have_fp8(compute_version):
     return any(conditions)
 
 
-@tvm_ffi.register_global_func("tvm.contrib.nvcc.supports_tma", override=True)
+@register_global_func("tvm.contrib.nvcc.supports_tma", override=True)
 def have_tma(target):
     """Whether TMA support is provided in the specified compute capability or not
 

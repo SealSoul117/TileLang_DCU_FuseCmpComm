@@ -19,8 +19,8 @@
 
 debug/
 build/
-*dist/
-dist*/
+/build-m1/
+/build-old/
 wheelhouse/
 __pycache__
 nnfusion.tar.gz
@@ -125,3 +125,13 @@ examples/gemm/*.db
 examples/gemm/*.json
 examples/gemm/*.txt
 examples/flash_attention/profile/
+
+examples/distributed/gemm_rs_prototype/generated/
+
+# Packaging outputs and local environment
+/dist/
+/.venv-dcu/
+
+# DCU example build outputs
+/examples/gemm/dcu_codegen/persistent_16/build-*/
+/examples/gemm/dcu_codegen/generated/

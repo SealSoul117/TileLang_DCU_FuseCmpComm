@@ -5,7 +5,7 @@ from tvm.target import Target
 from tvm.ir.base import Node
 from tvm.ir import Range
 from tvm.runtime import Scriptable
-import tvm_ffi
+from tilelang._ffi_compat import register_global_func, register_object
 from .gemm_mma import GemmMMA
 from .gemm_mma_sm70 import GemmMMASm70
 from .gemm_wgmma import GemmWGMMA
@@ -15,13 +15,13 @@ from .gemm_mmac import GemmMMAC
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
 
-@tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
+@register_global_func("tl.gemm_py.infer_layout")
 def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range, layout_map=None):
     thread_nums = thread_bounds.extent
     return gemm_py.infer_layout(target, thread_nums, layout_map)
 
 
-@tvm_ffi.register_global_func("tl.gemm_py.lower")
+@register_global_func("tl.gemm_py.lower")
 def gemm_py_lower(gemm_py: GemmMMA, layout_map, target: Target, thread_bounds: Range, thread_var: tir.Var):
     thread_nums = thread_bounds.extent
     stmt = gemm_py.lower(layout_map, target, thread_nums, thread_var)
@@ -56,7 +56,7 @@ class GemmInst(IntEnum):
         return self.name
 
 
-@tvm_ffi.register_object("tl.GemmPy")
+@register_object("tl.GemmPy")
 class GemmPy(Node, Scriptable):
     # FFI fields (LLVM/MLIR-style lowerCamel via reflection):
     # a, b, c, aPtr, bPtr, cPtr, m, n, k, transA, transB,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import inspect
 
 from tilelang.language.kernel import KernelLaunchFrame
-from tvm_ffi.container import Map
+from tilelang._ffi_compat import Array, Map
 from tvm.ir.base import Span
 from tvm.ir.expr import Range
 from tvm.tir.stmt import BufferRegion
@@ -392,7 +392,7 @@ class Builder(BaseBuilder):
             return orig_value
 
         # 2. Quick return for trivil types
-        if isinstance(value, (tuple, list, tvm.ffi.Array, int, float, str)):
+        if isinstance(value, (tuple, list, Array, int, float, str)):
             return value
         if isinstance(value, tir.IntImm) and value.dtype == "int32":
             return value.value

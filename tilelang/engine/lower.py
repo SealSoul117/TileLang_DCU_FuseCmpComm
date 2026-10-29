@@ -8,7 +8,7 @@ from typing import Callable
 import tilelang.transform
 from tilelang import tvm as tvm
 from tvm import tir
-import tvm_ffi
+from tilelang._ffi_compat import get_global_func, register_global_func
 from tvm.ir import CallingConv
 from tvm.target import Target
 from tilelang.contrib import hipcc, nvcc
@@ -56,7 +56,7 @@ def get_host_call(is_device_c: bool = False) -> Callable[[tir.PrimFunc], bool]:
     return lambda func: not get_device_call(is_device_c)(func)
 
 
-@tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
+@register_global_func("tilelang_callback_cuda_compile", override=True)
 def tilelang_callback_cuda_compile(code, target, pass_config=None):
     project_root = osp.join(osp.dirname(__file__), "../..")
     if "TL_TEMPLATE_PATH" in os.environ:
@@ -125,7 +125,7 @@ def tilelang_callback_cuda_compile(code, target, pass_config=None):
     return ptx
 
 
-@tvm_ffi.register_global_func("tilelang_callback_hip_compile", override=True)
+@register_global_func("tilelang_callback_hip_compile", override=True)
 def tilelang_callback_hip_compile(code, target):
     project_root = osp.join(osp.dirname(__file__), "../..")
     tl_template_path = osp.abspath(osp.join(project_root, "src"))
@@ -144,6 +144,7 @@ def tilelang_callback_hip_compile(code, target):
             "-std=c++17",
             "-O3",
             "-I" + tl_template_path,
+            "-I" + osp.join(tl_template_path, "runtime/dcu_ipc/include"),
             "-I" + ck_path,
         ],
         verbose=False,
@@ -184,9 +185,9 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
     host_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(host_mod)
     host_mod = tir.transform.CombineContextCall()(host_mod)
     if target_host.kind.name == "llvm":
-        host_mod = tvm.ffi.get_global_func("target.build.llvm")(host_mod, target_host)
+        host_mod = get_global_func("target.build.llvm")(host_mod, target_host)
     elif target_host.kind.name == "c":
-        host_mod = tvm.ffi.get_global_func("target.build.tilelang_c")(host_mod, target_host)
+        host_mod = get_global_func("target.build.tilelang_c")(host_mod, target_host)
     else:
         raise ValueError(f"Target host {target_host.kind.name} is not supported")
     return host_mod
@@ -199,9 +200,9 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
 
     if target.kind.name == "cuda":
         global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda")
-        device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
+        device_mod = get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
-        device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
+        device_mod = get_global_func("target.build.tilelang_hip")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
 
@@ -214,17 +215,17 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     device_mod = tir.transform.Simplify()(device_mod)
     if target.kind.name == "cuda":
         global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda") + "_without_compile"
-        device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
+        device_mod = get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
-        device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip_without_compile")(device_mod, target)
+        device_mod = get_global_func("target.build.tilelang_hip_without_compile")(device_mod, target)
     elif target.kind.name == "c":
-        device_mod = tvm.ffi.get_global_func("target.build.tilelang_cpp")(device_mod, target)
+        device_mod = get_global_func("target.build.tilelang_cpp")(device_mod, target)
     elif target.kind.name == "llvm":
-        device_mod = tvm.ffi.get_global_func("target.build.llvm")(device_mod, target)
+        device_mod = get_global_func("target.build.llvm")(device_mod, target)
     elif target.kind.name == "webgpu":
-        device_mod = tvm.ffi.get_global_func("target.build.webgpu")(device_mod, target)
+        device_mod = get_global_func("target.build.webgpu")(device_mod, target)
     elif target.kind.name == "metal":
-        device_mod = tvm.ffi.get_global_func("target.build.metal")(device_mod, target)
+        device_mod = get_global_func("target.build.metal")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
 
@@ -246,11 +247,15 @@ def lower(
     own device codegen implementation in jit.
     """
 
+    # M2 IPC is deliberately opt-in via bind_ipc(), but once attached it uses
+    # the same public engine.lower/compile path as every other PrimFunc.
+    from tilelang.distributed.ipc_binding import has_ipc_binding, prepare_ipc_primfunc
+
     mod = func_or_mod
     params = None
     if isinstance(func_or_mod, tir.PrimFunc):
         func = func_or_mod
-        params = extrac_params(func) if not runtime_only else None
+        # Target parsing happens below, so delay ABI preparation until then.
         mod = tvm.IRModule({func.attrs["global_symbol"]: func})
 
     if isinstance(target, str):
@@ -261,16 +266,31 @@ def lower(
     target_host = tvm.target.Target.canon_target(target_host)
     target = tvm.target.Target(target, target_host)
 
+    if isinstance(func_or_mod, tir.PrimFunc) and has_ipc_binding(func_or_mod):
+        func = prepare_ipc_primfunc(func_or_mod, target_kind=target.kind.name)
+        params = extrac_params(func) if not runtime_only else None
+        mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    elif isinstance(func_or_mod, tir.PrimFunc):
+        params = extrac_params(func_or_mod) if not runtime_only else None
+
     _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
     _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
 
-    # Before lowering, do semantic check
-    PreLowerSemanticCheck(mod)
-    # Phase 1: Lower and legalize the IR
-    mod = LowerAndLegalize(mod, target)
-    # print(mod)
-    # Phase 2: Optimize the IR for the target
-    mod = OptimizeForTarget(mod, target)
+    # IPC functions enter through the normal pipeline too.  LayoutInference
+    # consults Target::Current while it analyzes the existing T.copy, so bind
+    # the explicit HIP target for this path rather than bypassing the passes.
+    if isinstance(func_or_mod, tir.PrimFunc) and has_ipc_binding(func_or_mod):
+        with target:
+            PreLowerSemanticCheck(mod)
+            mod = LowerAndLegalize(mod, target)
+            mod = OptimizeForTarget(mod, target)
+    else:
+        # Before lowering, do semantic check
+        PreLowerSemanticCheck(mod)
+        # Phase 1: Lower and legalize the IR
+        mod = LowerAndLegalize(mod, target)
+        # Phase 2: Optimize the IR for the target
+        mod = OptimizeForTarget(mod, target)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)

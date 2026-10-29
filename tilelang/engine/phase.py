@@ -39,6 +39,22 @@ def allow_vectorize(pass_ctx: PassContext | None = None) -> bool:
     return not disable_vectorize
 
 
+def should_enable_dcu_ipc_vectorize(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    # This experimental communication fast path is deliberately opt-in: its
+    # strict matcher is isolated, but its performance has not met acceptance.
+    return bool(pass_ctx.config.get("tl.enable_dcu_ipc_vectorize", False))
+
+
+def should_enable_dcu_ipc_hoist(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    # Preserve the existing unconditional pipeline behavior unless an
+    # experiment explicitly disables the independently verified hoist.
+    return bool(pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_DCU_IPC_HOIST, True))
+
+
 def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
@@ -250,9 +266,21 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
 
     mod = tilelang.transform.StorageRewrite()(mod)
+    # LowerDCUIPC has already materialized explicit DeviceView address Lets.
+    # After StorageRewrite their local payload temporaries are outside the
+    # element loop, so the IPC-only pass can conservatively hoist just the
+    # verified remote-address producers before host/device splitting.  Keep
+    # the historical default on, while exposing an independent ablation knob.
+    if should_enable_dcu_ipc_hoist(pass_ctx=pass_ctx):
+        mod = tilelang.transform.HoistDCUIPCPointers()(mod)
     mod = tir.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
+    # Exact post-hoist scheduled RS/AR normal forms only. Matching loops rely on
+    # the caller's aligned, valid, non-overlapping allocation contract (no
+    # runtime guard/fallback); non-matching loops and ordinary GEMM are untouched.
+    if should_enable_dcu_ipc_vectorize(pass_ctx=pass_ctx):
+        mod = tilelang.transform.VectorizeDCUIPCCommunication()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
     mod = tir.transform.RewriteUnsafeSelect()(mod)
     mod = tir.transform.HoistIfThenElse()(mod)

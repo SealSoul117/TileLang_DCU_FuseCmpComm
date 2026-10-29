@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing_extensions import Literal
 
 from tvm import ir, tir, DataType
-from tvm.ffi import get_global_func
+from tilelang._ffi_compat import get_global_func
 from tvm.target.target import Target
 from tvm.tir import Schedule, IterVar
 from tvm.tir.schedule import BlockRV

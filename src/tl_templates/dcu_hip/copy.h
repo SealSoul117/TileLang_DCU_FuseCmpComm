@@ -101,7 +101,7 @@
   template <int N, int smem_offset = 0>
   TL_DEVICE void cp_async_gs_idxen(void *lds_base_ptr, int32x4_t res, int offset, int idxen) {
       typedef uint32_t uint32x2_t __attribute__((ext_vector_type(2)));
-      uint32x2_t v_addr = {idxen, offset};
+      uint32x2_t v_addr = {static_cast<uint32_t>(idxen), static_cast<uint32_t>(offset)};
       auto const lds_ptr_sgpr =
         __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>(lds_base_ptr)));
       
